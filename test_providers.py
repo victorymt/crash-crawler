@@ -1,6 +1,13 @@
 import unittest
 
-from providers import ProviderConfig, parse_deepseek_balance, parse_opencode_legacy, parse_percent
+from providers import (
+    ProviderConfig,
+    parse_deepseek_balance,
+    parse_ezaiclub_balance_tokens,
+    parse_ezaiclub_subscription_tokens,
+    parse_opencode_legacy,
+    parse_percent,
+)
 
 
 class ProviderParserTests(unittest.TestCase):
@@ -51,6 +58,41 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(result["recommendation"], "ok")
         self.assertEqual(result["balances"][0]["label"], "总余额")
         self.assertEqual(result["balances"][0]["value"], "12.50")
+
+    def test_parse_ezaiclub_balance_tokens(self):
+        balances = parse_ezaiclub_balance_tokens(
+            [
+                "Dashboard",
+                "账户余额",
+                "¥ 88.60",
+                "充值",
+            ]
+        )
+        self.assertEqual(balances[0]["key"], "balance")
+        self.assertEqual(balances[0]["value"], "88.60")
+        self.assertEqual(balances[0]["currency"], "CNY")
+        self.assertEqual(
+            parse_ezaiclub_balance_tokens(["余额", "1", "$20.8356166"])[0]["value"],
+            "20.84",
+        )
+
+    def test_parse_ezaiclub_subscription_tokens(self):
+        metrics = parse_ezaiclub_subscription_tokens(
+            [
+                "Subscriptions",
+                "当前套餐",
+                "Pro Monthly",
+                "到期时间",
+                "2026-08-21",
+            ]
+        )
+        self.assertTrue(metrics)
+        self.assertEqual(metrics[0]["label"], "当前套餐")
+        self.assertEqual(metrics[0]["value"], "Pro Monthly")
+        usage = parse_ezaiclub_subscription_tokens(
+            ["已达到 95%，但到期前没有可提前重置的窗口。", "2026/07/28"]
+        )
+        self.assertEqual(usage[0]["label"], "订阅用量")
 
 
 if __name__ == "__main__":

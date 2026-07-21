@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from providers import ProviderManager, load_config
+from providers import ProviderManager, links_for_config, load_config
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PORT = 19765
@@ -30,6 +30,7 @@ def public_configs() -> list[dict[str, object]]:
             "target_url": config.target_url,
             "enabled": config.enabled,
             "mode": config.mode,
+            "links": links_for_config(config),
         }
         for config in load_config()
         if config.enabled
@@ -351,6 +352,13 @@ def dashboard_html() -> str:
       window.open(provider.target_url, `_blank_provider_${{provider.id}}`, 'noopener');
     }}
 
+    function linkButtons(provider, snapshot) {{
+      const links = snapshot.links || provider.links || [{{ label: '打开官方页面', url: provider.target_url }}];
+      return links.map((link) => `
+        <a class="button primary" href="${{link.url}}" target="_blank">${{link.label}}</a>
+      `).join('');
+    }}
+
     function balanceHtml(balance) {{
       const currency = balance.currency ? ` ${{balance.currency}}` : '';
       return `<div class="amount">
@@ -364,13 +372,16 @@ def dashboard_html() -> str:
       root.innerHTML = providers.map((provider) => {{
         const snapshot = snapshots.find((item) => item.id === provider.id) || {{}};
         const balances = snapshot.balances || [];
-        const usage = snapshot.usage || snapshot.metrics || [];
+        const balanceKeys = new Set(balances.map((item) => `${{item.key}}|${{item.label}}|${{item.value}}`));
+        const usage = (snapshot.usage && snapshot.usage.length ? snapshot.usage : (snapshot.metrics || []).filter((item) => {{
+          return !balanceKeys.has(`${{item.key}}|${{item.label}}|${{item.value}}`);
+        }}));
         const balanceBlock = balances.length
           ? `<div class="section-title">余额</div><div class="amount-grid">${{balances.map(balanceHtml).join('')}}</div>`
           : '<div class="provider-meta">暂无余额数据。</div>';
         const usageBlock = usage.length
-          ? `<div class="section-title">用量</div><div class="metrics">${{usage.map(metricHtml).join('')}}</div>`
-          : '<div class="provider-meta">暂无用量数据。</div>';
+          ? `<div class="section-title">用量 / 订阅</div><div class="metrics">${{usage.map(metricHtml).join('')}}</div>`
+          : '<div class="provider-meta">暂无用量或订阅数据。</div>';
         return `
         <article class="launch-panel">
           <div class="launch-head">
@@ -382,7 +393,7 @@ def dashboard_html() -> str:
           ${{usageBlock}}
           ${{snapshot.error ? `<div class="error">${{snapshot.error}}</div>` : ''}}
           <div class="launch-actions">
-            <a class="button primary" href="${{provider.target_url}}" target="_blank">打开官方页面</a>
+            ${{linkButtons(provider, snapshot)}}
             <button data-copy="${{provider.id}}">复制 URL</button>
           </div>
         </article>

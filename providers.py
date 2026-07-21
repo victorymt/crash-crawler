@@ -25,6 +25,8 @@ DEFAULT_OPENCODE_URL = (
 )
 DEFAULT_DEEPSEEK_URL = "https://platform.deepseek.com/usage"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEFAULT_EZAICLUB_DASHBOARD_URL = "https://www.ezaiclub.com/dashboard"
+DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL = "https://www.ezaiclub.com/subscriptions"
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("PROVIDER_CONFIG", ROOT / "providers.local.json"))
@@ -58,6 +60,13 @@ DEEPSEEK_LOGIN_HINTS = (
     "Log in with Google",
     "登录",
     "注册",
+)
+EZAICLUB_LOGIN_HINTS = (
+    "Login - EZAIClub",
+    "Login",
+    "Sign in",
+    "Sign up",
+    "登录",
 )
 OPENCODE_USAGE_TYPES = ("滚动用量", "每周用量", "每月用量")
 
@@ -99,12 +108,24 @@ class ProviderConfig:
     profile_dir: str = DEFAULT_PROFILE_DIR
     cookie_cache: str | None = None
     api_key_env: str | None = None
+    secondary_urls: list[dict[str, str]] | None = None
     mode: str = "browser"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProviderConfig":
         profile_dir = str(data.get("profile_dir") or DEFAULT_PROFILE_DIR)
         cookie_cache = data.get("cookie_cache")
+        secondary_urls = []
+        for item in data.get("secondary_urls", []):
+            if isinstance(item, str):
+                secondary_urls.append({"label": "打开详情页", "url": item})
+            elif isinstance(item, dict) and item.get("url"):
+                secondary_urls.append(
+                    {
+                        "label": str(item.get("label") or "打开详情页"),
+                        "url": str(item["url"]),
+                    }
+                )
         return cls(
             id=str(data["id"]),
             name=str(data.get("name") or data["id"]),
@@ -114,6 +135,7 @@ class ProviderConfig:
             profile_dir=os.path.expanduser(profile_dir),
             cookie_cache=os.path.expanduser(str(cookie_cache)) if cookie_cache else None,
             api_key_env=str(data.get("api_key_env")) if data.get("api_key_env") else None,
+            secondary_urls=secondary_urls,
             mode=str(data.get("mode") or "browser"),
         )
 
@@ -160,6 +182,22 @@ def default_config() -> dict[str, Any]:
                 "api_key_env": "DEEPSEEK_API_KEY",
                 "mode": "api",
             },
+            {
+                "id": "ezaiclub",
+                "name": "EZAICLUB",
+                "type": "ezaiclub",
+                "target_url": DEFAULT_EZAICLUB_DASHBOARD_URL,
+                "enabled": True,
+                "profile_dir": DEFAULT_PROFILE_DIR,
+                "cookie_cache": default_cookie_cache("ezaiclub"),
+                "secondary_urls": [
+                    {
+                        "label": "打开订阅页",
+                        "url": DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL,
+                    }
+                ],
+                "mode": "browser",
+            },
         ]
     }
 
@@ -183,6 +221,14 @@ def build_browser(profile_dir: str):
             "Run `UV_CACHE_DIR=/tmp/uv-cache uv pip install playwright`, "
             "then retry with `uv run python ...`."
         ) from exc
+
+    profile_path = Path(profile_dir).expanduser()
+    if profile_path.resolve() == Path(DEFAULT_PROFILE_DIR).expanduser().resolve():
+        for name in ("SingletonCookie", "SingletonLock", "SingletonSocket"):
+            try:
+                (profile_path / name).unlink()
+            except FileNotFoundError:
+                pass
 
     pw = sync_playwright().start()
     context = pw.chromium.launch_persistent_context(
@@ -329,6 +375,31 @@ def balance_metric(
     }
 
 
+def normalize_amount(value: str) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except ValueError:
+        return value
+
+
+def text_metric(key: str, label: str, value: str | None) -> dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "value": value or "",
+        "unit": None,
+        "percent": None,
+        "reset_in": None,
+    }
+
+
+def links_for_config(config: ProviderConfig) -> list[dict[str, str]]:
+    return [
+        {"label": "打开官方页面", "url": config.target_url},
+        *(config.secondary_urls or []),
+    ]
+
+
 def usage_metric(
     key: str,
     label: str,
@@ -367,7 +438,7 @@ def recommendation_from_balances(
     totals = [
         float(item["value"])
         for item in balances
-        if item.get("key") == "total_balance"
+        if item.get("key") in ("total_balance", "balance")
         and re.fullmatch(r"-?\d+(?:\.\d+)?", str(item.get("value") or ""))
     ]
     if not totals:
@@ -395,6 +466,7 @@ def blank_snapshot(
         "balances": [],
         "usage": [],
         "metrics": [],
+        "links": links_for_config(config),
         "recommendation": "watch" if status in ("error", "unconfigured") else "ok",
         "error": error,
     }
@@ -468,6 +540,7 @@ def opencode_snapshot(config: ProviderConfig, legacy: dict[str, Any]) -> dict[st
         "balances": legacy.get("balances", []),
         "usage": usage,
         "metrics": legacy.get("balances", []) + usage,
+        "links": links_for_config(config),
         "recommendation": recommendation_from_usage(usage),
         "error": None,
         "raw": legacy,
@@ -583,6 +656,7 @@ def parse_deepseek_tokens(tokens: list[str], url: str, config: ProviderConfig) -
         "balances": [],
         "usage": [],
         "metrics": metrics,
+        "links": links_for_config(config),
         "recommendation": "watch",
         "error": None,
         "raw": {"tokens": tokens},
@@ -623,6 +697,7 @@ def parse_deepseek_balance(data: dict[str, Any], config: ProviderConfig) -> dict
         "balances": balances,
         "usage": [],
         "metrics": balances,
+        "links": links_for_config(config),
         "recommendation": recommendation_from_balances(balances, is_available),
         "error": None,
         "raw": {"is_available": is_available, "balance_infos": infos},
@@ -639,9 +714,226 @@ def deepseek_http_error_message(exc: HTTPError) -> str:
     return f"DeepSeek balance API returned HTTP {exc.code}"
 
 
-def dump_tokens(config: ProviderConfig, tokens: list[str], title: str, url: str) -> Path:
+def parse_money_value(text: str) -> tuple[str, str] | None:
+    match = re.search(
+        r"([$¥￥])?\s*(\d+(?:\.\d+)?)\s*(CNY|RMB|USD|USDT|元)?",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    symbol, amount, suffix = match.groups()
+    currency = None
+    if symbol == "$":
+        currency = "USD"
+    elif symbol in ("¥", "￥"):
+        currency = "CNY"
+    elif suffix:
+        normalized = suffix.upper()
+        currency = "CNY" if normalized in ("RMB", "元") else normalized
+    return amount, currency or ""
+
+
+def parse_ezaiclub_balance_tokens(tokens: list[str]) -> list[dict[str, Any]]:
+    balances = []
+    seen: set[tuple[str, str, str]] = set()
+    keywords = (
+        "余额",
+        "充值",
+        "可用",
+        "剩余",
+        "balance",
+        "Balance",
+        "credit",
+        "Credit",
+        "wallet",
+        "Wallet",
+    )
+
+    for idx, token in enumerate(tokens):
+        window = tokens[max(0, idx - 2) : min(len(tokens), idx + 4)]
+        joined = "\n".join(window)
+        if not any(keyword in joined for keyword in keywords):
+            continue
+
+        label = next((item for item in window if any(k in item for k in keywords)), token)
+        for item in window:
+            parsed = parse_money_value(item)
+            if not parsed:
+                continue
+            amount, currency = parsed
+            amount = normalize_amount(amount)
+            key = ("balance", label, amount)
+            if key in seen:
+                continue
+            seen.add(key)
+            balances.append(balance_metric("balance", label, amount, currency or None))
+
+    currency_balances = [item for item in balances if item.get("currency")]
+    if currency_balances:
+        preferred_labels = ("余额", "账户余额", "可用余额", "可用", "balance", "Balance")
+        ordered = sorted(
+            currency_balances,
+            key=lambda item: 0 if item.get("label") in preferred_labels else 1,
+        )
+        deduped = []
+        seen_amounts: set[tuple[str, str | None]] = set()
+        for item in ordered:
+            key = (item["value"], item.get("currency"))
+            if key in seen_amounts:
+                continue
+            seen_amounts.add(key)
+            deduped.append(item)
+        return deduped[:3]
+
+    return balances[:3]
+
+
+def flatten_json_values(value: Any) -> list[str]:
+    result = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            result.append(str(key))
+            result.extend(flatten_json_values(item))
+    elif isinstance(value, list):
+        for item in value:
+            result.extend(flatten_json_values(item))
+    elif value is not None:
+        result.append(str(value))
+    return result
+
+
+def extract_json_payloads(responses: list[dict[str, Any]]) -> list[str]:
+    tokens = []
+    for response in responses:
+        tokens.extend(flatten_json_values(response.get("data")))
+    return [token.strip() for token in tokens if token and token.strip()]
+
+
+def next_subscription_value(tokens: list[str], start: int) -> str | None:
+    skip_words = ("订阅", "套餐", "subscription", "Subscription", "plan", "Plan")
+    for idx in range(start, min(start + 4, len(tokens))):
+        token = tokens[idx].strip()
+        if not token or token in skip_words:
+            continue
+        if len(token) > 120:
+            continue
+        return token
+    return None
+
+
+def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]]:
+    metrics = []
+    seen: set[tuple[str, str]] = set()
+    nav_tokens = {
+        "充值/订阅",
+        "模型价格",
+        "文档",
+        "查看您的订阅计划和用量",
+        "我的订阅",
+    }
+    keywords = (
+        "订阅",
+        "套餐",
+        "到期",
+        "续费",
+        "有效",
+        "subscription",
+        "Subscription",
+        "plan",
+        "Plan",
+        "active",
+        "Active",
+        "expires",
+        "Expires",
+        "renew",
+        "Renew",
+    )
+    date_re = re.compile(r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|[A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4}")
+
+    for idx, token in enumerate(tokens):
+        clean = token.strip()
+        if not clean or not any(keyword in clean for keyword in keywords):
+            continue
+        if clean in ("Subscriptions", "Subscription", "订阅"):
+            continue
+        if clean in nav_tokens:
+            continue
+        if clean in {"last_active_at"} or "同一订阅重复" in clean:
+            continue
+        if len(clean) > 48 and "已达到" not in clean:
+            continue
+        percent_match = re.search(r"已达到\s*(\d+)%", clean)
+        if percent_match:
+            date_match = date_re.search("\n".join(tokens[idx : idx + 5]))
+            value = f"{percent_match.group(1)}%"
+            if date_match:
+                value = f"{value}, 到期 {date_match.group(0)}"
+            key = ("订阅用量", value)
+            if key not in seen:
+                seen.add(key)
+                metrics.append(text_metric("subscription_usage", "订阅用量", value))
+            continue
+        value = next_subscription_value(tokens, idx + 1)
+        date_match = date_re.search("\n".join(tokens[idx : idx + 5]))
+        if date_match and any(word in clean for word in ("到期", "续费", "有效", "expires", "Expires", "renew", "Renew")):
+            value = date_match.group(0)
+        if not value and len(clean) <= 120:
+            value = clean
+        if not value:
+            continue
+        if value in nav_tokens:
+            continue
+        if "_" in value or value in {"allowed_groups"}:
+            continue
+        key = (clean, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        metrics.append(text_metric(f"subscription_{len(metrics) + 1}", clean, value))
+        if len(metrics) >= 6:
+            break
+    return metrics
+
+
+def ezaiclub_snapshot(
+    config: ProviderConfig,
+    dashboard_url: str,
+    balances: list[dict[str, Any]],
+    subscription_metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metrics = balances + subscription_metrics
+    return {
+        "id": config.id,
+        "name": config.name,
+        "type": config.type,
+        "status": "ok",
+        "url": dashboard_url,
+        "updated_at": now_iso(),
+        "subscribed": None,
+        "balances": balances,
+        "usage": [],
+        "metrics": metrics,
+        "links": links_for_config(config),
+        "recommendation": recommendation_from_balances(balances),
+        "error": None if metrics else "EZAICLUB pages loaded, but no balance or subscription fields were recognized",
+        "raw": {
+            "balance_count": len(balances),
+            "subscription_metric_count": len(subscription_metrics),
+        },
+    }
+
+
+def dump_tokens(
+    config: ProviderConfig,
+    tokens: list[str],
+    title: str,
+    url: str,
+    suffix: str | None = None,
+) -> Path:
     DEFAULT_DUMP_DIR.mkdir(parents=True, exist_ok=True)
-    path = DEFAULT_DUMP_DIR / f"{config.id}.txt"
+    name = f"{config.id}-{suffix}.txt" if suffix else f"{config.id}.txt"
+    path = DEFAULT_DUMP_DIR / name
     lines = [
         f"TITLE: {title}",
         f"URL:   {url}",
@@ -792,6 +1084,92 @@ class DeepSeekProvider(Provider):
             raise ProviderError(deepseek_http_error_message(exc)) from exc
 
 
+class EZAICLUBProvider(Provider):
+    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+        pw, context = build_browser(self.config.profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            responses: list[dict[str, Any]] = []
+            self.capture_json_responses(page, responses)
+            page.goto(self.config.target_url, wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(3000)
+            dashboard_text = page.inner_text("body")
+            if is_login_html(page.url, page.title() + "\n" + dashboard_text, EZAICLUB_LOGIN_HINTS):
+                raise NotLoggedInError("BrowserOS profile is not logged in to EZAICLUB")
+
+            dashboard_tokens = [line.strip() for line in dashboard_text.splitlines() if line.strip()]
+            json_tokens = extract_json_payloads(responses)
+            balances = parse_ezaiclub_balance_tokens(dashboard_tokens + json_tokens)
+            if not balances:
+                dump_tokens(
+                    self.config,
+                    dashboard_tokens + json_tokens,
+                    title=page.title(),
+                    url=page.url,
+                    suffix="dashboard",
+                )
+
+            subscription_metrics = self.fetch_subscription_metrics(page)
+            return ezaiclub_snapshot(
+                self.config,
+                dashboard_url=page.url if "/subscriptions" not in page.url else self.config.target_url,
+                balances=balances,
+                subscription_metrics=subscription_metrics,
+            )
+        finally:
+            context.close()
+            pw.stop()
+
+    def capture_json_responses(self, page, responses: list[dict[str, Any]]) -> None:
+        host = urlparse(self.config.target_url).hostname or "www.ezaiclub.com"
+
+        def handle_response(response) -> None:
+            try:
+                response_host = urlparse(response.url).hostname
+                content_type = response.headers.get("content-type", "")
+                if response_host != host or "json" not in content_type.lower():
+                    return
+                responses.append({"url": response.url, "data": response.json()})
+            except Exception:
+                return
+
+        page.on("response", handle_response)
+
+    def fetch_subscription_metrics(self, page) -> list[dict[str, Any]]:
+        subscription_url = next(
+            (
+                item["url"]
+                for item in self.config.secondary_urls or []
+                if "subscription" in item["url"]
+            ),
+            DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL,
+        )
+        try:
+            responses: list[dict[str, Any]] = []
+            self.capture_json_responses(page, responses)
+            page.goto(subscription_url, wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(3000)
+            body_text = page.inner_text("body")
+            if is_login_html(page.url, page.title() + "\n" + body_text, EZAICLUB_LOGIN_HINTS):
+                raise NotLoggedInError("BrowserOS profile is not logged in to EZAICLUB")
+            tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
+            tokens.extend(extract_json_payloads(responses))
+            metrics = parse_ezaiclub_subscription_tokens(tokens)
+            if not metrics:
+                dump_tokens(
+                    self.config,
+                    tokens,
+                    title=page.title(),
+                    url=page.url,
+                    suffix="subscriptions",
+                )
+            return metrics
+        except NotLoggedInError:
+            raise
+        except Exception:
+            return []
+
+
 class ProviderManager:
     def __init__(
         self,
@@ -813,6 +1191,8 @@ class ProviderManager:
             return OpenCodeProvider(config)
         if config.type == "deepseek":
             return DeepSeekProvider(config)
+        if config.type == "ezaiclub":
+            return EZAICLUBProvider(config)
         raise ValueError(f"unsupported provider type: {config.type}")
 
     def load_cache(self) -> dict[str, Any]:
@@ -865,6 +1245,7 @@ class ProviderManager:
                 "balances": stale_balances,
                 "usage": stale_usage,
                 "metrics": stale_metrics,
+                "links": previous.get("links", links_for_config(config)) if previous else links_for_config(config),
                 "recommendation": previous.get("recommendation", "watch") if previous else "watch",
                 "error": str(exc),
             }

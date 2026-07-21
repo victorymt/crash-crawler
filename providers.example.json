@@ -20,6 +20,22 @@
       "cookie_cache": "~/.cache/provider-dashboard/deepseek/cookies.json",
       "api_key_env": "DEEPSEEK_API_KEY",
       "mode": "api"
+    },
+    {
+      "id": "ezaiclub",
+      "name": "EZAICLUB",
+      "type": "ezaiclub",
+      "target_url": "https://www.ezaiclub.com/dashboard",
+      "enabled": true,
+      "profile_dir": "/home/cv/.browseros-crawler-profile",
+      "cookie_cache": "~/.cache/provider-dashboard/ezaiclub/cookies.json",
+      "secondary_urls": [
+        {
+          "label": "打开订阅页",
+          "url": "https://www.ezaiclub.com/subscriptions"
+        }
+      ],
+      "mode": "browser"
     }
   ]
 }
