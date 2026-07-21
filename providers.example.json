@@ -36,6 +36,16 @@
         }
       ],
       "mode": "browser"
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "type": "siliconflow",
+      "target_url": "https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
+      "enabled": true,
+      "profile_dir": "/home/cv/.browseros-crawler-profile",
+      "cookie_cache": "~/.cache/provider-dashboard/siliconflow/cookies.json",
+      "mode": "browser"
     }
   ]
 }

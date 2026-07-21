@@ -7,6 +7,8 @@ from providers import (
     parse_ezaiclub_subscription_tokens,
     parse_opencode_legacy,
     parse_percent,
+    parse_siliconflow_balance_tokens,
+    parse_siliconflow_metric_tokens,
 )
 
 
@@ -93,6 +95,38 @@ class ProviderParserTests(unittest.TestCase):
             ["已达到 95%，但到期前没有可提前重置的窗口。", "2026/07/28"]
         )
         self.assertEqual(usage[0]["label"], "订阅用量")
+
+    def test_parse_siliconflow_balance_tokens(self):
+        balances = parse_siliconflow_balance_tokens(
+            [
+                "费用账单",
+                "可用余额",
+                "¥ 23.50",
+                "优惠券",
+                "10.00 CNY",
+            ]
+        )
+        self.assertEqual(balances[0]["label"], "可用余额")
+        self.assertEqual(balances[0]["value"], "23.50")
+        self.assertEqual(balances[0]["currency"], "CNY")
+        self.assertEqual(balances[1]["label"], "优惠券")
+        self.assertEqual(balances[1]["value"], "10.00")
+
+    def test_parse_siliconflow_json_tokens(self):
+        balances = parse_siliconflow_balance_tokens(
+            [
+                "couponBalance",
+                "3.456",
+                "balance",
+                "8.9",
+                "currency",
+                "CNY",
+            ]
+        )
+        self.assertEqual({item["value"] for item in balances}, {"3.46", "8.90"})
+        metrics = parse_siliconflow_metric_tokens(["有效期", "2026-08-21", "账单金额", "1.20"])
+        self.assertEqual(metrics[0]["label"], "有效期")
+        self.assertEqual(metrics[0]["value"], "2026-08-21")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 - OpenCode Go: `https://opencode.ai/workspace/wrk_01KW9MTABWQ0DNJ014CV528WC2/go`
 - DeepSeek: `https://platform.deepseek.com/usage`
 - EZAICLUB: `https://www.ezaiclub.com/dashboard` 和 `https://www.ezaiclub.com/subscriptions`
+- SiliconFlow: `https://cloud.siliconflow.cn/me/expensebill?tab=coupon`
 
 第一版优先把官方控制台入口放到一个本地看板里。官方页面通过新标签页打开，登录态由你正在使用的浏览器自然复用。
 看板会自动采集可用的余额/用量数据，官方页面按钮保留用于查看细节和充值。
@@ -78,7 +79,7 @@ uv run python crawler.py --provider deepseek --explore
 
 ## BrowserOS 登录态
 
-OpenCode 和 EZAICLUB 的后端解析模式需要 BrowserOS profile 副本：
+OpenCode、EZAICLUB 和 SiliconFlow 的后端解析模式需要 BrowserOS profile 副本：
 
 ```bash
 cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
@@ -86,7 +87,7 @@ cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
 
 BrowserOS 关闭时复制最干净。Web 看板里的“打开”按钮不依赖这个副本，直接使用当前浏览器自己的登录态。
 
-EZAICLUB 如果未登录，卡片会显示登录态错误；“打开官方页面”和“打开订阅页”按钮仍会保留，方便进入官方站点登录或查看详情。
+EZAICLUB 或 SiliconFlow 如果未登录，卡片会显示登录态错误；官方页面按钮仍会保留，方便进入官方站点登录或查看详情。
 
 如果看到 `No module named 'playwright'`，说明当前 `.venv` 还没安装依赖：
 

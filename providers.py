@@ -27,6 +27,7 @@ DEFAULT_DEEPSEEK_URL = "https://platform.deepseek.com/usage"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEFAULT_EZAICLUB_DASHBOARD_URL = "https://www.ezaiclub.com/dashboard"
 DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL = "https://www.ezaiclub.com/subscriptions"
+DEFAULT_SILICONFLOW_COUPON_URL = "https://cloud.siliconflow.cn/me/expensebill?tab=coupon"
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("PROVIDER_CONFIG", ROOT / "providers.local.json"))
@@ -44,7 +45,7 @@ REQUEST_HEADERS = {
 
 USAGE_HINTS = re.compile(
     r"usage|quota|reset|额度|用量|重置|credits?|remaining|limit|plan|subscription|"
-    r"invoice|balance|余额|消耗|充值|模型",
+    r"invoice|balance|coupon|voucher|余额|消耗|充值|模型|账单|费用|赠金|优惠券|代金券|券",
     re.I,
 )
 OPENCODE_LOGIN_HINTS = (
@@ -67,6 +68,13 @@ EZAICLUB_LOGIN_HINTS = (
     "Sign in",
     "Sign up",
     "登录",
+)
+SILICONFLOW_LOGIN_HINTS = (
+    "account.siliconflow.cn/login",
+    "硅基流动统一登录",
+    "Accelerate AGI to Benefit Humanity",
+    "Blazing-fast, cost-effective Generative AI cloud services",
+    "SiliconFlow Ambassador Program",
 )
 OPENCODE_USAGE_TYPES = ("滚动用量", "每周用量", "每月用量")
 
@@ -196,6 +204,16 @@ def default_config() -> dict[str, Any]:
                         "url": DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL,
                     }
                 ],
+                "mode": "browser",
+            },
+            {
+                "id": "siliconflow",
+                "name": "SiliconFlow",
+                "type": "siliconflow",
+                "target_url": DEFAULT_SILICONFLOW_COUPON_URL,
+                "enabled": True,
+                "profile_dir": DEFAULT_PROFILE_DIR,
+                "cookie_cache": default_cookie_cache("siliconflow"),
                 "mode": "browser",
             },
         ]
@@ -896,6 +914,239 @@ def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]
     return metrics
 
 
+def parse_siliconflow_balance_tokens(tokens: list[str]) -> list[dict[str, Any]]:
+    balances = []
+    seen: set[tuple[str, str, str | None]] = set()
+    keywords = (
+        "余额",
+        "可用",
+        "剩余",
+        "赠金",
+        "充值",
+        "券",
+        "优惠券",
+        "代金券",
+        "coupon",
+        "Coupon",
+        "credit",
+        "Credit",
+        "balance",
+        "Balance",
+        "amount",
+        "Amount",
+    )
+    preferred_labels = ("可用余额", "账户余额", "余额", "赠金", "优惠券", "代金券", "balance", "Balance")
+
+    def add_balance(label: str, amount: str, currency: str | None) -> None:
+        amount = normalize_amount(amount)
+        key = (label, amount, currency or None)
+        if key in seen:
+            return
+        seen.add(key)
+        balances.append(balance_metric("balance", label, amount, currency or None))
+
+    def previous_coupon_label(idx: int) -> str | None:
+        for item in reversed(tokens[max(0, idx - 4) : idx]):
+            clean = item.strip()
+            if not clean or len(clean) > 48:
+                continue
+            if re.fullmatch(r"\d+(?:\.\d+)?", clean):
+                continue
+            if clean in {"全部", "可用", "兑换中心"}:
+                continue
+            return clean
+        return None
+
+    for idx, token in enumerate(tokens):
+        quota_match = re.search(
+            r"剩余额度[:：]\s*([$¥￥])?\s*(\d+(?:\.\d+)?)\s*(CNY|RMB|USD|USDT|元)?",
+            token,
+            re.I,
+        )
+        if quota_match:
+            symbol, amount, suffix = quota_match.groups()
+            currency = None
+            if symbol == "$":
+                currency = "USD"
+            elif symbol in ("¥", "￥"):
+                currency = "CNY"
+            elif suffix:
+                normalized = suffix.upper()
+                currency = "CNY" if normalized in ("RMB", "元") else normalized
+            prefix = previous_coupon_label(idx)
+            label = f"{prefix}剩余额度" if prefix else "剩余额度"
+            add_balance(label, amount, currency)
+            continue
+
+        window = tokens[max(0, idx - 2) : min(len(tokens), idx + 5)]
+        joined = "\n".join(window)
+        if not any(keyword in joined for keyword in keywords):
+            continue
+
+        keyword_items = [
+            (offset, item)
+            for offset, item in enumerate(window)
+            if any(keyword in item for keyword in keywords)
+        ]
+        for offset, item in enumerate(window):
+            clean = item.strip()
+            if not clean or len(clean) > 80:
+                continue
+            if re.search(r"\d{4}[-/年]\d{1,2}|^\d+%$", clean):
+                continue
+            has_currency = bool(re.search(r"[$¥￥]|(?:CNY|RMB|USD|USDT|元)\b", clean, re.I))
+            near_currency = next(
+                (
+                    "CNY" if item.strip().upper() in ("RMB", "元") else item.strip().upper()
+                    for item in window
+                    if item.strip().upper() in ("CNY", "RMB", "USD", "USDT", "元")
+                ),
+                None,
+            )
+            has_currency = has_currency or near_currency is not None
+            if not has_currency:
+                continue
+            parsed = parse_money_value(clean)
+            if not parsed:
+                continue
+            label = min(keyword_items, key=lambda pair: abs(pair[0] - offset))[1] if keyword_items else token
+            if len(label) > 80:
+                label = token
+            label = re.sub(
+                r"[（(]?\s*[$¥￥]\s*\d+(?:\.\d+)?\s*[）)]?",
+                "",
+                label,
+            ).strip("（）() ") or label
+            amount, currency = parsed
+            add_balance(label, amount, currency or near_currency)
+
+    ordered = sorted(
+        balances,
+        key=lambda item: 0 if item.get("label") in preferred_labels else 1,
+    )
+    deduped = []
+    seen_amounts: set[tuple[str, str | None]] = set()
+    for item in ordered:
+        key = (item["value"], item.get("currency"))
+        if key in seen_amounts:
+            continue
+        seen_amounts.add(key)
+        deduped.append(item)
+    return deduped[:5]
+
+
+def parse_siliconflow_metric_tokens(tokens: list[str]) -> list[dict[str, Any]]:
+    metrics = []
+    seen: set[tuple[str, str]] = set()
+    keywords = (
+        "账单",
+        "费用",
+        "消费",
+        "消耗",
+        "使用",
+        "到期",
+        "有效",
+        "过期",
+        "充值",
+        "expense",
+        "Expense",
+        "bill",
+        "Bill",
+        "used",
+        "Used",
+        "expires",
+        "Expires",
+        "valid",
+        "Valid",
+    )
+    ignored_labels = {
+        "used",
+        "expiresAt",
+        "quota",
+        "total",
+        "remain",
+        "remaining",
+        "余额充值",
+        "费用明细",
+    }
+    date_re = re.compile(
+        r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}(?:\s*~\s*\d{4}[-/年]\d{1,2}[-/月]\d{1,2})?|"
+        r"[A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4}"
+    )
+
+    def add_metric(label: str, value: str) -> None:
+        key = (label, value)
+        if key in seen:
+            return
+        seen.add(key)
+        metrics.append(text_metric(f"siliconflow_metric_{len(metrics) + 1}", label, value))
+
+    for idx, token in enumerate(tokens):
+        clean = token.strip()
+        if not clean or len(clean) > 80:
+            continue
+        if clean in ignored_labels:
+            continue
+        if clean == "代金券" and idx + 2 < len(tokens):
+            count = tokens[idx + 1].strip()
+            suffix = tokens[idx + 2].strip()
+            if re.fullmatch(r"\d+", count) and "张可用" in suffix:
+                add_metric("代金券", f"{count} 张可用")
+            continue
+        if not any(keyword in clean for keyword in keywords):
+            continue
+        window = tokens[idx : min(len(tokens), idx + 5)]
+        value = None
+        date_match = date_re.search("\n".join(window))
+        if date_match:
+            value = date_match.group(0)
+        if value is None:
+            value = next(
+                (
+                    item.strip()
+                    for item in window[1:]
+                    if item.strip()
+                    and len(item.strip()) <= 80
+                    and re.search(r"[$¥￥]\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:CNY|RMB|USD|USDT|元)\b|\d+%", item, re.I)
+                ),
+                None,
+            )
+        if not value:
+            continue
+        add_metric(clean, value)
+        if len(metrics) >= 6:
+            break
+    return metrics
+
+
+def siliconflow_snapshot(
+    config: ProviderConfig,
+    url: str,
+    balances: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    all_metrics = balances + metrics
+    return {
+        "id": config.id,
+        "name": config.name,
+        "type": config.type,
+        "status": "ok",
+        "url": url,
+        "updated_at": now_iso(),
+        "subscribed": None,
+        "balances": balances,
+        "usage": [],
+        "metrics": all_metrics,
+        "links": links_for_config(config),
+        "recommendation": recommendation_from_balances(balances),
+        "error": None if all_metrics else "SiliconFlow page loaded, but no balance or coupon fields were recognized",
+        "raw": {
+            "balance_count": len(balances),
+            "metric_count": len(metrics),
+        },
+    }
+
+
 def ezaiclub_snapshot(
     config: ProviderConfig,
     dashboard_url: str,
@@ -1170,6 +1421,53 @@ class EZAICLUBProvider(Provider):
             return []
 
 
+class SiliconFlowProvider(Provider):
+    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+        pw, context = build_browser(self.config.profile_dir)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            responses: list[dict[str, Any]] = []
+            self.capture_json_responses(page, responses)
+            page.goto(self.config.target_url, wait_until="networkidle", timeout=60000)
+            page.wait_for_timeout(3000)
+            body_text = page.inner_text("body")
+            login_probe = page.title() + "\n" + body_text
+            if is_login_html(page.url, login_probe, SILICONFLOW_LOGIN_HINTS):
+                raise NotLoggedInError("BrowserOS profile is not logged in to SiliconFlow")
+
+            tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
+            tokens.extend(extract_json_payloads(responses))
+            balances = parse_siliconflow_balance_tokens(tokens)
+            metrics = parse_siliconflow_metric_tokens(tokens)
+            if not balances and not metrics:
+                dump_tokens(
+                    self.config,
+                    tokens,
+                    title=page.title(),
+                    url=page.url,
+                    suffix="coupon",
+                )
+            return siliconflow_snapshot(self.config, page.url, balances, metrics)
+        finally:
+            context.close()
+            pw.stop()
+
+    def capture_json_responses(self, page, responses: list[dict[str, Any]]) -> None:
+        host = urlparse(self.config.target_url).hostname or "cloud.siliconflow.cn"
+
+        def handle_response(response) -> None:
+            try:
+                response_host = urlparse(response.url).hostname
+                content_type = response.headers.get("content-type", "")
+                if response_host != host or "json" not in content_type.lower():
+                    return
+                responses.append({"url": response.url, "data": response.json()})
+            except Exception:
+                return
+
+        page.on("response", handle_response)
+
+
 class ProviderManager:
     def __init__(
         self,
@@ -1193,6 +1491,8 @@ class ProviderManager:
             return DeepSeekProvider(config)
         if config.type == "ezaiclub":
             return EZAICLUBProvider(config)
+        if config.type == "siliconflow":
+            return SiliconFlowProvider(config)
         raise ValueError(f"unsupported provider type: {config.type}")
 
     def load_cache(self) -> dict[str, Any]:
