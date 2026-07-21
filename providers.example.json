@@ -1,0 +1,25 @@
+{
+  "providers": [
+    {
+      "id": "opencode-go",
+      "name": "OpenCode Go",
+      "type": "opencode",
+      "target_url": "https://opencode.ai/workspace/wrk_01KW9MTABWQ0DNJ014CV528WC2/go",
+      "enabled": true,
+      "profile_dir": "/home/cv/.browseros-crawler-profile",
+      "cookie_cache": "~/.cache/provider-dashboard/opencode-go/cookies.json",
+      "mode": "http_then_browser"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "type": "deepseek",
+      "target_url": "https://platform.deepseek.com/usage",
+      "enabled": true,
+      "profile_dir": "/home/cv/.browseros-crawler-profile",
+      "cookie_cache": "~/.cache/provider-dashboard/deepseek/cookies.json",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "mode": "api"
+    }
+  ]
+}

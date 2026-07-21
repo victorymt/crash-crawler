@@ -1,0 +1,7 @@
+providers.local.json
+.provider-cache.json
+page_dump.txt
+result.json
+dumps/
+__pycache__/
+.venv/
