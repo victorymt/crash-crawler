@@ -9,6 +9,8 @@
 
 看板会展示可解析到的余额、用量、订阅和券信息，并保留官方页面按钮用于充值或查看详情。
 
+![Provider Usage Hub dashboard](docs/dashboard.png)
+
 ## 运行 Web 看板
 
 安装 Playwright：
