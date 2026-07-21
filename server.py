@@ -358,6 +358,7 @@ def dashboard_html() -> str:
   </main>
   <script>
     const providers = {provider_json};
+    let activeOperation = false;
 
     function statusLabel(status) {{
       return ({{ ok: 'ok', stale: 'stale', error: 'error', idle: 'idle', unconfigured: 'unconfigured' }})[status] || status || 'idle';
@@ -413,6 +414,7 @@ def dashboard_html() -> str:
           ${{snapshot.error ? `<div class="error">${{snapshot.error}}</div>` : ''}}
           <div class="launch-actions">
             ${{linkButtons(provider, snapshot)}}
+            <button data-refresh-provider="${{provider.id}}">刷新</button>
             <button data-copy="${{provider.id}}">复制 URL</button>
           </div>
         </article>
@@ -424,6 +426,15 @@ def dashboard_html() -> str:
           navigator.clipboard.writeText(provider.target_url);
         }});
       }});
+      root.querySelectorAll('[data-refresh-provider]').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          const provider = providers.find((item) => item.id === button.dataset.refreshProvider);
+          if (provider) {{
+            refreshProvider(provider);
+          }}
+        }});
+      }});
+      setControlsDisabled(activeOperation);
     }}
 
     function metricHtml(metric) {{
@@ -463,6 +474,14 @@ def dashboard_html() -> str:
       node.classList.toggle('error', Boolean(isError));
     }}
 
+    function setControlsDisabled(disabled) {{
+      document.getElementById('refresh-all').disabled = disabled;
+      document.getElementById('sync-auth').disabled = disabled;
+      document.querySelectorAll('[data-refresh-provider]').forEach((button) => {{
+        button.disabled = disabled;
+      }});
+    }}
+
     async function fetchWithTimeout(url, options = {{}}, timeoutMs = 90000) {{
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -483,11 +502,13 @@ def dashboard_html() -> str:
     }}
 
     async function refreshAll() {{
+      if (activeOperation) {{
+        return;
+      }}
       const button = document.getElementById('refresh-all');
       const originalText = button.textContent;
-      const syncButton = document.getElementById('sync-auth');
-      button.disabled = true;
-      syncButton.disabled = true;
+      activeOperation = true;
+      setControlsDisabled(true);
       try {{
         for (let index = 0; index < providers.length; index += 1) {{
           const provider = providers[index];
@@ -502,18 +523,40 @@ def dashboard_html() -> str:
         await loadStatus();
         setRefreshMessage(error.message || '刷新失败', true);
       }} finally {{
-        button.disabled = false;
-        syncButton.disabled = false;
+        activeOperation = false;
+        setControlsDisabled(false);
         button.textContent = originalText;
       }}
     }}
 
+    async function refreshProvider(provider) {{
+      if (activeOperation) {{
+        return;
+      }}
+      activeOperation = true;
+      setControlsDisabled(true);
+      setRefreshMessage(`正在刷新 ${{provider.name}}`);
+      try {{
+        await fetchWithTimeout(`/api/providers/${{encodeURIComponent(provider.id)}}/refresh`, {{ method: 'POST' }});
+        await loadStatus();
+        setRefreshMessage(`${{provider.name}} 刷新完成：${{new Date().toLocaleTimeString()}}`);
+      }} catch (error) {{
+        await loadStatus();
+        setRefreshMessage(error.message || `${{provider.name}} 刷新失败`, true);
+      }} finally {{
+        activeOperation = false;
+        setControlsDisabled(false);
+      }}
+    }}
+
     async function syncAuth() {{
+      if (activeOperation) {{
+        return;
+      }}
       const button = document.getElementById('sync-auth');
-      const refreshButton = document.getElementById('refresh-all');
       const originalText = button.textContent;
-      button.disabled = true;
-      refreshButton.disabled = true;
+      activeOperation = true;
+      setControlsDisabled(true);
       button.textContent = '同步中';
       setRefreshMessage('正在同步 BrowserOS 登录态...');
       try {{
@@ -523,8 +566,8 @@ def dashboard_html() -> str:
       }} catch (error) {{
         setRefreshMessage(error.message || '同步登录态失败', true);
       }} finally {{
-        button.disabled = false;
-        refreshButton.disabled = false;
+        activeOperation = false;
+        setControlsDisabled(false);
         button.textContent = originalText;
       }}
     }}
