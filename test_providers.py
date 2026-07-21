@@ -1,7 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from providers import (
+    DeepSeekProvider,
+    EZAICLUBProvider,
     ProviderConfig,
+    ProviderManager,
+    SiliconFlowProvider,
     parse_deepseek_balance,
     parse_ezaiclub_balance_tokens,
     parse_ezaiclub_subscription_tokens,
@@ -9,6 +15,7 @@ from providers import (
     parse_percent,
     parse_siliconflow_balance_tokens,
     parse_siliconflow_metric_tokens,
+    sync_browseros_profile,
 )
 
 
@@ -127,6 +134,71 @@ class ProviderParserTests(unittest.TestCase):
         metrics = parse_siliconflow_metric_tokens(["有效期", "2026-08-21", "账单金额", "1.20"])
         self.assertEqual(metrics[0]["label"], "有效期")
         self.assertEqual(metrics[0]["value"], "2026-08-21")
+
+    def test_provider_manager_registry(self):
+        configs = [
+            ProviderConfig(
+                id="deepseek",
+                name="DeepSeek",
+                type="deepseek",
+                target_url="https://platform.deepseek.com/usage",
+            ),
+            ProviderConfig(
+                id="ezaiclub",
+                name="EZAICLUB",
+                type="ezaiclub",
+                target_url="https://www.ezaiclub.com/dashboard",
+            ),
+            ProviderConfig(
+                id="siliconflow",
+                name="SiliconFlow",
+                type="siliconflow",
+                target_url="https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
+            ),
+        ]
+        manager = ProviderManager(configs=configs)
+
+        self.assertIsInstance(manager.get_provider("deepseek"), DeepSeekProvider)
+        self.assertIsInstance(manager.get_provider("ezaiclub"), EZAICLUBProvider)
+        self.assertIsInstance(manager.get_provider("siliconflow"), SiliconFlowProvider)
+
+    def test_provider_manager_rejects_unknown_type(self):
+        manager = ProviderManager(
+            configs=[
+                ProviderConfig(
+                    id="unknown",
+                    name="Unknown",
+                    type="unknown",
+                    target_url="https://example.test",
+                )
+            ]
+        )
+        with self.assertRaises(ValueError):
+            manager.get_provider("unknown")
+
+    def test_sync_browseros_profile_copies_files_and_removes_singletons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            (source / "Cookies").write_text("cookie-db", encoding="utf-8")
+            (source / "SingletonLock").write_text("source-lock", encoding="utf-8")
+            target.mkdir()
+            (target / "SingletonSocket").write_text("target-lock", encoding="utf-8")
+
+            result = sync_browseros_profile(source, target)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual((target / "Cookies").read_text(encoding="utf-8"), "cookie-db")
+            self.assertFalse((target / "SingletonLock").exists())
+            self.assertFalse((target / "SingletonSocket").exists())
+
+    def test_sync_browseros_profile_rejects_missing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(Exception):
+                sync_browseros_profile(root / "missing", root / "target")
 
 
 if __name__ == "__main__":

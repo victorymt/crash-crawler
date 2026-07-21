@@ -87,6 +87,8 @@ cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
 
 BrowserOS 关闭时复制最干净。Web 看板里的“打开”按钮不依赖这个副本，直接使用当前浏览器自己的登录态。
 
+Web 看板里的“同步登录态”按钮会执行同样的同步动作，并清理副本里的 Chromium lock 文件。同步完成后再点“刷新解析”。
+
 EZAICLUB 或 SiliconFlow 如果未登录，卡片会显示登录态错误；官方页面按钮仍会保留，方便进入官方站点登录或查看详情。
 
 如果看到 `No module named 'playwright'`，说明当前 `.venv` 还没安装依赖：

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.cookiejar import Cookie, CookieJar
@@ -19,6 +20,9 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 BROWSEROS_BIN = os.environ.get("BROWSEROS_BIN", "/usr/bin/browseros")
 DEFAULT_PROFILE_DIR = os.environ.get(
     "BROWSEROS_PROFILE_DIR", "/home/cv/.browseros-crawler-profile"
+)
+BROWSEROS_SOURCE_PROFILE_DIR = os.environ.get(
+    "BROWSEROS_SOURCE_PROFILE_DIR", "/home/cv/.config/browser-os"
 )
 DEFAULT_OPENCODE_URL = (
     "https://opencode.ai/workspace/wrk_01KW9MTABWQ0DNJ014CV528WC2/go"
@@ -256,6 +260,44 @@ def build_browser(profile_dir: str):
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
     return pw, context
+
+
+def remove_profile_singletons(profile_dir: Path) -> None:
+    for name in ("SingletonCookie", "SingletonLock", "SingletonSocket"):
+        path = profile_dir / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def sync_browseros_profile(
+    source_dir: str | Path = BROWSEROS_SOURCE_PROFILE_DIR,
+    target_dir: str | Path = DEFAULT_PROFILE_DIR,
+) -> dict[str, Any]:
+    source = Path(source_dir).expanduser()
+    target = Path(target_dir).expanduser()
+    if not source.exists() or not source.is_dir():
+        raise ProviderError(f"BrowserOS source profile not found: {source}")
+    if source.resolve() == target.resolve():
+        raise ProviderError("BrowserOS source and target profiles must be different")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    remove_profile_singletons(target)
+    shutil.copytree(
+        source,
+        target,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("SingletonCookie", "SingletonLock", "SingletonSocket"),
+    )
+    remove_profile_singletons(target)
+    return {
+        "ok": True,
+        "source": str(source),
+        "target": str(target),
+        "synced_at": now_iso(),
+    }
 
 
 def html_tokens(html: str) -> list[str]:
@@ -1218,6 +1260,57 @@ class Provider:
             pw.stop()
 
 
+class BrowserJsonProvider(Provider):
+    login_hints: tuple[str, ...] = ()
+    login_error = "BrowserOS profile is not logged in"
+    default_host = ""
+
+    def capture_json_responses(
+        self,
+        page,
+        responses: list[dict[str, Any]],
+        host: str | None = None,
+    ) -> None:
+        target_host = host or urlparse(self.config.target_url).hostname or self.default_host
+
+        def handle_response(response) -> None:
+            try:
+                response_host = urlparse(response.url).hostname
+                content_type = response.headers.get("content-type", "")
+                if response_host != target_host or "json" not in content_type.lower():
+                    return
+                responses.append({"url": response.url, "data": response.json()})
+            except Exception:
+                return
+
+        page.on("response", handle_response)
+
+    def goto_with_json(
+        self,
+        page,
+        url: str,
+        host: str | None = None,
+        timeout: int = 60000,
+        settle_ms: int = 3000,
+    ) -> tuple[str, list[str], list[dict[str, Any]]]:
+        responses: list[dict[str, Any]] = []
+        self.capture_json_responses(page, responses, host)
+        page.goto(url, wait_until="networkidle", timeout=timeout)
+        page.wait_for_timeout(settle_ms)
+        body_text = page.inner_text("body")
+        login_probe = page.title() + "\n" + body_text
+        if is_login_html(page.url, login_probe, self.login_hints):
+            raise NotLoggedInError(self.login_error)
+        tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
+        tokens.extend(extract_json_payloads(responses))
+        return page.url, tokens, responses
+
+    def with_browser_page(self):
+        pw, context = build_browser(self.config.profile_dir)
+        page = context.pages[0] if context.pages else context.new_page()
+        return pw, context, page
+
+
 class OpenCodeProvider(Provider):
     def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
         if not self.config.cookie_cache:
@@ -1335,56 +1428,35 @@ class DeepSeekProvider(Provider):
             raise ProviderError(deepseek_http_error_message(exc)) from exc
 
 
-class EZAICLUBProvider(Provider):
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
-        pw, context = build_browser(self.config.profile_dir)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            responses: list[dict[str, Any]] = []
-            self.capture_json_responses(page, responses)
-            page.goto(self.config.target_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
-            dashboard_text = page.inner_text("body")
-            if is_login_html(page.url, page.title() + "\n" + dashboard_text, EZAICLUB_LOGIN_HINTS):
-                raise NotLoggedInError("BrowserOS profile is not logged in to EZAICLUB")
+class EZAICLUBProvider(BrowserJsonProvider):
+    login_hints = EZAICLUB_LOGIN_HINTS
+    login_error = "BrowserOS profile is not logged in to EZAICLUB"
+    default_host = "www.ezaiclub.com"
 
-            dashboard_tokens = [line.strip() for line in dashboard_text.splitlines() if line.strip()]
-            json_tokens = extract_json_payloads(responses)
-            balances = parse_ezaiclub_balance_tokens(dashboard_tokens + json_tokens)
+    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+        pw, context, page = self.with_browser_page()
+        try:
+            dashboard_url, dashboard_tokens, _ = self.goto_with_json(page, self.config.target_url)
+            balances = parse_ezaiclub_balance_tokens(dashboard_tokens)
             if not balances:
                 dump_tokens(
                     self.config,
-                    dashboard_tokens + json_tokens,
+                    dashboard_tokens,
                     title=page.title(),
-                    url=page.url,
+                    url=dashboard_url,
                     suffix="dashboard",
                 )
 
             subscription_metrics = self.fetch_subscription_metrics(page)
             return ezaiclub_snapshot(
                 self.config,
-                dashboard_url=page.url if "/subscriptions" not in page.url else self.config.target_url,
+                dashboard_url=dashboard_url if "/subscriptions" not in dashboard_url else self.config.target_url,
                 balances=balances,
                 subscription_metrics=subscription_metrics,
             )
         finally:
             context.close()
             pw.stop()
-
-    def capture_json_responses(self, page, responses: list[dict[str, Any]]) -> None:
-        host = urlparse(self.config.target_url).hostname or "www.ezaiclub.com"
-
-        def handle_response(response) -> None:
-            try:
-                response_host = urlparse(response.url).hostname
-                content_type = response.headers.get("content-type", "")
-                if response_host != host or "json" not in content_type.lower():
-                    return
-                responses.append({"url": response.url, "data": response.json()})
-            except Exception:
-                return
-
-        page.on("response", handle_response)
 
     def fetch_subscription_metrics(self, page) -> list[dict[str, Any]]:
         subscription_url = next(
@@ -1396,22 +1468,14 @@ class EZAICLUBProvider(Provider):
             DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL,
         )
         try:
-            responses: list[dict[str, Any]] = []
-            self.capture_json_responses(page, responses)
-            page.goto(subscription_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
-            body_text = page.inner_text("body")
-            if is_login_html(page.url, page.title() + "\n" + body_text, EZAICLUB_LOGIN_HINTS):
-                raise NotLoggedInError("BrowserOS profile is not logged in to EZAICLUB")
-            tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
-            tokens.extend(extract_json_payloads(responses))
+            page_url, tokens, _ = self.goto_with_json(page, subscription_url)
             metrics = parse_ezaiclub_subscription_tokens(tokens)
             if not metrics:
                 dump_tokens(
                     self.config,
                     tokens,
                     title=page.title(),
-                    url=page.url,
+                    url=page_url,
                     suffix="subscriptions",
                 )
             return metrics
@@ -1421,22 +1485,15 @@ class EZAICLUBProvider(Provider):
             return []
 
 
-class SiliconFlowProvider(Provider):
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
-        pw, context = build_browser(self.config.profile_dir)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            responses: list[dict[str, Any]] = []
-            self.capture_json_responses(page, responses)
-            page.goto(self.config.target_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
-            body_text = page.inner_text("body")
-            login_probe = page.title() + "\n" + body_text
-            if is_login_html(page.url, login_probe, SILICONFLOW_LOGIN_HINTS):
-                raise NotLoggedInError("BrowserOS profile is not logged in to SiliconFlow")
+class SiliconFlowProvider(BrowserJsonProvider):
+    login_hints = SILICONFLOW_LOGIN_HINTS
+    login_error = "BrowserOS profile is not logged in to SiliconFlow"
+    default_host = "cloud.siliconflow.cn"
 
-            tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
-            tokens.extend(extract_json_payloads(responses))
+    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+        pw, context, page = self.with_browser_page()
+        try:
+            page_url, tokens, _ = self.goto_with_json(page, self.config.target_url)
             balances = parse_siliconflow_balance_tokens(tokens)
             metrics = parse_siliconflow_metric_tokens(tokens)
             if not balances and not metrics:
@@ -1444,28 +1501,21 @@ class SiliconFlowProvider(Provider):
                     self.config,
                     tokens,
                     title=page.title(),
-                    url=page.url,
+                    url=page_url,
                     suffix="coupon",
                 )
-            return siliconflow_snapshot(self.config, page.url, balances, metrics)
+            return siliconflow_snapshot(self.config, page_url, balances, metrics)
         finally:
             context.close()
             pw.stop()
 
-    def capture_json_responses(self, page, responses: list[dict[str, Any]]) -> None:
-        host = urlparse(self.config.target_url).hostname or "cloud.siliconflow.cn"
 
-        def handle_response(response) -> None:
-            try:
-                response_host = urlparse(response.url).hostname
-                content_type = response.headers.get("content-type", "")
-                if response_host != host or "json" not in content_type.lower():
-                    return
-                responses.append({"url": response.url, "data": response.json()})
-            except Exception:
-                return
-
-        page.on("response", handle_response)
+PROVIDER_TYPES: dict[str, type[Provider]] = {
+    "opencode": OpenCodeProvider,
+    "deepseek": DeepSeekProvider,
+    "ezaiclub": EZAICLUBProvider,
+    "siliconflow": SiliconFlowProvider,
+}
 
 
 class ProviderManager:
@@ -1485,14 +1535,9 @@ class ProviderManager:
         config = next((item for item in self.configs if item.id == provider_id), None)
         if not config:
             raise KeyError(f"unknown provider: {provider_id}")
-        if config.type == "opencode":
-            return OpenCodeProvider(config)
-        if config.type == "deepseek":
-            return DeepSeekProvider(config)
-        if config.type == "ezaiclub":
-            return EZAICLUBProvider(config)
-        if config.type == "siliconflow":
-            return SiliconFlowProvider(config)
+        provider_class = PROVIDER_TYPES.get(config.type)
+        if provider_class:
+            return provider_class(config)
         raise ValueError(f"unsupported provider type: {config.type}")
 
     def load_cache(self) -> dict[str, Any]:

@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from providers import ProviderManager, links_for_config, load_config
+from providers import ProviderError, ProviderManager, links_for_config, load_config, sync_browseros_profile
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PORT = 19765
@@ -106,6 +106,21 @@ def dashboard_html() -> str:
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+    }}
+    .toolbar-wrap {{
+      display: grid;
+      justify-items: end;
+      gap: 4px;
+    }}
+    .refresh-message {{
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }}
+    .refresh-message.error {{
+      color: var(--bad);
     }}
     button, a.button {{
       display: inline-flex;
@@ -325,9 +340,13 @@ def dashboard_html() -> str:
 <body>
   <header>
     <h1>Provider Usage Hub</h1>
-    <div class="toolbar">
-      <button id="refresh-all">刷新解析</button>
-      <button id="open-all">打开全部</button>
+    <div class="toolbar-wrap">
+      <div class="toolbar">
+        <button id="sync-auth">同步登录态</button>
+        <button id="refresh-all">刷新解析</button>
+        <button id="open-all">打开全部</button>
+      </div>
+      <div id="refresh-message" class="refresh-message" aria-live="polite"></div>
     </div>
   </header>
   <main>
@@ -438,21 +457,83 @@ def dashboard_html() -> str:
       `).join('');
     }}
 
+    function setRefreshMessage(message, isError = false) {{
+      const node = document.getElementById('refresh-message');
+      node.textContent = message || '';
+      node.classList.toggle('error', Boolean(isError));
+    }}
+
+    async function fetchWithTimeout(url, options = {{}}, timeoutMs = 90000) {{
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {{
+        const response = await fetch(url, {{ ...options, signal: controller.signal }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
+        }}
+        return response;
+      }} catch (error) {{
+        if (error.name === 'AbortError') {{
+          throw new Error('请求超时，请稍后重试或检查 provider 登录态');
+        }}
+        throw error;
+      }} finally {{
+        window.clearTimeout(timeout);
+      }}
+    }}
+
     async function refreshAll() {{
       const button = document.getElementById('refresh-all');
+      const originalText = button.textContent;
+      const syncButton = document.getElementById('sync-auth');
       button.disabled = true;
+      syncButton.disabled = true;
       try {{
-        await fetch('/api/refresh', {{ method: 'POST' }});
+        for (let index = 0; index < providers.length; index += 1) {{
+          const provider = providers[index];
+          const progress = `${{index + 1}}/${{providers.length}}`;
+          button.textContent = `刷新中 ${{progress}}`;
+          setRefreshMessage(`正在刷新 ${{provider.name}} (${{progress}})`);
+          await fetchWithTimeout(`/api/providers/${{encodeURIComponent(provider.id)}}/refresh`, {{ method: 'POST' }});
+          await loadStatus();
+        }}
+        setRefreshMessage(`刷新完成：${{new Date().toLocaleTimeString()}}`);
+      }} catch (error) {{
         await loadStatus();
+        setRefreshMessage(error.message || '刷新失败', true);
       }} finally {{
         button.disabled = false;
+        syncButton.disabled = false;
+        button.textContent = originalText;
+      }}
+    }}
+
+    async function syncAuth() {{
+      const button = document.getElementById('sync-auth');
+      const refreshButton = document.getElementById('refresh-all');
+      const originalText = button.textContent;
+      button.disabled = true;
+      refreshButton.disabled = true;
+      button.textContent = '同步中';
+      setRefreshMessage('正在同步 BrowserOS 登录态...');
+      try {{
+        await fetchWithTimeout('/api/sync-auth', {{ method: 'POST' }}, 120000);
+        await loadStatus();
+        setRefreshMessage(`登录态已同步：${{new Date().toLocaleTimeString()}}`);
+      }} catch (error) {{
+        setRefreshMessage(error.message || '同步登录态失败', true);
+      }} finally {{
+        button.disabled = false;
+        refreshButton.disabled = false;
+        button.textContent = originalText;
       }}
     }}
 
     document.getElementById('refresh-all').addEventListener('click', refreshAll);
+    document.getElementById('sync-auth').addEventListener('click', syncAuth);
     document.getElementById('open-all').addEventListener('click', () => providers.forEach(openProvider));
     renderLaunchers();
-    loadStatus().then(refreshAll);
+    loadStatus();
   </script>
 </body>
 </html>
@@ -510,6 +591,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/sync-auth":
+            try:
+                self.send_json(sync_browseros_profile())
+            except ProviderError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
         if path == "/api/refresh":
             self.send_json({"providers": self.manager.refresh_all()})
             return
