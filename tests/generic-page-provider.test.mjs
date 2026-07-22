@@ -95,3 +95,73 @@ test("generic page provider collects configured balance and quota rules", async 
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;
 });
+
+test("generic page provider collects CSS selector rules from multiple pages", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    throw new Error("open tabs should be used for selector sources");
+  };
+  globalThis.chrome = {
+    tabs: {
+      async query() {
+        return [
+          { id: 11, url: "https://example.test/dashboard" },
+          { id: 12, url: "https://example.test/subscriptions" }
+        ];
+      }
+    },
+    scripting: {
+      async executeScript({ target }) {
+        const subscription = target.tabId === 12;
+        return [{
+          result: {
+            title: subscription ? "Subscriptions" : "Dashboard",
+            url: subscription ? "https://example.test/subscriptions" : "https://example.test/dashboard",
+            text: subscription ? "$50.15 / $50.00\n2026-07-29" : "$74.84",
+            jsonScripts: [],
+            storageValues: [],
+            selectorResults: subscription
+              ? {
+                  "quota-1": { values: ["$50.15 / $50.00"], resetValues: ["6天13小时"] },
+                  "text-1": { values: ["2026-07-29"] }
+                }
+              : { "balance-1": { values: ["$74.84"] } }
+          }
+        }];
+      }
+    }
+  };
+
+  const { collectProvider } = await import(`../extension/src/providers/index.js?selectors=${Date.now()}`);
+  const snapshot = await collectProvider({
+    id: "selector-provider",
+    name: "Selector Provider",
+    type: "page",
+    targetUrl: "https://example.test/dashboard",
+    enabled: true,
+    secondaryUrls: [{ id: "subscriptions", label: "订阅", url: "https://example.test/subscriptions" }],
+    parserRules: {
+      balances: [{ id: "balance-1", pageId: "main", label: "余额", selector: ".balance", currency: "USD" }],
+      quotas: [{
+        id: "quota-1",
+        pageId: "subscriptions",
+        label: "每周用量",
+        mode: "combined",
+        selector: ".quota",
+        resetSelector: ".reset",
+        currency: "USD"
+      }],
+      textMetrics: [{ id: "text-1", pageId: "subscriptions", label: "到期时间", selector: ".expires" }]
+    }
+  });
+
+  assert.equal(snapshot.balances[0].value, "74.84");
+  assert.equal(snapshot.usage[0].value, "$50.15 / $50.00");
+  assert.equal(snapshot.usage[0].resetIn, "6天13小时");
+  assert.equal(snapshot.metrics.some((item) => item.label === "到期时间" && item.value === "2026-07-29"), true);
+
+  globalThis.chrome = originalChrome;
+  globalThis.fetch = originalFetch;
+});

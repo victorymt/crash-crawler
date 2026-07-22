@@ -1,4 +1,4 @@
-import { DEEPSEEK_BALANCE_URL } from "../shared/config.js";
+import { DEEPSEEK_BALANCE_URL, originsForConfig } from "../shared/config.js";
 import {
   NotLoggedInError,
   OPENCODE_LOGIN_HINTS,
@@ -14,6 +14,7 @@ import {
   opencodeSnapshot,
   pageTextTokens,
   parseGenericPageTokens,
+  parseGenericSelectorResults,
   parseDeepseekBalance,
   parseEzaiclubBalanceTokens,
   parseEzaiclubSubscriptionTokens,
@@ -79,13 +80,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function extractTokensFromTab(tabId, waitOptions = {}) {
-  const effectiveWaitOptions = { ...DEFAULT_RENDER_WAIT_OPTIONS, ...waitOptions };
+async function extractTokensFromTab(tabId, waitOptions = {}, selectorRules = []) {
+  const effectiveWaitOptions = { ...DEFAULT_RENDER_WAIT_OPTIONS, ...waitOptions, selectorRules };
   const [{ result } = {}] = await chrome.scripting.executeScript({
     target: { tabId },
     func: async (options) => {
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const usagePattern = new RegExp(options.readyPattern, "i");
+      const usagePattern = options.readyPattern ? new RegExp(options.readyPattern, "i") : null;
       const startedAt = Date.now();
       const deadline = startedAt + options.waitMs;
       let lastText = "";
@@ -94,7 +95,19 @@ async function extractTokensFromTab(tabId, waitOptions = {}) {
       while (Date.now() < deadline) {
         const text = document.body ? document.body.innerText : "";
         const waitedLongEnough = Date.now() - startedAt >= options.minWaitMs;
-        if (waitedLongEnough && usagePattern.test(text)) {
+        let selectorReady = false;
+        if (waitedLongEnough && (options.readySelector || options.selectorRules.length)) {
+          const selectors = [
+            options.readySelector,
+            ...options.selectorRules.flatMap((rule) => [rule.selector, rule.usedSelector, rule.limitSelector])
+          ].filter(Boolean);
+          try {
+            selectorReady = selectors.some((selector) => document.querySelector(selector));
+          } catch (error) {
+            throw new Error(`Invalid CSS selector: ${error.message}`);
+          }
+        }
+        if (waitedLongEnough && (selectorReady || usagePattern?.test(text))) {
           break;
         }
         if (text && text === lastText) {
@@ -124,13 +137,39 @@ async function extractTokensFromTab(tabId, waitOptions = {}) {
         }
       }
 
+      const readValues = (selector, attribute = "textContent") => {
+        if (!selector) return [];
+        let nodes;
+        try {
+          nodes = Array.from(document.querySelectorAll(selector));
+        } catch (error) {
+          throw new Error(`Invalid CSS selector ${selector}: ${error.message}`);
+        }
+        return nodes.map((node) => {
+          if (attribute === "textContent") return node.textContent || "";
+          if (attribute === "innerText") return node.innerText || "";
+          if (attribute === "value" && "value" in node) return node.value || "";
+          return node.getAttribute(attribute) || "";
+        }).map((value) => String(value).trim()).filter(Boolean);
+      };
+      const selectorResults = {};
+      for (const rule of options.selectorRules) {
+        selectorResults[rule.id] = {
+          values: readValues(rule.selector, rule.attribute),
+          usedValues: readValues(rule.usedSelector, rule.usedAttribute || rule.attribute),
+          limitValues: readValues(rule.limitSelector, rule.limitAttribute || rule.attribute),
+          resetValues: readValues(rule.resetSelector, rule.resetAttribute || "textContent")
+        };
+      }
+
       return {
         title: document.title,
         url: location.href,
         text: document.body ? document.body.innerText : "",
         jsonScripts: Array.from(document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__'))
           .map((node) => node.textContent || ""),
-        storageValues
+        storageValues,
+        selectorResults
       };
     },
     args: [effectiveWaitOptions]
@@ -171,7 +210,7 @@ async function getOpenTabTokens(url, options = {}) {
   const tabs = await chrome.tabs.query({ url: `${new URL(url).origin}/*` });
   const matchingTab = pickBestTab(tabs, url, options);
   if (!matchingTab?.id) return null;
-  return extractTokensFromTab(matchingTab.id, options.waitOptions);
+  return extractTokensFromTab(matchingTab.id, options.waitOptions, options.selectorRules || []);
 }
 
 async function getRenderedTabTokens(url, options = {}) {
@@ -181,7 +220,7 @@ async function getRenderedTabTokens(url, options = {}) {
   try {
     await waitForTabComplete(tab.id);
     await delay(options.afterLoadDelayMs ?? 1500);
-    return await extractTokensFromTab(tab.id, options.waitOptions);
+    return await extractTokensFromTab(tab.id, options.waitOptions, options.selectorRules || []);
   } finally {
     try {
       await chrome.tabs.remove(tab.id);
@@ -223,33 +262,33 @@ function tabMatchScore(tabUrl, target) {
 
 async function tokensFromUrl(url, loginHints, loginError, options = {}) {
   const openTab = await getOpenTabTokens(url, options);
-  if (openTab?.tokens?.length) {
+  if (openTab?.tokens?.length || Object.keys(openTab?.selectorResults || {}).length) {
     if (isLoginHtml(openTab.url, `${openTab.title}\n${openTab.text}`, loginHints)) {
       throw new NotLoggedInError(loginError);
     }
-    if (options.renderFallback && options.shouldUseRenderedTokens?.(openTab.tokens)) {
+    if (options.renderFallback && options.shouldUseRenderedTokens?.(openTab.tokens, openTab)) {
       const rendered = await getRenderedTabTokens(url, options);
-      if (rendered?.tokens?.length) {
+      if (rendered?.tokens?.length || Object.keys(rendered?.selectorResults || {}).length) {
         if (isLoginHtml(rendered.url, `${rendered.title}\n${rendered.text}`, loginHints)) {
           throw new NotLoggedInError(loginError);
         }
-        return { url: rendered.url, tokens: rendered.tokens };
+        return rendered;
       }
     }
-    return { url: openTab.url, tokens: openTab.tokens };
+    return openTab;
   }
   const page = await fetchText(url);
   if (isLoginHtml(page.url, page.text, loginHints)) {
     throw new NotLoggedInError(loginError);
   }
   const fetchedTokens = htmlTokens(page.text);
-  if (options.renderFallback && options.shouldUseRenderedTokens?.(fetchedTokens)) {
+  if (options.renderFallback && options.shouldUseRenderedTokens?.(fetchedTokens, null)) {
     const rendered = await getRenderedTabTokens(url, options);
-    if (rendered?.tokens?.length) {
+    if (rendered?.tokens?.length || Object.keys(rendered?.selectorResults || {}).length) {
       if (isLoginHtml(rendered.url, `${rendered.title}\n${rendered.text}`, loginHints)) {
         throw new NotLoggedInError(loginError);
       }
-      return { url: rendered.url, tokens: rendered.tokens };
+      return rendered;
     }
   }
   return { url: page.url, tokens: fetchedTokens };
@@ -346,22 +385,47 @@ async function collectSiliconFlow(config) {
   return siliconflowSnapshot(config, page.url, balances, metrics);
 }
 
+function selectorRulesForPage(parserRules, pageId) {
+  return [
+    ...(parserRules.balances || []),
+    ...(parserRules.quotas || []),
+    ...(parserRules.textMetrics || [])
+  ].filter((rule) => (rule.pageId || "main") === pageId)
+    .filter((rule) => rule.selector || rule.usedSelector || rule.limitSelector)
+    .map((rule) => ({ ...rule }));
+}
+
+function hasSelectorRules(parserRules = {}) {
+  return [parserRules.balances, parserRules.quotas, parserRules.textMetrics]
+    .some((rules) => (rules || []).some((rule) => rule.selector || rule.usedSelector || rule.limitSelector));
+}
+
+function mergeGenericParsed(left, right) {
+  const balances = [...(left.balances || []), ...(right.balances || [])];
+  const usage = [...(left.usage || []), ...(right.usage || [])];
+  const textMetrics = [...(left.textMetrics || []), ...(right.textMetrics || [])];
+  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+}
+
 async function collectGenericPage(config) {
   const parserRules = config.parserRules || {};
   const loginHints = Array.isArray(parserRules.loginHints) ? parserRules.loginHints : [];
   const waitOptions = {
     ...DEFAULT_RENDER_WAIT_OPTIONS,
     ...(parserRules.readyPattern ? { readyPattern: parserRules.readyPattern } : {}),
+    ...(parserRules.readySelector ? { readySelector: parserRules.readySelector } : {}),
     ...(parserRules.waitOptions || {})
   };
   const pages = [
-    { url: config.targetUrl, required: true },
-    ...(config.secondaryUrls || []).map((item) => ({ url: item.url, required: false }))
+    { id: "main", url: config.targetUrl, required: true },
+    ...(config.secondaryUrls || []).map((item) => ({ id: item.id, url: item.url, required: false }))
   ];
   const allTokens = [];
+  const selectorResults = {};
   let snapshotUrl = config.targetUrl;
 
   for (const pageConfig of pages) {
+    const pageSelectorRules = selectorRulesForPage(parserRules, pageConfig.id);
     try {
       const page = await tokensFromUrl(
         pageConfig.url,
@@ -371,21 +435,40 @@ async function collectGenericPage(config) {
           renderFallback: true,
           requirePathMatch: parserRules.requirePathMatch !== false,
           waitOptions,
+          selectorRules: pageSelectorRules,
           afterLoadDelayMs: Number(parserRules.afterLoadDelayMs || 1800),
-          shouldUseRenderedTokens: (tokens) => !parseGenericPageTokens(tokens, parserRules).metrics.length
+          shouldUseRenderedTokens: (tokens, page) => {
+            if (!pageSelectorRules.length) return !parseGenericPageTokens(tokens, parserRules).metrics.length;
+            return !Object.values(page?.selectorResults || {}).some((result) => {
+              return [result.values, result.usedValues, result.limitValues].some((values) => values?.length);
+            });
+          }
         }
       );
       if (pageConfig.required) snapshotUrl = page.url;
       allTokens.push(...page.tokens);
+      Object.assign(selectorResults, page.selectorResults || {});
     } catch (error) {
-      if (error instanceof NotLoggedInError || pageConfig.required) throw error;
+      if (error instanceof NotLoggedInError || pageConfig.required || pageSelectorRules.length) throw error;
     }
   }
 
-  return genericPageSnapshot(config, snapshotUrl, parseGenericPageTokens(allTokens, parserRules));
+  const tokenParsed = parseGenericPageTokens(allTokens, parserRules);
+  const selectorParsed = parseGenericSelectorResults(selectorResults, parserRules);
+  return genericPageSnapshot(config, snapshotUrl, mergeGenericParsed(tokenParsed, selectorParsed));
+}
+
+async function ensureProviderPermission(config) {
+  if (!globalThis.chrome?.permissions?.contains) return;
+  const origins = originsForConfig(config);
+  if (!await chrome.permissions.contains({ origins })) {
+    throw new Error(`Open extension settings and grant access to ${origins.join(", ")}`);
+  }
 }
 
 export async function collectProvider(config) {
+  await ensureProviderPermission(config);
+  if (hasSelectorRules(config.parserRules)) return collectGenericPage(config);
   if (config.type === "opencode") return collectOpenCode(config);
   if (config.type === "deepseek") return collectDeepSeek(config);
   if (config.type === "ezaiclub") return collectEzaiclub(config);

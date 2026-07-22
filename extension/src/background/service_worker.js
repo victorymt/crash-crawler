@@ -1,8 +1,10 @@
 import { normalizeProviderConfig } from "../shared/config.js";
 import { blankSnapshot, errorSnapshot } from "../shared/snapshots.js";
 import {
+  exportProviderConfig,
   getProviderConfigs,
   getSnapshots,
+  importProviderConfig,
   saveProviderConfigs,
   saveSnapshot,
   setSecret
@@ -34,6 +36,15 @@ async function refreshProvider(providerId) {
   }
 }
 
+async function testProvider(providerInput) {
+  const configs = await getProviderConfigs();
+  const config = typeof providerInput === "string"
+    ? configs.find((item) => item.id === providerInput)
+    : normalizeProviderConfig(providerInput);
+  if (!config) throw new Error(`unknown provider: ${providerInput}`);
+  return collectProvider(config);
+}
+
 async function refreshAllProviders() {
   const configs = await publicConfigs();
   const providers = [];
@@ -63,6 +74,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { configs: await getProviderConfigs() };
       case "config:save":
         return { configs: await saveProviderConfigs(message.configs || []) };
+      case "config:importProvider":
+        return { provider: await importProviderConfig(message.provider) };
+      case "config:exportProvider":
+        return { provider: await exportProviderConfig(message.providerId) };
+      case "providers:test":
+        return { provider: await testProvider(message.provider || message.providerId) };
       case "secret:setDeepSeekKey":
         if (message.value) {
           await setSecret("deepseekApiKey", message.value);

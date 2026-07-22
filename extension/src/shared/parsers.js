@@ -228,8 +228,8 @@ function compileRulePattern(rule) {
   if (!rule?.pattern) return null;
   try {
     return new RegExp(rule.pattern, rule.flags || "");
-  } catch {
-    return null;
+  } catch (error) {
+    throw new ProviderError(`Invalid parser rule regex${rule.label ? ` for ${rule.label}` : ""}: ${error.message}`);
   }
 }
 
@@ -282,6 +282,79 @@ function genericValueFromRule(tokens, rule, match) {
   return groupValue(match, rule.valueGroup ?? 1);
 }
 
+function firstSelectorValue(values) {
+  return (values || []).map((value) => String(value || "").trim()).find(Boolean) || "";
+}
+
+function numericValues(value) {
+  return [...String(value || "").matchAll(/-?\d+(?:[.,]\d+)?/g)].map((match) => match[0].replace(/,/g, ""));
+}
+
+function selectorValue(value, rule, group = 1, fallbackToText = false) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const pattern = compileRulePattern(rule);
+  if (pattern) {
+    const match = text.match(pattern);
+    return groupValue(match, group) || numericValues(match?.[0])[0] || "";
+  }
+  if (fallbackToText) return text;
+  return numericValues(text)[0] || "";
+}
+
+export function parseGenericSelectorResults(selectorResults, parserRules = {}) {
+  const balances = [];
+  const usage = [];
+  const textMetrics = [];
+
+  for (const rule of (parserRules.balances || []).filter((item) => item.selector)) {
+    const result = selectorResults[rule.id] || {};
+    const raw = firstSelectorValue(result.values);
+    const amount = selectorValue(raw, rule, rule.valueGroup ?? 1);
+    if (!amount) continue;
+    balances.push(balanceMetric(rule.key || rule.id || "balance", rule.label || "余额", normalizeAmount(amount), rule.currency || null));
+  }
+
+  for (const rule of (parserRules.quotas || []).filter((item) => item.selector || item.usedSelector || item.limitSelector)) {
+    const result = selectorResults[rule.id] || {};
+    let usedRaw = "";
+    let limitRaw = "";
+    if (rule.mode === "separate" || rule.usedSelector || rule.limitSelector) {
+      usedRaw = selectorValue(firstSelectorValue(result.usedValues), { ...rule, pattern: rule.usedPattern || rule.pattern || "" }, rule.usedGroup ?? 1);
+      limitRaw = selectorValue(firstSelectorValue(result.limitValues), { ...rule, pattern: rule.limitPattern || rule.pattern || "" }, rule.limitGroup ?? 1);
+    } else {
+      const raw = firstSelectorValue(result.values);
+      const match = compileRulePattern(rule)?.exec(raw);
+      if (match) {
+        usedRaw = groupValue(match, rule.usedGroup ?? 1);
+        limitRaw = groupValue(match, rule.limitGroup ?? 2);
+      } else {
+        [usedRaw = "", limitRaw = ""] = numericValues(raw);
+      }
+    }
+    const used = Number(usedRaw);
+    const limit = Number(limitRaw);
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
+    const symbol = rule.symbol || (rule.currency === "CNY" ? "¥" : "$");
+    const value = `${symbol}${normalizeAmount(usedRaw)} / ${symbol}${normalizeAmount(limitRaw)}`;
+    const resetRaw = firstSelectorValue(result.resetValues);
+    const resetIn = resetRaw
+      ? selectorValue(resetRaw, { ...rule, pattern: rule.resetPattern || "" }, rule.resetGroup ?? 1, true)
+      : null;
+    usage.push(usageMetric(rule.key || rule.id || "usage", rule.label || "用量", Math.round((used / limit) * 100), value, resetIn || null));
+  }
+
+  for (const rule of (parserRules.textMetrics || []).filter((item) => item.selector)) {
+    const result = selectorResults[rule.id] || {};
+    const raw = firstSelectorValue(result.values);
+    const value = selectorValue(raw, rule, rule.valueGroup ?? 1, true);
+    if (!value) continue;
+    textMetrics.push(textMetric(rule.key || rule.id || `metric_${textMetrics.length + 1}`, rule.label || "指标", value));
+  }
+
+  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+}
+
 export function parseGenericPageTokens(tokens, parserRules = {}) {
   const balances = [];
   const usage = [];
@@ -295,7 +368,7 @@ export function parseGenericPageTokens(tokens, parserRules = {}) {
     return true;
   }
 
-  for (const rule of parserRules.balances || []) {
+  for (const rule of (parserRules.balances || []).filter((item) => !item.selector)) {
     for (const { match } of scanRule(tokens, rule)) {
       const label = rule.label || groupValue(match, rule.labelGroup) || "余额";
       const amount = groupValue(match, rule.valueGroup ?? 1);
@@ -305,7 +378,7 @@ export function parseGenericPageTokens(tokens, parserRules = {}) {
     }
   }
 
-  for (const rule of parserRules.quotas || []) {
+  for (const rule of (parserRules.quotas || []).filter((item) => !item.selector && !item.usedSelector && !item.limitSelector)) {
     for (const { match, idx } of scanRule(tokens, rule)) {
       const label = rule.label || groupValue(match, rule.labelGroup) || "用量";
       const usedRaw = groupValue(match, rule.usedGroup ?? 1);
@@ -321,7 +394,7 @@ export function parseGenericPageTokens(tokens, parserRules = {}) {
     }
   }
 
-  for (const rule of parserRules.textMetrics || []) {
+  for (const rule of (parserRules.textMetrics || []).filter((item) => !item.selector)) {
     for (const { match } of scanRule(tokens, rule)) {
       const label = rule.label || groupValue(match, rule.labelGroup) || "指标";
       const value = genericValueFromRule(tokens, rule, match);

@@ -10,7 +10,7 @@
   <main>
     <header>
       <h1>Provider Usage Hub 设置</h1>
-      <button id="save" class="primary">保存</button>
+      <button id="save-global" class="primary">保存全局设置</button>
     </header>
     <section>
       <h2>DeepSeek</h2>
@@ -20,15 +20,104 @@
       </label>
     </section>
     <section>
-      <h2>Providers</h2>
+      <div class="section-head">
+        <h2>Providers</h2>
+        <div class="section-actions">
+          <button id="import-source" type="button">导入书源</button>
+          <button id="add-page-provider" type="button" class="primary">新增来源</button>
+        </div>
+      </div>
       <div id="providers"></div>
     </section>
-    <section>
+    <section id="source-editor-section" class="hidden">
       <div class="section-head">
-        <h2>高级 JSON 配置</h2>
-        <button id="add-page-provider" type="button">添加页面 Provider</button>
+        <h2 id="editor-title">编辑来源</h2>
+        <button id="close-editor" type="button">关闭</button>
       </div>
-      <textarea id="configs-json" spellcheck="false"></textarea>
+      <form id="source-form" novalidate>
+        <div class="form-grid basic-fields">
+          <label>
+            名称
+            <input id="source-name" required>
+          </label>
+          <label>
+            ID
+            <input id="source-id" required pattern="[a-zA-Z0-9._-]+">
+          </label>
+          <label class="checkbox-label enabled-field">
+            <input id="source-enabled" type="checkbox">
+            启用
+          </label>
+        </div>
+        <input id="source-type" type="hidden" value="page">
+
+        <div class="editor-block">
+          <div class="block-head">
+            <h3>页面</h3>
+            <button type="button" data-editor-action="add-page">添加页面</button>
+          </div>
+          <div class="page-row main-page-row">
+            <label>
+              页面名称
+              <input value="主页" disabled>
+            </label>
+            <label>
+              页面 URL
+              <input id="source-target-url" type="url" required>
+            </label>
+          </div>
+          <div id="secondary-pages"></div>
+        </div>
+
+        <div class="editor-block">
+          <div class="block-head">
+            <h3>指标规则</h3>
+            <div class="section-actions">
+              <button type="button" data-editor-action="add-balance">余额</button>
+              <button type="button" data-editor-action="add-quota">额度</button>
+              <button type="button" data-editor-action="add-text">文本</button>
+            </div>
+          </div>
+          <div id="metric-rules"></div>
+        </div>
+
+        <details class="advanced-block">
+          <summary>高级设置</summary>
+          <div class="form-grid advanced-fields">
+            <label>
+              登录页提示词
+              <textarea id="source-login-hints" rows="3" spellcheck="false"></textarea>
+            </label>
+            <label>
+              页面就绪选择器
+              <input id="source-ready-selector" spellcheck="false">
+            </label>
+          </div>
+        </details>
+
+        <div class="editor-actions">
+          <button type="button" data-editor-action="test">测试</button>
+          <button type="submit" class="primary">保存来源</button>
+          <button id="delete-source" type="button" class="danger">删除</button>
+        </div>
+      </form>
+      <div id="test-preview" class="test-preview hidden" aria-live="polite"></div>
+    </section>
+
+    <section id="import-panel" class="hidden">
+      <div class="section-head">
+        <h2>导入书源</h2>
+        <button id="close-import" type="button">关闭</button>
+      </div>
+      <label>
+        书源 JSON
+        <textarea id="import-json" rows="8" spellcheck="false"></textarea>
+      </label>
+      <div class="source-actions">
+        <input id="import-file" type="file" accept="application/json,.json" hidden>
+        <button id="choose-import-file" type="button">选择文件</button>
+        <button id="confirm-import" type="button" class="primary">导入</button>
+      </div>
     </section>
     <div id="message" class="message" aria-live="polite"></div>
   </main>

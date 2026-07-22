@@ -1,8 +1,24 @@
-import { DEFAULT_PROVIDER_CONFIGS, normalizeProviderConfig } from "./config.js";
+import {
+  DEFAULT_PROVIDER_CONFIGS,
+  isBuiltinProviderId,
+  normalizeProviderConfig,
+  normalizeProviderConfigs,
+  upsertProviderConfig
+} from "./config.js";
 
 const CONFIG_KEY = "providerConfigs";
 const SNAPSHOT_KEY = "providerSnapshots";
 const SECRETS_KEY = "secrets";
+
+function normalizeStoredConfigs(configs) {
+  const rawConfigs = Array.isArray(configs) ? configs : [];
+  const builtins = DEFAULT_PROVIDER_CONFIGS.map((defaultConfig) => {
+    const stored = rawConfigs.find((item) => item?.id === defaultConfig.id);
+    return { ...defaultConfig, enabled: stored?.enabled ?? defaultConfig.enabled };
+  });
+  const custom = rawConfigs.filter((item) => item && !isBuiltinProviderId(item.id));
+  return normalizeProviderConfigs([...builtins, ...custom]);
+}
 
 function storageGet(keys) {
   return chrome.storage.local.get(keys);
@@ -14,14 +30,30 @@ function storageSet(value) {
 
 export async function getProviderConfigs() {
   const data = await storageGet(CONFIG_KEY);
-  const configs = Array.isArray(data[CONFIG_KEY]) ? data[CONFIG_KEY] : DEFAULT_PROVIDER_CONFIGS;
-  return configs.map(normalizeProviderConfig);
+  return normalizeStoredConfigs(data[CONFIG_KEY]);
 }
 
 export async function saveProviderConfigs(configs) {
-  const normalized = configs.map(normalizeProviderConfig);
+  const normalized = normalizeStoredConfigs(configs);
   await storageSet({ [CONFIG_KEY]: normalized });
   return normalized;
+}
+
+export async function importProviderConfig(provider) {
+  if (isBuiltinProviderId(provider?.id)) {
+    throw new Error(`Built-in provider cannot be replaced: ${provider.id}`);
+  }
+  const configs = await getProviderConfigs();
+  const normalized = upsertProviderConfig(configs, provider);
+  await storageSet({ [CONFIG_KEY]: normalized });
+  return normalized.find((item) => item.id === String(provider.id));
+}
+
+export async function exportProviderConfig(providerId) {
+  const configs = await getProviderConfigs();
+  const config = configs.find((item) => item.id === providerId);
+  if (!config) throw new Error(`unknown provider: ${providerId}`);
+  return normalizeProviderConfig(config);
 }
 
 export async function getSnapshots() {

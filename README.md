@@ -117,38 +117,64 @@ uv run python crawler.py --provider ezaiclub --explore
 
 插件版不需要启动 `server.py`，也不需要同步 BrowserOS profile。它会直接使用当前浏览器的登录态访问 provider 页面；DeepSeek API Key 在扩展设置页中保存到 `chrome.storage.local`。
 
-用户可以自行新增普通页面型 provider，不需要改插件源代码：打开扩展设置页，点击“添加页面 Provider”，再编辑模板里的 URL 和 `parserRules`。也可以直接在“高级 JSON 配置”里添加 `type: "page"` provider，通过 `parserRules` 配置余额、额度和文本指标解析规则：
+用户可以像添加小说书源一样自行新增 provider，不需要改插件源代码：
+
+- 点击“新增来源”，填写名称、页面 URL，并按需添加余额、额度或文本指标。
+- 每个指标使用 CSS 选择器取值；额度支持从同一元素读取 `$50.15 / $50.00`，也支持分别选择已用值和总额。
+- 点击“测试”直接预览余额、额度和文本结果，测试不会写入正式快照。
+- 保存或测试新域名时，浏览器会申请对应站点的访问权限。
+- 内置 provider 只读，可以复制成自定义来源；“导入书源”和“导出”用于分享 JSON 配置。
+
+设置页不要求用户直接编辑 JSON。导出的 v2 书源格式示例：
 
 ```json
 {
+  "schemaVersion": 2,
   "id": "example-page",
   "name": "Example",
   "type": "page",
   "targetUrl": "https://example.com/dashboard",
   "enabled": true,
-  "secondaryUrls": [{ "label": "打开订阅页", "url": "https://example.com/subscriptions" }],
+  "secondaryUrls": [
+    { "id": "subscriptions", "label": "订阅页", "url": "https://example.com/subscriptions" }
+  ],
   "parserRules": {
     "loginHints": ["Login", "Sign in", "登录"],
-    "readyPattern": "余额|用量|后重置",
+    "readySelector": ".account-balance",
     "balances": [
-      { "label": "余额", "pattern": "^[$](\\d+(?:\\.\\d+)?)$", "valueGroup": 1, "currency": "USD", "limit": 1 }
+      {
+        "id": "balance-1",
+        "pageId": "main",
+        "label": "余额",
+        "selector": ".account-balance",
+        "currency": "USD"
+      }
     ],
     "quotas": [
       {
+        "id": "quota-1",
+        "pageId": "subscriptions",
         "label": "每周用量",
-        "pattern": "^[$](\\d+(?:\\.\\d+)?)\\s*/\\s*[$](\\d+(?:\\.\\d+)?)$",
-        "usedGroup": 1,
-        "limitGroup": 2,
+        "mode": "combined",
+        "selector": ".weekly-usage",
         "currency": "USD",
-        "resetPattern": "(.+?)\\s*后重置"
+        "resetSelector": ".weekly-reset"
       }
     ],
     "textMetrics": [
-      { "label": "到期时间", "pattern": "剩余\\s*[^()]*\\(([^)]+)\\)", "valueGroup": 1 }
+      {
+        "id": "text-1",
+        "pageId": "subscriptions",
+        "label": "到期时间",
+        "selector": ".expires-at",
+        "attribute": "textContent"
+      }
     ]
   }
 }
 ```
+
+旧版 v1 正则书源仍可导入和运行。CSS 选择器取得的文本需要进一步裁剪时，可以在指标的“正则提取”中填写正则和捕获组。
 
 本地回归测试：
 

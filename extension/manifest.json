@@ -24,5 +24,9 @@
     "https://www.ezaiclub.com/*",
     "https://cloud.siliconflow.cn/*",
     "https://account.siliconflow.cn/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ]
 }

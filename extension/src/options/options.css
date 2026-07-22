@@ -32,7 +32,7 @@ body {
 }
 
 main {
-  max-width: 920px;
+  max-width: 1040px;
   margin: 0 auto;
   padding: 24px;
 }
@@ -95,7 +95,7 @@ input, select {
 }
 
 textarea {
-  min-height: 360px;
+  min-height: 88px;
   resize: vertical;
   font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   overflow-wrap: normal;
@@ -118,13 +118,64 @@ button.primary {
   color: #fff;
 }
 
+button.danger {
+  border-color: #dc2626;
+  color: #b91c1c;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.section-actions,
+.editor-actions,
+.provider-actions,
+.source-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .provider-row {
   display: grid;
-  grid-template-columns: 88px minmax(120px, 180px) minmax(180px, 1fr);
-  gap: 10px;
-  align-items: end;
+  grid-template-columns: 72px minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
   padding: 12px 0;
   border-top: 1px solid var(--line);
+}
+
+.provider-summary {
+  min-width: 0;
+}
+
+.provider-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 3px;
+}
+
+.provider-title strong,
+.provider-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-url {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.source-badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .provider-row:first-child {
@@ -143,6 +194,152 @@ button.primary {
   width: auto;
 }
 
+.provider-actions {
+  justify-content: flex-end;
+}
+
+.source-actions {
+  margin-top: 10px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.basic-fields {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, .7fr) 90px;
+  align-items: end;
+}
+
+.enabled-field {
+  min-height: 34px;
+}
+
+.editor-block,
+.advanced-block {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.block-head,
+.rule-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.page-row {
+  display: grid;
+  grid-template-columns: minmax(130px, .35fr) minmax(240px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.page-row:last-child {
+  border-bottom: 0;
+}
+
+.main-page-row {
+  grid-template-columns: minmax(130px, .35fr) minmax(240px, 1fr);
+}
+
+.rule-card {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.rule-card:last-child {
+  border-bottom: 0;
+}
+
+.rule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.rule-grid .wide {
+  grid-column: 1 / -1;
+}
+
+.rule-advanced {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+}
+
+.rule-advanced summary,
+.advanced-block summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.rule-advanced .form-grid,
+.advanced-fields {
+  margin-top: 10px;
+}
+
+.quota-separate.hidden,
+.quota-combined.hidden {
+  display: none;
+}
+
+.empty-state {
+  margin: 14px 0 0;
+  color: var(--muted);
+}
+
+.editor-actions {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.test-preview {
+  min-height: 60px;
+  max-height: 280px;
+  overflow: auto;
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.preview-metric {
+  display: grid;
+  grid-template-columns: minmax(120px, .45fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.preview-metric span:first-child {
+  color: var(--muted);
+}
+
+.preview-error {
+  color: #b91c1c;
+}
+
 .message {
   min-height: 20px;
   color: var(--muted);
@@ -152,4 +349,12 @@ button.primary {
   main { padding: 12px; }
   .section-head { align-items: stretch; flex-direction: column; }
   .provider-row { grid-template-columns: 1fr; }
+  .provider-actions { justify-content: flex-start; }
+  .form-grid,
+  .basic-fields,
+  .page-row,
+  .main-page-row,
+  .rule-grid { grid-template-columns: 1fr; }
+  .rule-grid .wide,
+  .rule-advanced { grid-column: 1; }
 }

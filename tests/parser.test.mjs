@@ -6,6 +6,7 @@ import {
   parseEzaiclubBalanceTokens,
   parseEzaiclubSubscriptionTokens,
   parseGenericPageTokens,
+  parseGenericSelectorResults,
   parseOpencodeLegacy,
   parsePercent,
   parseSiliconflowBalanceTokens,
@@ -174,6 +175,61 @@ test("parseGenericPageTokens parses configurable page rules", () => {
   assert.equal(parsed.usage[0].percent, 100);
   assert.equal(parsed.usage[0].resetIn, "6天13小时");
   assert.equal(parsed.textMetrics[0].value, "2026/07/29 00:17");
+});
+
+test("parseGenericPageTokens reports invalid regex rules", () => {
+  assert.throws(
+    () => parseGenericPageTokens(["$10.00"], { balances: [{ label: "余额", pattern: "[" }] }),
+    /Invalid parser rule regex for 余额/
+  );
+});
+
+test("parseGenericSelectorResults parses CSS selector values", () => {
+  const parserRules = {
+    balances: [
+      { id: "balance-1", label: "余额", selector: ".balance", currency: "USD" }
+    ],
+    quotas: [
+      { id: "quota-1", label: "每周用量", mode: "combined", selector: ".quota", currency: "USD" },
+      {
+        id: "quota-2",
+        label: "月度用量",
+        mode: "separate",
+        usedSelector: ".used",
+        limitSelector: ".limit",
+        resetSelector: ".reset",
+        currency: "CNY"
+      }
+    ],
+    textMetrics: [
+      { id: "text-1", label: "到期时间", selector: ".expires", attribute: "title" }
+    ]
+  };
+  const parsed = parseGenericSelectorResults({
+    "balance-1": { values: ["Balance $74.84"] },
+    "quota-1": { values: ["$50.15 / $50.00"] },
+    "quota-2": { usedValues: ["¥12.50"], limitValues: ["¥100"], resetValues: ["6天后"] },
+    "text-1": { values: ["2026-07-29"] }
+  }, parserRules);
+  assert.equal(parsed.balances[0].value, "74.84");
+  assert.equal(parsed.usage[0].value, "$50.15 / $50.00");
+  assert.equal(parsed.usage[0].percent, 100);
+  assert.equal(parsed.usage[1].value, "¥12.50 / ¥100.00");
+  assert.equal(parsed.usage[1].resetIn, "6天后");
+  assert.equal(parsed.textMetrics[0].value, "2026-07-29");
+});
+
+test("parseGenericSelectorResults supports regex extraction from selected text", () => {
+  const parsed = parseGenericSelectorResults({
+    balance: { values: ["余额 USD 18.456"] },
+    quota: { values: ["used=12.5; cap=20"] }
+  }, {
+    balances: [{ id: "balance", label: "余额", selector: ".balance", pattern: "USD\\s+(\\d+(?:\\.\\d+)?)", valueGroup: 1, currency: "USD" }],
+    quotas: [{ id: "quota", label: "用量", selector: ".quota", pattern: "used=(\\d+(?:\\.\\d+)?); cap=(\\d+(?:\\.\\d+)?)", usedGroup: 1, limitGroup: 2, currency: "USD" }]
+  });
+  assert.equal(parsed.balances[0].value, "18.46");
+  assert.equal(parsed.usage[0].value, "$12.50 / $20.00");
+  assert.equal(parsed.usage[0].percent, 63);
 });
 
 test("parseSiliconflowBalanceTokens", () => {
