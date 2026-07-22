@@ -9,6 +9,8 @@ let configs = [];
 let draftConfig = null;
 let draftOriginalId = "";
 let editorReadOnly = false;
+let editorDirty = false;
+let activeOperation = false;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -82,12 +84,31 @@ export function metricRuleTemplate(kind, existingRules = []) {
   const prefix = kind === "balances" ? "balance" : kind === "quotas" ? "quota" : "text";
   const id = uniqueId(new Set(existingRules.map((rule) => rule.id)), `${prefix}-${existingRules.length + 1}`);
   if (kind === "balances") {
-    return { id, pageId: "main", label: "余额", selector: "", currency: "USD", valueGroup: 1 };
+    return { id, pageId: "main", label: "余额", selector: "", attribute: "textContent", index: 0, currency: "USD", valueGroup: 1 };
   }
   if (kind === "quotas") {
-    return { id, pageId: "main", label: "用量", mode: "combined", selector: "", currency: "USD", usedGroup: 1, limitGroup: 2 };
+    return { id, pageId: "main", label: "用量", mode: "combined", selector: "", attribute: "textContent", index: 0, currency: "USD", usedGroup: 1, limitGroup: 2 };
   }
-  return { id, pageId: "main", label: "指标", selector: "", attribute: "textContent", valueGroup: 1 };
+  return { id, pageId: "main", label: "指标", selector: "", attribute: "textContent", index: 0, valueGroup: 1 };
+}
+
+function setOperationLocked(locked) {
+  activeOperation = locked;
+  document.querySelectorAll("button").forEach((button) => { button.disabled = locked; });
+}
+
+async function withOperationLock(operation) {
+  if (activeOperation) return null;
+  setOperationLocked(true);
+  try {
+    return await operation();
+  } finally {
+    setOperationLocked(false);
+  }
+}
+
+function confirmDiscardChanges() {
+  return !editorDirty || confirm("当前来源有未保存的修改，确定放弃吗？");
 }
 
 function providerTypeLabel(config) {
@@ -119,6 +140,7 @@ function renderProviderList() {
       </div>
     </div>`;
   }).join("");
+  root.querySelectorAll("button").forEach((button) => { button.disabled = activeOperation; });
 }
 
 function pageOptions(config, selectedPageId) {
@@ -166,6 +188,8 @@ function renderBalanceRule(config, rule, index) {
       <label>页面<select data-rule-field="pageId">${pageOptions(config, rule.pageId || "main")}</select></label>
       <label class="wide">CSS 选择器<input data-rule-field="selector" value="${escapeHtml(rule.selector || "")}" spellcheck="false"></label>
       <label>币种<select data-rule-field="currency">${currencyOptions(rule.currency || "USD")}</select></label>
+      <label>取值<select data-rule-field="attribute">${attributeOptions(rule.attribute || "textContent")}</select></label>
+      <label>元素序号<input data-rule-field="index" type="number" min="0" value="${Number(rule.index ?? 0)}"></label>
       <details class="rule-advanced"><summary>正则提取</summary><div class="form-grid">
         <label>正则<input data-rule-field="pattern" value="${escapeHtml(rule.pattern || "")}" spellcheck="false"></label>
         <label>捕获组<input data-rule-field="valueGroup" type="number" min="0" value="${Number(rule.valueGroup ?? 1)}"></label>
@@ -187,8 +211,14 @@ function renderQuotaRule(config, rule, index) {
       </select></label>
       <label>币种<select data-rule-field="currency">${currencyOptions(rule.currency || "USD")}</select></label>
       <label class="wide quota-combined ${mode === "combined" ? "" : "hidden"}">CSS 选择器<input data-rule-field="selector" value="${escapeHtml(rule.selector || "")}" spellcheck="false"></label>
+      <label class="quota-combined ${mode === "combined" ? "" : "hidden"}">取值<select data-rule-field="attribute">${attributeOptions(rule.attribute || "textContent")}</select></label>
+      <label class="quota-combined ${mode === "combined" ? "" : "hidden"}">元素序号<input data-rule-field="index" type="number" min="0" value="${Number(rule.index ?? 0)}"></label>
       <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">已用选择器<input data-rule-field="usedSelector" value="${escapeHtml(rule.usedSelector || "")}" spellcheck="false"></label>
       <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">总额选择器<input data-rule-field="limitSelector" value="${escapeHtml(rule.limitSelector || "")}" spellcheck="false"></label>
+      <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">已用取值<select data-rule-field="usedAttribute">${attributeOptions(rule.usedAttribute || rule.attribute || "textContent")}</select></label>
+      <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">已用元素序号<input data-rule-field="usedIndex" type="number" min="0" value="${Number(rule.usedIndex ?? rule.index ?? 0)}"></label>
+      <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">总额取值<select data-rule-field="limitAttribute">${attributeOptions(rule.limitAttribute || rule.attribute || "textContent")}</select></label>
+      <label class="quota-separate ${mode === "separate" ? "" : "hidden"}">总额元素序号<input data-rule-field="limitIndex" type="number" min="0" value="${Number(rule.limitIndex ?? rule.index ?? 0)}"></label>
       <label class="wide">重置时间选择器<input data-rule-field="resetSelector" value="${escapeHtml(rule.resetSelector || "")}" spellcheck="false"></label>
       <details class="rule-advanced"><summary>正则提取</summary><div class="form-grid">
         <label>正则<input data-rule-field="pattern" value="${escapeHtml(rule.pattern || "")}" spellcheck="false"></label>
@@ -208,6 +238,7 @@ function renderTextRule(config, rule, index) {
       <label>页面<select data-rule-field="pageId">${pageOptions(config, rule.pageId || "main")}</select></label>
       <label class="wide">CSS 选择器<input data-rule-field="selector" value="${escapeHtml(rule.selector || "")}" spellcheck="false"></label>
       <label>取值<select data-rule-field="attribute">${attributeOptions(rule.attribute || "textContent")}</select></label>
+      <label>元素序号<input data-rule-field="index" type="number" min="0" value="${Number(rule.index ?? 0)}"></label>
       <details class="rule-advanced"><summary>正则提取</summary><div class="form-grid">
         <label>正则<input data-rule-field="pattern" value="${escapeHtml(rule.pattern || "")}" spellcheck="false"></label>
         <label>捕获组<input data-rule-field="valueGroup" type="number" min="0" value="${Number(rule.valueGroup ?? 1)}"></label>
@@ -251,6 +282,7 @@ function renderEditor() {
   form.querySelector('button[type="submit"]').classList.toggle("hidden", editorReadOnly);
   document.getElementById("delete-source").classList.toggle("hidden", editorReadOnly || !draftOriginalId);
   document.getElementById("test-preview").classList.add("hidden");
+  form.querySelectorAll("button").forEach((button) => { button.disabled = activeOperation; });
   section.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -260,16 +292,23 @@ function optionalField(object, key, value) {
 }
 
 function readRule(card) {
-  const value = (field) => card.querySelector(`[data-rule-field="${field}"]`)?.value ?? "";
-  const kind = card.dataset.ruleKind;
+  const fields = Object.fromEntries([...card.querySelectorAll("[data-rule-field]")]
+    .map((control) => [control.dataset.ruleField, control.value]));
+  return [card.dataset.ruleKind, ruleFormValuesToRule(card.dataset.ruleKind, card.dataset.ruleId, fields)];
+}
+
+export function ruleFormValuesToRule(kind, id, fields) {
+  const value = (field) => fields[field] ?? "";
   const rule = {
-    id: card.dataset.ruleId,
+    id,
     pageId: value("pageId") || "main",
     label: value("label").trim()
   };
   optionalField(rule, "pattern", value("pattern"));
   if (kind === "balances") {
     optionalField(rule, "selector", value("selector"));
+    rule.attribute = value("attribute") || "textContent";
+    rule.index = Number(value("index") || 0);
     rule.currency = value("currency") || "USD";
     rule.valueGroup = Number(value("valueGroup") || 1);
   } else if (kind === "quotas") {
@@ -277,8 +316,14 @@ function readRule(card) {
     if (rule.mode === "separate") {
       optionalField(rule, "usedSelector", value("usedSelector"));
       optionalField(rule, "limitSelector", value("limitSelector"));
+      rule.usedAttribute = value("usedAttribute") || "textContent";
+      rule.usedIndex = Number(value("usedIndex") || 0);
+      rule.limitAttribute = value("limitAttribute") || "textContent";
+      rule.limitIndex = Number(value("limitIndex") || 0);
     } else {
       optionalField(rule, "selector", value("selector"));
+      rule.attribute = value("attribute") || "textContent";
+      rule.index = Number(value("index") || 0);
     }
     optionalField(rule, "resetSelector", value("resetSelector"));
     optionalField(rule, "resetPattern", value("resetPattern"));
@@ -288,9 +333,10 @@ function readRule(card) {
   } else {
     optionalField(rule, "selector", value("selector"));
     rule.attribute = value("attribute") || "textContent";
+    rule.index = Number(value("index") || 0);
     rule.valueGroup = Number(value("valueGroup") || 1);
   }
-  return [kind, rule];
+  return rule;
 }
 
 export function formStateToProvider(state) {
@@ -336,19 +382,24 @@ function openEditor(config, options = {}) {
   draftOriginalId = options.isNew ? "" : config.id;
   editorReadOnly = Boolean(options.readOnly);
   renderEditor();
+  editorDirty = false;
 }
 
-function closeEditor() {
+function closeEditor(force = false) {
+  if (!force && !confirmDiscardChanges()) return false;
   draftConfig = null;
   draftOriginalId = "";
   editorReadOnly = false;
+  editorDirty = false;
   document.getElementById("source-editor-section").classList.add("hidden");
+  return true;
 }
 
 function mutateDraft(mutator) {
   draftConfig = readEditorSource();
   mutator(draftConfig);
   renderEditor();
+  editorDirty = true;
 }
 
 function addSecondaryPage() {
@@ -416,10 +467,14 @@ function validateSelectors(config) {
 }
 
 async function requestProviderPermissions(config) {
+  return requestOrigins(originsForConfig(config));
+}
+
+async function requestOrigins(origins) {
   if (!chrome.permissions?.request) return;
-  const origins = originsForConfig(config);
-  if (!await chrome.permissions.request({ origins })) {
-    throw new Error(`未获得站点访问权限：${origins.join("、")}`);
+  const uniqueOrigins = [...new Set(origins)];
+  if (!await chrome.permissions.request({ origins: uniqueOrigins })) {
+    throw new Error(`未获得站点访问权限：${uniqueOrigins.join("、")}`);
   }
 }
 
@@ -427,18 +482,35 @@ function previewMetric(label, value) {
   return `<div class="preview-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
 }
 
+function formatBalancePreview(item) {
+  if (item.currency === "CNY") return `¥${item.value}`;
+  if (item.currency === "USD") return `$${item.value}`;
+  return item.currency ? `${item.value} ${item.currency}` : item.value;
+}
+
+function diagnosticHtml(item) {
+  const status = ({ matched: "已匹配", not_found: "未找到元素", parse_failed: "正则解析失败" })[item.status] || item.status;
+  const samples = (item.samples || []).map((sample) => `<code>${escapeHtml(sample)}</code>`).join("");
+  return `<div class="diagnostic ${escapeHtml(item.status)}">
+    <div><strong>${escapeHtml(item.label || item.ruleId)}</strong><span>${escapeHtml(status)}</span></div>
+    <small>${escapeHtml(item.pageId || "main")} · ${Number(item.matchCount || 0)} 个元素${item.error ? ` · ${escapeHtml(item.error)}` : ""}</small>
+    ${samples ? `<div class="diagnostic-samples">${samples}</div>` : ""}
+  </div>`;
+}
+
 function renderTestPreview(snapshot) {
   const root = document.getElementById("test-preview");
   const metricKeys = new Set([...(snapshot.balances || []), ...(snapshot.usage || [])].map((item) => item.key));
   const textMetrics = (snapshot.metrics || []).filter((item) => !metricKeys.has(item.key));
   const rows = [
-    ...(snapshot.balances || []).map((item) => previewMetric(item.label, `${item.currency === "CNY" ? "¥" : item.currency === "USD" ? "$" : ""}${item.value}`)),
+    ...(snapshot.balances || []).map((item) => previewMetric(item.label, formatBalancePreview(item))),
     ...(snapshot.usage || []).map((item) => previewMetric(item.label, item.value || `${item.percent}%`)),
     ...textMetrics.map((item) => previewMetric(item.label, item.value))
   ].join("");
   root.innerHTML = `<div class="preview-head"><strong>${escapeHtml(snapshot.name)}</strong><span>${escapeHtml(snapshot.status)}</span></div>
     ${rows || '<div class="preview-error">没有匹配到指标</div>'}
-    ${snapshot.error ? `<div class="preview-error">${escapeHtml(snapshot.error)}</div>` : ""}`;
+    ${snapshot.error ? `<div class="preview-error">${escapeHtml(snapshot.error)}</div>` : ""}
+    ${(snapshot.diagnostics || []).length ? `<div class="diagnostics">${snapshot.diagnostics.map(diagnosticHtml).join("")}</div>` : ""}`;
   root.classList.remove("hidden");
 }
 
@@ -450,7 +522,8 @@ function renderTesting() {
 
 async function saveEditor(event) {
   event?.preventDefault();
-  try {
+  return withOperationLock(async () => {
+    try {
     if (!document.getElementById("source-form").reportValidity()) return;
     const source = formStateToProvider(readEditorSource());
     validateSelectors(source);
@@ -459,13 +532,15 @@ async function saveEditor(event) {
     await load();
     openEditor(response.provider);
     setMessage(`${source.name} 已保存。`);
-  } catch (error) {
-    setMessage(error.message || "保存失败", true);
-  }
+    } catch (error) {
+      setMessage(error.message || "保存失败", true);
+    }
+  });
 }
 
 async function testEditor() {
-  try {
+  return withOperationLock(async () => {
+    try {
     const source = formStateToProvider(readEditorSource());
     validateSelectors(source);
     await requestProviderPermissions(source);
@@ -473,26 +548,29 @@ async function testEditor() {
     const response = await sendMessage({ type: "providers:test", provider: source });
     renderTestPreview(response.provider);
     setMessage("测试完成，结果不会写入看板缓存。");
-  } catch (error) {
-    const root = document.getElementById("test-preview");
-    root.innerHTML = `<div class="preview-error">${escapeHtml(error.message || String(error))}</div>`;
-    root.classList.remove("hidden");
-    setMessage(error.message || "测试失败", true);
-  }
+    } catch (error) {
+      const root = document.getElementById("test-preview");
+      root.innerHTML = `<div class="preview-error">${escapeHtml(error.message || String(error))}</div>`;
+      root.classList.remove("hidden");
+      setMessage(error.message || "测试失败", true);
+    }
+  });
 }
 
 async function deleteProvider(providerId) {
   const config = configs.find((item) => item.id === providerId);
   if (!config || isBuiltinProviderId(providerId)) return;
   if (!confirm(`删除 Provider：${config.name}？`)) return;
-  try {
-    await sendMessage({ type: "config:save", configs: configs.filter((item) => item.id !== providerId) });
-    closeEditor();
+  return withOperationLock(async () => {
+    try {
+    await sendMessage({ type: "config:deleteProvider", providerId });
+    closeEditor(true);
     await load();
     setMessage(`${config.name} 已删除。`);
-  } catch (error) {
-    setMessage(error.message || "删除失败", true);
-  }
+    } catch (error) {
+      setMessage(error.message || "删除失败", true);
+    }
+  });
 }
 
 function downloadJson(provider) {
@@ -506,7 +584,8 @@ function downloadJson(provider) {
 }
 
 async function exportSource(providerId) {
-  try {
+  return withOperationLock(async () => {
+    try {
     const response = await sendMessage({ type: "config:exportProvider", providerId });
     const json = JSON.stringify(response.provider, null, 2);
     try {
@@ -516,14 +595,16 @@ async function exportSource(providerId) {
       downloadJson(response.provider);
       setMessage(`${response.provider.name} 书源已下载。`);
     }
-  } catch (error) {
-    setMessage(error.message || "导出失败", true);
-  }
+    } catch (error) {
+      setMessage(error.message || "导出失败", true);
+    }
+  });
 }
 
 async function handleProviderAction(providerId, action) {
   const config = configs.find((item) => item.id === providerId);
   if (!config) return;
+  if (["edit", "view", "duplicate", "test"].includes(action) && !confirmDiscardChanges()) return;
   if (action === "edit") openEditor(config);
   if (action === "view") openEditor(config, { readOnly: true });
   if (action === "duplicate") openEditor(duplicateProviderSource(config, configs), { isNew: true });
@@ -536,29 +617,38 @@ async function handleProviderAction(providerId, action) {
 }
 
 async function importSources() {
-  try {
+  return withOperationLock(async () => {
+    try {
     const parsed = JSON.parse(document.getElementById("import-json").value);
     const sources = Array.isArray(parsed) ? parsed : [parsed];
     if (!sources.length) throw new Error("书源文件为空。");
-    let imported = null;
-    for (const raw of sources) {
+    const normalizedSources = sources.map((raw) => {
       const source = formStateToProvider(raw);
       validateSelectors(source);
-      await requestProviderPermissions(source);
-      imported = (await sendMessage({ type: "config:importProvider", provider: source })).provider;
+      return source;
+    });
+    const sourceIds = new Set();
+    for (const source of normalizedSources) {
+      if (sourceIds.has(source.id)) throw new Error(`导入文件包含重复 ID：${source.id}`);
+      sourceIds.add(source.id);
     }
+    await requestOrigins(normalizedSources.flatMap(originsForConfig));
+    const response = await sendMessage({ type: "config:importProviders", providers: normalizedSources });
+    const imported = response.providers.at(-1);
     await load();
     document.getElementById("import-panel").classList.add("hidden");
     document.getElementById("import-json").value = "";
     if (imported) openEditor(imported);
     setMessage(`已导入 ${sources.length} 个 Provider。`);
-  } catch (error) {
-    setMessage(error.message || "导入失败", true);
-  }
+    } catch (error) {
+      setMessage(error.message || "导入失败", true);
+    }
+  });
 }
 
 async function saveGlobal() {
-  try {
+  return withOperationLock(async () => {
+    try {
     const updatedConfigs = configs.map((config) => {
       const row = [...document.querySelectorAll(".provider-row")].find((item) => item.dataset.provider === config.id);
       return { ...config, enabled: row?.querySelector("[data-provider-toggle]").checked ?? config.enabled };
@@ -571,9 +661,10 @@ async function saveGlobal() {
     configs = updatedConfigs;
     renderProviderList();
     setMessage("全局设置已保存。断开的站点权限会在测试或保存来源时重新申请。");
-  } catch (error) {
-    setMessage(error.message || "保存失败", true);
-  }
+    } catch (error) {
+      setMessage(error.message || "保存失败", true);
+    }
+  });
 }
 
 async function load() {
@@ -595,7 +686,9 @@ function handleEditorAction(button) {
 
 if (typeof document !== "undefined") {
   document.getElementById("save-global").addEventListener("click", saveGlobal);
-  document.getElementById("add-page-provider").addEventListener("click", () => openEditor(pageProviderTemplate(configs), { isNew: true }));
+  document.getElementById("add-page-provider").addEventListener("click", () => {
+    if (confirmDiscardChanges()) openEditor(pageProviderTemplate(configs), { isNew: true });
+  });
   document.getElementById("close-editor").addEventListener("click", closeEditor);
   document.getElementById("source-form").addEventListener("submit", saveEditor);
   document.getElementById("delete-source").addEventListener("click", () => deleteProvider(draftOriginalId));
@@ -609,8 +702,16 @@ if (typeof document !== "undefined") {
   });
   document.getElementById("source-form").addEventListener("change", (event) => {
     if (event.target.matches('[data-rule-field="mode"]')) updateQuotaMode(event.target);
+    if (!editorReadOnly) editorDirty = true;
   });
-  document.getElementById("import-source").addEventListener("click", () => document.getElementById("import-panel").classList.remove("hidden"));
+  document.getElementById("source-form").addEventListener("input", () => {
+    if (!editorReadOnly) editorDirty = true;
+  });
+  document.getElementById("import-source").addEventListener("click", () => {
+    if (!confirmDiscardChanges()) return;
+    if (draftConfig) closeEditor(true);
+    document.getElementById("import-panel").classList.remove("hidden");
+  });
   document.getElementById("close-import").addEventListener("click", () => document.getElementById("import-panel").classList.add("hidden"));
   document.getElementById("choose-import-file").addEventListener("click", () => document.getElementById("import-file").click());
   document.getElementById("import-file").addEventListener("change", async (event) => {
@@ -618,5 +719,10 @@ if (typeof document !== "undefined") {
     if (file) document.getElementById("import-json").value = await file.text();
   });
   document.getElementById("confirm-import").addEventListener("click", importSources);
+  window.addEventListener("beforeunload", (event) => {
+    if (!editorDirty) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   load().catch((error) => setMessage(error.message, true));
 }

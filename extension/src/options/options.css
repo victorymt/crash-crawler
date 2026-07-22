@@ -123,6 +123,11 @@ button.danger {
   color: #b91c1c;
 }
 
+button:disabled {
+  cursor: wait;
+  opacity: .55;
+}
+
 .hidden {
   display: none !important;
 }
@@ -338,6 +343,47 @@ h3 {
 
 .preview-error {
   color: #b91c1c;
+}
+
+.diagnostics {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.diagnostic {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.diagnostic > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.diagnostic.matched > div:first-child span { color: #15803d; }
+.diagnostic.not_found > div:first-child span,
+.diagnostic.parse_failed > div:first-child span { color: #b91c1c; }
+
+.diagnostic small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+.diagnostic-samples {
+  display: grid;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.diagnostic-samples code {
+  overflow: hidden;
+  padding: 3px 5px;
+  border-radius: 4px;
+  background: var(--panel);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .message {

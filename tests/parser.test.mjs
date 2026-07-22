@@ -7,6 +7,8 @@ import {
   parseEzaiclubSubscriptionTokens,
   parseGenericPageTokens,
   parseGenericSelectorResults,
+  formatCurrencyAmount,
+  formatQuotaValue,
   parseOpencodeLegacy,
   parsePercent,
   parseSiliconflowBalanceTokens,
@@ -230,6 +232,31 @@ test("parseGenericSelectorResults supports regex extraction from selected text",
   assert.equal(parsed.balances[0].value, "18.46");
   assert.equal(parsed.usage[0].value, "$12.50 / $20.00");
   assert.equal(parsed.usage[0].percent, 63);
+});
+
+test("generic selector formatting supports USD, CNY, and suffix currencies", () => {
+  assert.equal(formatCurrencyAmount("12", "USD"), "$12.00");
+  assert.equal(formatCurrencyAmount("12", "CNY"), "¥12.00");
+  assert.equal(formatCurrencyAmount("12", "USDT"), "12.00 USDT");
+  assert.equal(formatQuotaValue("12", "20", "USDT"), "12.00 USDT / 20.00 USDT");
+  assert.equal(formatQuotaValue("12", "20", null), "$12.00 / $20.00");
+});
+
+test("generic selector diagnostics distinguish matches, missing elements, and parse failures", () => {
+  const parsed = parseGenericSelectorResults({
+    matched: { values: ["$12.00"], matchCount: 4, samples: ["$12.00", "$13.00", "$14.00"] },
+    failed: { values: ["not money"], matchCount: 1, samples: ["not money"] }
+  }, {
+    balances: [
+      { id: "matched", pageId: "main", label: "余额", selector: ".balance", currency: "USD" },
+      { id: "missing", pageId: "detail", label: "赠金", selector: ".credit", currency: "USD" },
+      { id: "failed", pageId: "main", label: "代金券", selector: ".coupon", pattern: "USD (\\d+)", currency: "USD" }
+    ]
+  });
+  assert.deepEqual(parsed.diagnostics.map((item) => item.status), ["matched", "not_found", "parse_failed"]);
+  assert.equal(parsed.diagnostics[0].matchCount, 4);
+  assert.deepEqual(parsed.diagnostics[0].samples, ["$12.00", "$13.00", "$14.00"]);
+  assert.equal(parsed.diagnostics[1].pageId, "detail");
 });
 
 test("parseSiliconflowBalanceTokens", () => {

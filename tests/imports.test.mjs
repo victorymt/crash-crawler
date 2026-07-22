@@ -42,7 +42,7 @@ test("normalizeProviderConfig preserves parser rules", async () => {
 });
 
 test("page provider template generates a unique id", async () => {
-  const { metricRuleTemplate, pageProviderTemplate } = await import("../extension/src/options/options.js");
+  const { metricRuleTemplate, pageProviderTemplate, ruleFormValuesToRule } = await import("../extension/src/options/options.js");
   const template = pageProviderTemplate([
     { id: "page-provider-1" },
     { id: "page-provider-2" }
@@ -52,6 +52,17 @@ test("page provider template generates a unique id", async () => {
   assert.equal(template.schemaVersion, 2);
   assert.deepEqual(template.parserRules.quotas, []);
   assert.equal(metricRuleTemplate("quotas").mode, "combined");
+  assert.deepEqual(ruleFormValuesToRule("quotas", "quota-1", {
+    label: "月度用量", pageId: "main", mode: "separate", currency: "USDT",
+    usedSelector: ".used", usedAttribute: "value", usedIndex: "2",
+    limitSelector: ".limit", limitAttribute: "aria-label", limitIndex: "3",
+    usedGroup: "1", limitGroup: "1"
+  }), {
+    id: "quota-1", pageId: "main", label: "月度用量", mode: "separate",
+    usedSelector: ".used", usedAttribute: "value", usedIndex: 2,
+    limitSelector: ".limit", limitAttribute: "aria-label", limitIndex: 3,
+    currency: "USDT", usedGroup: 1, limitGroup: 1
+  });
 });
 
 test("options page uses a structured provider editor", async () => {
@@ -60,9 +71,25 @@ test("options page uses a structured provider editor", async () => {
   assert.match(html, /data-editor-action="add-balance"/);
   assert.match(html, /data-editor-action="add-quota"/);
   assert.doesNotMatch(html, /id="source-json"/);
+
+  const [, idPattern] = html.match(/<input id="source-id"[^>]*pattern="([^"]+)"/) || [];
+  assert.ok(idPattern);
+  const providerIdPattern = new RegExp(`^(?:${idPattern})$`, "v");
+  assert.equal(providerIdPattern.test("provider-1.test_value"), true);
+  assert.equal(providerIdPattern.test("provider id"), false);
+  assert.equal(providerIdPattern.test("provider/id"), false);
 });
 
 test("manifest declares optional host permissions for user sources", async () => {
   const manifest = JSON.parse(await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8"));
   assert.deepEqual(manifest.optional_host_permissions, ["https://*/*", "http://*/*"]);
+});
+
+test("popup quota summary preserves prefix and suffix currencies", async () => {
+  const source = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
+  const moduleSource = source.slice(0, source.indexOf("function metricHtml"));
+  const moduleUrl = `data:text/javascript,${encodeURIComponent(moduleSource)}`;
+  const { quotaSummary } = await import(moduleUrl);
+  assert.equal(quotaSummary("$50.15 / $50.00"), "$50.15 / $50.00 · 超出 $0.15");
+  assert.equal(quotaSummary("12.00 USDT / 20.00 USDT"), "12.00 USDT / 20.00 USDT · 剩余 8.00 USDT");
 });

@@ -302,24 +302,74 @@ function selectorValue(value, rule, group = 1, fallbackToText = false) {
   return numericValues(text)[0] || "";
 }
 
+export function formatCurrencyAmount(value, currency, symbol = "") {
+  const amount = normalizeAmount(value);
+  if (symbol) return `${symbol}${amount}`;
+  if (currency === "USD") return `$${amount}`;
+  if (currency === "CNY") return `¥${amount}`;
+  return currency ? `${amount} ${currency}` : amount;
+}
+
+export function formatQuotaValue(used, limit, currency, symbol = "") {
+  const effectiveSymbol = symbol || (!currency ? "$" : "");
+  return `${formatCurrencyAmount(used, currency, effectiveSymbol)} / ${formatCurrencyAmount(limit, currency, effectiveSymbol)}`;
+}
+
+function ruleDiagnostic(rule, result, status, rawValues = [], error = null) {
+  const separate = rule.mode === "separate" || rule.usedSelector || rule.limitSelector;
+  const matchCount = separate
+    ? Number(result.usedMatchCount || 0) + Number(result.limitMatchCount || 0)
+    : Number(result.matchCount ?? rawValues.length);
+  const samples = separate
+    ? [...(result.usedSamples || result.usedValues || []), ...(result.limitSamples || result.limitValues || [])]
+    : (result.samples || rawValues);
+  return {
+    ruleId: rule.id,
+    label: rule.label || rule.id,
+    pageId: rule.pageId || "main",
+    status,
+    matchCount,
+    samples: samples.slice(0, 3),
+    error
+  };
+}
+
 export function parseGenericSelectorResults(selectorResults, parserRules = {}) {
   const balances = [];
   const usage = [];
   const textMetrics = [];
+  const diagnostics = [];
 
   for (const rule of (parserRules.balances || []).filter((item) => item.selector)) {
     const result = selectorResults[rule.id] || {};
-    const raw = firstSelectorValue(result.values);
+    const rawValues = result.values || [];
+    const raw = firstSelectorValue(rawValues);
+    if (!raw) {
+      diagnostics.push(ruleDiagnostic(rule, result, "not_found"));
+      continue;
+    }
     const amount = selectorValue(raw, rule, rule.valueGroup ?? 1);
-    if (!amount) continue;
+    if (!amount) {
+      diagnostics.push(ruleDiagnostic(rule, result, "parse_failed", rawValues, "Selected text did not contain a balance value"));
+      continue;
+    }
     balances.push(balanceMetric(rule.key || rule.id || "balance", rule.label || "余额", normalizeAmount(amount), rule.currency || null));
+    diagnostics.push(ruleDiagnostic(rule, result, "matched", rawValues));
   }
 
   for (const rule of (parserRules.quotas || []).filter((item) => item.selector || item.usedSelector || item.limitSelector)) {
     const result = selectorResults[rule.id] || {};
+    const separate = rule.mode === "separate" || rule.usedSelector || rule.limitSelector;
+    const rawValues = separate
+      ? [...(result.usedValues || []), ...(result.limitValues || [])]
+      : (result.values || []);
+    if (!rawValues.length || (separate && (!(result.usedValues || []).length || !(result.limitValues || []).length))) {
+      diagnostics.push(ruleDiagnostic(rule, result, "not_found", rawValues));
+      continue;
+    }
     let usedRaw = "";
     let limitRaw = "";
-    if (rule.mode === "separate" || rule.usedSelector || rule.limitSelector) {
+    if (separate) {
       usedRaw = selectorValue(firstSelectorValue(result.usedValues), { ...rule, pattern: rule.usedPattern || rule.pattern || "" }, rule.usedGroup ?? 1);
       limitRaw = selectorValue(firstSelectorValue(result.limitValues), { ...rule, pattern: rule.limitPattern || rule.pattern || "" }, rule.limitGroup ?? 1);
     } else {
@@ -334,25 +384,37 @@ export function parseGenericSelectorResults(selectorResults, parserRules = {}) {
     }
     const used = Number(usedRaw);
     const limit = Number(limitRaw);
-    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
-    const symbol = rule.symbol || (rule.currency === "CNY" ? "¥" : "$");
-    const value = `${symbol}${normalizeAmount(usedRaw)} / ${symbol}${normalizeAmount(limitRaw)}`;
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) {
+      diagnostics.push(ruleDiagnostic(rule, result, "parse_failed", rawValues, "Selected text did not contain a valid used/limit pair"));
+      continue;
+    }
+    const value = formatQuotaValue(usedRaw, limitRaw, rule.currency, rule.symbol || "");
     const resetRaw = firstSelectorValue(result.resetValues);
     const resetIn = resetRaw
       ? selectorValue(resetRaw, { ...rule, pattern: rule.resetPattern || "" }, rule.resetGroup ?? 1, true)
       : null;
     usage.push(usageMetric(rule.key || rule.id || "usage", rule.label || "用量", Math.round((used / limit) * 100), value, resetIn || null));
+    diagnostics.push(ruleDiagnostic(rule, result, "matched", rawValues));
   }
 
   for (const rule of (parserRules.textMetrics || []).filter((item) => item.selector)) {
     const result = selectorResults[rule.id] || {};
-    const raw = firstSelectorValue(result.values);
+    const rawValues = result.values || [];
+    const raw = firstSelectorValue(rawValues);
+    if (!raw) {
+      diagnostics.push(ruleDiagnostic(rule, result, "not_found"));
+      continue;
+    }
     const value = selectorValue(raw, rule, rule.valueGroup ?? 1, true);
-    if (!value) continue;
+    if (!value) {
+      diagnostics.push(ruleDiagnostic(rule, result, "parse_failed", rawValues, "Selected text did not match the configured regex"));
+      continue;
+    }
     textMetrics.push(textMetric(rule.key || rule.id || `metric_${textMetrics.length + 1}`, rule.label || "指标", value));
+    diagnostics.push(ruleDiagnostic(rule, result, "matched", rawValues));
   }
 
-  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics], diagnostics };
 }
 
 export function parseGenericPageTokens(tokens, parserRules = {}) {
@@ -386,8 +448,7 @@ export function parseGenericPageTokens(tokens, parserRules = {}) {
       const used = Number(usedRaw);
       const limit = Number(limitRaw);
       if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
-      const symbol = rule.symbol || (rule.currency === "CNY" ? "¥" : "$");
-      const value = `${symbol}${normalizeAmount(usedRaw)} / ${symbol}${normalizeAmount(limitRaw)}`;
+      const value = formatQuotaValue(usedRaw, limitRaw, rule.currency, rule.symbol || "");
       if (!addSeen("usage", label, value)) continue;
       usage.push(usageMetric(rule.key || "usage", label, Math.round((used / limit) * 100), value, genericResetValue(tokens, idx, rule)));
       if (rule.limit && usage.length >= rule.limit) break;
@@ -426,6 +487,7 @@ export function genericPageSnapshot(config, url, parsed) {
     links: linksForConfig(config),
     recommendation: usage.length ? recommendationFromUsage(usage) : recommendationFromBalances(balances),
     error: metrics.length ? null : "Page loaded, but no configured provider rules matched",
+    diagnostics: parsed.diagnostics || [],
     raw: { balance_count: balances.length, usage_count: usage.length, metric_count: metrics.length }
   };
 }

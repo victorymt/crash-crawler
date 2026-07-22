@@ -2,8 +2,7 @@ import {
   DEFAULT_PROVIDER_CONFIGS,
   isBuiltinProviderId,
   normalizeProviderConfig,
-  normalizeProviderConfigs,
-  upsertProviderConfig
+  normalizeProviderConfigs
 } from "./config.js";
 
 const CONFIG_KEY = "providerConfigs";
@@ -40,13 +39,43 @@ export async function saveProviderConfigs(configs) {
 }
 
 export async function importProviderConfig(provider) {
-  if (isBuiltinProviderId(provider?.id)) {
-    throw new Error(`Built-in provider cannot be replaced: ${provider.id}`);
-  }
+  const [imported] = await importProviderConfigs([provider]);
+  return imported;
+}
+
+export async function importProviderConfigs(providers) {
+  if (!Array.isArray(providers) || !providers.length) throw new Error("Provider import is empty");
+  const ids = new Set();
+  const imported = providers.map((provider) => {
+    const normalized = normalizeProviderConfig(provider);
+    if (isBuiltinProviderId(normalized.id)) {
+      throw new Error(`Built-in provider cannot be replaced: ${normalized.id}`);
+    }
+    if (ids.has(normalized.id)) throw new Error(`Duplicate provider id in import: ${normalized.id}`);
+    ids.add(normalized.id);
+    return normalized;
+  });
   const configs = await getProviderConfigs();
-  const normalized = upsertProviderConfig(configs, provider);
+  const replacements = new Map(imported.map((provider) => [provider.id, provider]));
+  const merged = configs.map((config) => replacements.get(config.id) || config);
+  for (const provider of imported) {
+    if (!configs.some((config) => config.id === provider.id)) merged.push(provider);
+  }
+  const normalized = normalizeProviderConfigs(merged);
   await storageSet({ [CONFIG_KEY]: normalized });
-  return normalized.find((item) => item.id === String(provider.id));
+  return imported.map((provider) => normalized.find((item) => item.id === provider.id));
+}
+
+export async function deleteProviderConfig(providerId) {
+  const id = String(providerId || "");
+  if (isBuiltinProviderId(id)) throw new Error(`Built-in provider cannot be deleted: ${id}`);
+  const [configs, snapshots] = await Promise.all([getProviderConfigs(), getSnapshots()]);
+  if (!configs.some((config) => config.id === id)) throw new Error(`unknown provider: ${id}`);
+  const nextSnapshots = { ...snapshots };
+  delete nextSnapshots[id];
+  const normalized = normalizeStoredConfigs(configs.filter((config) => config.id !== id));
+  await storageSet({ [CONFIG_KEY]: normalized, [SNAPSHOT_KEY]: nextSnapshots });
+  return normalized;
 }
 
 export async function exportProviderConfig(providerId) {

@@ -2,9 +2,11 @@ import { normalizeProviderConfig } from "../shared/config.js";
 import { blankSnapshot, errorSnapshot } from "../shared/snapshots.js";
 import {
   exportProviderConfig,
+  deleteProviderConfig,
   getProviderConfigs,
   getSnapshots,
   importProviderConfig,
+  importProviderConfigs,
   saveProviderConfigs,
   saveSnapshot,
   setSecret
@@ -76,6 +78,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { configs: await saveProviderConfigs(message.configs || []) };
       case "config:importProvider":
         return { provider: await importProviderConfig(message.provider) };
+      case "config:importProviders":
+        return { providers: await importProviderConfigs(message.providers) };
+      case "config:deleteProvider":
+        return { configs: await deleteProviderConfig(message.providerId) };
       case "config:exportProvider":
         return { provider: await exportProviderConfig(message.providerId) };
       case "providers:test":

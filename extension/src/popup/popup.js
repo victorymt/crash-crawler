@@ -44,17 +44,21 @@ function formatQuotaAmount(value) {
   return Number.isFinite(value) ? value.toFixed(2) : "";
 }
 
-function quotaSummary(value) {
-  const match = String(value || "").match(/([$¥￥])?\s*(\d+(?:\.\d+)?)\s*\/\s*([$¥￥])?\s*(\d+(?:\.\d+)?)/);
+export function quotaSummary(value) {
+  const match = String(value || "").match(/^\s*([$¥￥])?\s*(\d+(?:\.\d+)?)\s*([A-Za-z]{3,8})?\s*\/\s*([$¥￥])?\s*(\d+(?:\.\d+)?)\s*([A-Za-z]{3,8})?\s*$/);
   if (!match) return String(value || "");
-  const [, leftSymbol, usedRaw, rightSymbol, limitRaw] = match;
+  const [, leftSymbol, usedRaw, leftCurrency, rightSymbol, limitRaw, rightCurrency] = match;
   const used = Number(usedRaw);
   const limit = Number(limitRaw);
   if (!Number.isFinite(used) || !Number.isFinite(limit)) return String(value || "");
-  const symbol = leftSymbol || rightSymbol || "$";
+  const symbol = leftSymbol || rightSymbol || "";
+  const currency = leftCurrency || rightCurrency || "";
+  const format = (amount) => symbol
+    ? `${symbol}${formatQuotaAmount(amount)}`
+    : `${formatQuotaAmount(amount)}${currency ? ` ${currency}` : ""}`;
   const remaining = limit - used;
   const remainingLabel = remaining < 0 ? "超出" : "剩余";
-  return `${symbol}${formatQuotaAmount(used)} / ${symbol}${formatQuotaAmount(limit)} · ${remainingLabel} ${symbol}${formatQuotaAmount(Math.abs(remaining))}`;
+  return `${format(used)} / ${format(limit)} · ${remainingLabel} ${format(Math.abs(remaining))}`;
 }
 
 function metricHtml(metric) {

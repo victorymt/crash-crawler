@@ -80,8 +80,9 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function extractTokensFromTab(tabId, waitOptions = {}, selectorRules = []) {
-  const effectiveWaitOptions = { ...DEFAULT_RENDER_WAIT_OPTIONS, ...waitOptions, selectorRules };
+export async function extractTokensFromTab(tabId, waitOptions = {}, selectorRules = []) {
+  const selectorOnly = selectorRules.length > 0 && waitOptions.collectPageTokens !== true;
+  const effectiveWaitOptions = { ...DEFAULT_RENDER_WAIT_OPTIONS, ...waitOptions, selectorRules, selectorOnly };
   const [{ result } = {}] = await chrome.scripting.executeScript({
     target: { tabId },
     func: async (options) => {
@@ -92,25 +93,46 @@ async function extractTokensFromTab(tabId, waitOptions = {}, selectorRules = [])
       let lastText = "";
       let stableCount = 0;
 
+      const readNodeValue = (node, attribute = "textContent") => {
+        if (attribute === "textContent") return node.textContent || "";
+        if (attribute === "innerText") return node.innerText || "";
+        if (attribute === "value" && "value" in node) return node.value || "";
+        return node.getAttribute(attribute) || "";
+      };
+      const selectNodes = (selector) => {
+        if (!selector) return [];
+        try {
+          return Array.from(document.querySelectorAll(selector));
+        } catch (error) {
+          throw new Error(`Invalid CSS selector ${selector}: ${error.message}`);
+        }
+      };
+      const selectorHasValue = (selector, attribute = "textContent", index = 0) => {
+        const nodes = selectNodes(selector);
+        const node = nodes[Math.max(0, Number(index) || 0)];
+        return Boolean(node && String(readNodeValue(node, attribute)).trim());
+      };
+      const ruleReady = (rule) => {
+        if (rule.mode === "separate" || rule.usedSelector || rule.limitSelector) {
+          return selectorHasValue(rule.usedSelector, rule.usedAttribute || rule.attribute, rule.usedIndex ?? rule.index)
+            && selectorHasValue(rule.limitSelector, rule.limitAttribute || rule.attribute, rule.limitIndex ?? rule.index);
+        }
+        return selectorHasValue(rule.selector, rule.attribute, rule.index);
+      };
+
       while (Date.now() < deadline) {
-        const text = document.body ? document.body.innerText : "";
+        const text = options.selectorOnly ? "" : (document.body ? document.body.innerText : "");
         const waitedLongEnough = Date.now() - startedAt >= options.minWaitMs;
         let selectorReady = false;
         if (waitedLongEnough && (options.readySelector || options.selectorRules.length)) {
-          const selectors = [
-            options.readySelector,
-            ...options.selectorRules.flatMap((rule) => [rule.selector, rule.usedSelector, rule.limitSelector])
-          ].filter(Boolean);
-          try {
-            selectorReady = selectors.some((selector) => document.querySelector(selector));
-          } catch (error) {
-            throw new Error(`Invalid CSS selector: ${error.message}`);
-          }
+          selectorReady = options.readySelector
+            ? selectNodes(options.readySelector).length > 0
+            : options.selectorRules.every(ruleReady);
         }
         if (waitedLongEnough && (selectorReady || usagePattern?.test(text))) {
           break;
         }
-        if (text && text === lastText) {
+        if (!options.selectorRules.length && text && text === lastText) {
           stableCount += 1;
           if (waitedLongEnough && stableCount >= options.stableSamples) {
             break;
@@ -123,56 +145,67 @@ async function extractTokensFromTab(tabId, waitOptions = {}, selectorRules = [])
       }
 
       const storageValues = [];
-      for (const storage of [window.localStorage, window.sessionStorage]) {
-        try {
-          for (let index = 0; index < storage.length; index += 1) {
-            const key = storage.key(index);
-            const value = storage.getItem(key);
-            if (value && value.length <= 50000) {
-              storageValues.push(key, value);
+      if (!options.selectorOnly) {
+        for (const storage of [window.localStorage, window.sessionStorage]) {
+          try {
+            for (let index = 0; index < storage.length; index += 1) {
+              const key = storage.key(index);
+              const value = storage.getItem(key);
+              if (value && value.length <= 50000) {
+                storageValues.push(key, value);
+              }
             }
+          } catch {
+            // Ignore storage access failures from the page.
           }
-        } catch {
-          // Ignore storage access failures from the page.
         }
       }
 
-      const readValues = (selector, attribute = "textContent") => {
-        if (!selector) return [];
-        let nodes;
-        try {
-          nodes = Array.from(document.querySelectorAll(selector));
-        } catch (error) {
-          throw new Error(`Invalid CSS selector ${selector}: ${error.message}`);
-        }
-        return nodes.map((node) => {
-          if (attribute === "textContent") return node.textContent || "";
-          if (attribute === "innerText") return node.innerText || "";
-          if (attribute === "value" && "value" in node) return node.value || "";
-          return node.getAttribute(attribute) || "";
-        }).map((value) => String(value).trim()).filter(Boolean);
+      const readValues = (selector, attribute = "textContent", index = null) => {
+        const nodes = selectNodes(selector);
+        const allValues = nodes.map((node) => String(readNodeValue(node, attribute)).trim());
+        const samples = allValues.filter(Boolean).slice(0, 3);
+        if (index == null || index === "") return { values: allValues.filter(Boolean), matchCount: nodes.length, samples };
+        const selected = allValues[Math.max(0, Number(index) || 0)];
+        return { values: selected ? [selected] : [], matchCount: nodes.length, samples };
       };
       const selectorResults = {};
       for (const rule of options.selectorRules) {
+        const valueResult = readValues(rule.selector, rule.attribute, rule.index);
+        const usedResult = readValues(rule.usedSelector, rule.usedAttribute || rule.attribute, rule.usedIndex ?? rule.index);
+        const limitResult = readValues(rule.limitSelector, rule.limitAttribute || rule.attribute, rule.limitIndex ?? rule.index);
+        const resetResult = readValues(rule.resetSelector, rule.resetAttribute || "textContent", rule.resetIndex);
         selectorResults[rule.id] = {
-          values: readValues(rule.selector, rule.attribute),
-          usedValues: readValues(rule.usedSelector, rule.usedAttribute || rule.attribute),
-          limitValues: readValues(rule.limitSelector, rule.limitAttribute || rule.attribute),
-          resetValues: readValues(rule.resetSelector, rule.resetAttribute || "textContent")
+          values: valueResult.values,
+          usedValues: usedResult.values,
+          limitValues: limitResult.values,
+          resetValues: resetResult.values,
+          matchCount: valueResult.matchCount,
+          usedMatchCount: usedResult.matchCount,
+          limitMatchCount: limitResult.matchCount,
+          resetMatchCount: resetResult.matchCount,
+          samples: valueResult.samples,
+          usedSamples: usedResult.samples,
+          limitSamples: limitResult.samples,
+          resetSamples: resetResult.samples
         };
       }
 
+      const loginText = options.selectorOnly
+        ? `${location.href}\n${document.title}`
+        : `${location.href}\n${document.title}\n${document.body?.innerText || ""}`;
       return {
         title: document.title,
         url: location.href,
-        text: document.body ? document.body.innerText : "",
-        jsonScripts: Array.from(document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__'))
+        text: options.selectorOnly ? "" : (document.body ? document.body.innerText : ""),
+        loginDetected: (options.loginHints || []).some((hint) => loginText.includes(hint)),
+        jsonScripts: options.selectorOnly ? [] : Array.from(document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__'))
           .map((node) => node.textContent || ""),
         storageValues,
         selectorResults
       };
     },
-    args: [effectiveWaitOptions]
+    args: [{ ...effectiveWaitOptions, loginHints: waitOptions.loginHints || [] }]
   });
   if (!result) return null;
   const tokens = pageTextTokens(result.text);
@@ -261,21 +294,30 @@ function tabMatchScore(tabUrl, target) {
 }
 
 async function tokensFromUrl(url, loginHints, loginError, options = {}) {
+  const isLoginPage = (page) => page?.loginDetected === true
+    || isLoginHtml(page?.url, `${page?.title || ""}\n${page?.text || ""}`, loginHints);
   const openTab = await getOpenTabTokens(url, options);
   if (openTab?.tokens?.length || Object.keys(openTab?.selectorResults || {}).length) {
-    if (isLoginHtml(openTab.url, `${openTab.title}\n${openTab.text}`, loginHints)) {
+    if (isLoginPage(openTab)) {
       throw new NotLoggedInError(loginError);
     }
     if (options.renderFallback && options.shouldUseRenderedTokens?.(openTab.tokens, openTab)) {
       const rendered = await getRenderedTabTokens(url, options);
       if (rendered?.tokens?.length || Object.keys(rendered?.selectorResults || {}).length) {
-        if (isLoginHtml(rendered.url, `${rendered.title}\n${rendered.text}`, loginHints)) {
+        if (isLoginPage(rendered)) {
           throw new NotLoggedInError(loginError);
         }
         return rendered;
       }
     }
     return openTab;
+  }
+  if (options.selectorRules?.length) {
+    const rendered = await getRenderedTabTokens(url, options);
+    if (rendered && (rendered.tokens?.length || Object.keys(rendered.selectorResults || {}).length)) {
+      if (isLoginPage(rendered)) throw new NotLoggedInError(loginError);
+      return rendered;
+    }
   }
   const page = await fetchText(url);
   if (isLoginHtml(page.url, page.text, loginHints)) {
@@ -285,7 +327,7 @@ async function tokensFromUrl(url, loginHints, loginError, options = {}) {
   if (options.renderFallback && options.shouldUseRenderedTokens?.(fetchedTokens, null)) {
     const rendered = await getRenderedTabTokens(url, options);
     if (rendered?.tokens?.length || Object.keys(rendered?.selectorResults || {}).length) {
-      if (isLoginHtml(rendered.url, `${rendered.title}\n${rendered.text}`, loginHints)) {
+      if (isLoginPage(rendered)) {
         throw new NotLoggedInError(loginError);
       }
       return rendered;
@@ -404,7 +446,13 @@ function mergeGenericParsed(left, right) {
   const balances = [...(left.balances || []), ...(right.balances || [])];
   const usage = [...(left.usage || []), ...(right.usage || [])];
   const textMetrics = [...(left.textMetrics || []), ...(right.textMetrics || [])];
-  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+  return {
+    balances,
+    usage,
+    textMetrics,
+    metrics: [...balances, ...usage, ...textMetrics],
+    diagnostics: [...(left.diagnostics || []), ...(right.diagnostics || [])]
+  };
 }
 
 async function collectGenericPage(config) {
@@ -414,7 +462,8 @@ async function collectGenericPage(config) {
     ...DEFAULT_RENDER_WAIT_OPTIONS,
     ...(parserRules.readyPattern ? { readyPattern: parserRules.readyPattern } : {}),
     ...(parserRules.readySelector ? { readySelector: parserRules.readySelector } : {}),
-    ...(parserRules.waitOptions || {})
+    ...(parserRules.waitOptions || {}),
+    loginHints
   };
   const pages = [
     { id: "main", url: config.targetUrl, required: true },

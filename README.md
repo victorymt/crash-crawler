@@ -120,10 +120,10 @@ uv run python crawler.py --provider ezaiclub --explore
 用户可以像添加小说书源一样自行新增 provider，不需要改插件源代码：
 
 - 点击“新增来源”，填写名称、页面 URL，并按需添加余额、额度或文本指标。
-- 每个指标使用 CSS 选择器取值；额度支持从同一元素读取 `$50.15 / $50.00`，也支持分别选择已用值和总额。
-- 点击“测试”直接预览余额、额度和文本结果，测试不会写入正式快照。
+- 每个指标使用 CSS 选择器取值，可以选择元素属性和匹配序号；额度支持从同一元素读取 `$50.15 / $50.00`，也支持分别选择已用值和总额。
+- 点击“测试”直接预览余额、额度、文本和逐规则诊断，测试不会写入正式快照。
 - 保存或测试新域名时，浏览器会申请对应站点的访问权限。
-- 内置 provider 只读，可以复制成自定义来源；“导入书源”和“导出”用于分享 JSON 配置。
+- 内置 provider 只读，可以复制成自定义来源；“导入书源”和“导出”用于分享 JSON 配置。批量导入会整体校验，不会只导入其中一部分。
 
 设置页不要求用户直接编辑 JSON。导出的 v2 书源格式示例：
 
@@ -147,6 +147,8 @@ uv run python crawler.py --provider ezaiclub --explore
         "pageId": "main",
         "label": "余额",
         "selector": ".account-balance",
+        "attribute": "textContent",
+        "index": 0,
         "currency": "USD"
       }
     ],
@@ -167,7 +169,8 @@ uv run python crawler.py --provider ezaiclub --explore
         "pageId": "subscriptions",
         "label": "到期时间",
         "selector": ".expires-at",
-        "attribute": "textContent"
+        "attribute": "textContent",
+        "index": 0
       }
     ]
   }
