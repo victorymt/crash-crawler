@@ -117,6 +117,39 @@ uv run python crawler.py --provider ezaiclub --explore
 
 插件版不需要启动 `server.py`，也不需要同步 BrowserOS profile。它会直接使用当前浏览器的登录态访问 provider 页面；DeepSeek API Key 在扩展设置页中保存到 `chrome.storage.local`。
 
+用户可以自行新增普通页面型 provider，不需要改插件源代码：打开扩展设置页，点击“添加页面 Provider”，再编辑模板里的 URL 和 `parserRules`。也可以直接在“高级 JSON 配置”里添加 `type: "page"` provider，通过 `parserRules` 配置余额、额度和文本指标解析规则：
+
+```json
+{
+  "id": "example-page",
+  "name": "Example",
+  "type": "page",
+  "targetUrl": "https://example.com/dashboard",
+  "enabled": true,
+  "secondaryUrls": [{ "label": "打开订阅页", "url": "https://example.com/subscriptions" }],
+  "parserRules": {
+    "loginHints": ["Login", "Sign in", "登录"],
+    "readyPattern": "余额|用量|后重置",
+    "balances": [
+      { "label": "余额", "pattern": "^[$](\\d+(?:\\.\\d+)?)$", "valueGroup": 1, "currency": "USD", "limit": 1 }
+    ],
+    "quotas": [
+      {
+        "label": "每周用量",
+        "pattern": "^[$](\\d+(?:\\.\\d+)?)\\s*/\\s*[$](\\d+(?:\\.\\d+)?)$",
+        "usedGroup": 1,
+        "limitGroup": 2,
+        "currency": "USD",
+        "resetPattern": "(.+?)\\s*后重置"
+      }
+    ],
+    "textMetrics": [
+      { "label": "到期时间", "pattern": "剩余\\s*[^()]*\\(([^)]+)\\)", "valueGroup": 1 }
+    ]
+  }
+}
+```
+
 本地回归测试：
 
 ```bash

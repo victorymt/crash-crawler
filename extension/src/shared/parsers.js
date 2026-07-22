@@ -224,6 +224,139 @@ export function deepseekHttpErrorMessage(status) {
   return `DeepSeek balance API returned HTTP ${status}`;
 }
 
+function compileRulePattern(rule) {
+  if (!rule?.pattern) return null;
+  try {
+    return new RegExp(rule.pattern, rule.flags || "");
+  } catch {
+    return null;
+  }
+}
+
+function groupValue(match, group = 1) {
+  if (!match) return "";
+  return String(match[Number(group) || 1] ?? "").trim();
+}
+
+function currencyFromRule(rule, match) {
+  const value = rule.currencyGroup ? groupValue(match, rule.currencyGroup) : "";
+  if (value) return value === "¥" || value === "￥" || value.toUpperCase() === "RMB" || value === "元" ? "CNY" : value.toUpperCase();
+  return rule.currency || null;
+}
+
+function scanRule(tokens, rule) {
+  const pattern = compileRulePattern(rule);
+  if (!pattern) return [];
+  const matches = [];
+  for (let idx = 0; idx < tokens.length; idx += 1) {
+    const token = String(tokens[idx] || "").trim();
+    if (!token) continue;
+    const match = token.match(pattern);
+    if (match) matches.push({ match, token, idx });
+  }
+  return matches;
+}
+
+function firstRuleValue(tokens, rule) {
+  if (!rule?.pattern) return "";
+  const found = scanRule(tokens, rule)[0];
+  return groupValue(found?.match, rule.valueGroup ?? 1);
+}
+
+function genericResetValue(tokens, quotaIdx, rule) {
+  if (!rule.resetPattern) return null;
+  const resetRule = {
+    pattern: rule.resetPattern,
+    flags: rule.resetFlags || rule.flags || "",
+    valueGroup: rule.resetGroup ?? 1
+  };
+  const window = tokens.slice(quotaIdx, Math.min(tokens.length, quotaIdx + Number(rule.resetLookahead || 6)));
+  return firstRuleValue(window, resetRule) || firstRuleValue(tokens, resetRule) || null;
+}
+
+function genericValueFromRule(tokens, rule, match) {
+  if (rule.staticValue != null) return String(rule.staticValue);
+  if (rule.valuePattern) {
+    return firstRuleValue(tokens, { pattern: rule.valuePattern, flags: rule.valueFlags || rule.flags || "", valueGroup: rule.valueGroup ?? 1 });
+  }
+  return groupValue(match, rule.valueGroup ?? 1);
+}
+
+export function parseGenericPageTokens(tokens, parserRules = {}) {
+  const balances = [];
+  const usage = [];
+  const textMetrics = [];
+  const seen = new Set();
+
+  function addSeen(kind, label, value, extra = "") {
+    const key = `${kind}|${label}|${value}|${extra}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }
+
+  for (const rule of parserRules.balances || []) {
+    for (const { match } of scanRule(tokens, rule)) {
+      const label = rule.label || groupValue(match, rule.labelGroup) || "余额";
+      const amount = groupValue(match, rule.valueGroup ?? 1);
+      if (!amount || !addSeen("balance", label, amount, rule.currency || "")) continue;
+      balances.push(balanceMetric(rule.key || "balance", label, normalizeAmount(amount), currencyFromRule(rule, match)));
+      if (rule.limit && balances.length >= rule.limit) break;
+    }
+  }
+
+  for (const rule of parserRules.quotas || []) {
+    for (const { match, idx } of scanRule(tokens, rule)) {
+      const label = rule.label || groupValue(match, rule.labelGroup) || "用量";
+      const usedRaw = groupValue(match, rule.usedGroup ?? 1);
+      const limitRaw = groupValue(match, rule.limitGroup ?? 2);
+      const used = Number(usedRaw);
+      const limit = Number(limitRaw);
+      if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
+      const symbol = rule.symbol || (rule.currency === "CNY" ? "¥" : "$");
+      const value = `${symbol}${normalizeAmount(usedRaw)} / ${symbol}${normalizeAmount(limitRaw)}`;
+      if (!addSeen("usage", label, value)) continue;
+      usage.push(usageMetric(rule.key || "usage", label, Math.round((used / limit) * 100), value, genericResetValue(tokens, idx, rule)));
+      if (rule.limit && usage.length >= rule.limit) break;
+    }
+  }
+
+  for (const rule of parserRules.textMetrics || []) {
+    for (const { match } of scanRule(tokens, rule)) {
+      const label = rule.label || groupValue(match, rule.labelGroup) || "指标";
+      const value = genericValueFromRule(tokens, rule, match);
+      if (!value || !addSeen("text", label, value)) continue;
+      textMetrics.push(textMetric(rule.key || `metric_${textMetrics.length + 1}`, label, value));
+      if (rule.limit && textMetrics.length >= rule.limit) break;
+    }
+  }
+
+  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+}
+
+export function genericPageSnapshot(config, url, parsed) {
+  const balances = parsed.balances || [];
+  const usage = parsed.usage || [];
+  const metrics = parsed.metrics || [...balances, ...usage, ...(parsed.textMetrics || [])];
+  return {
+    id: config.id,
+    name: config.name,
+    type: config.type,
+    status: "ok",
+    url,
+    updatedAt: nowIso(),
+    checkedAt: nowIso(),
+    subscribed: null,
+    balances,
+    usage,
+    metrics,
+    links: linksForConfig(config),
+    recommendation: usage.length ? recommendationFromUsage(usage) : recommendationFromBalances(balances),
+    error: metrics.length ? null : "Page loaded, but no configured provider rules matched",
+    raw: { balance_count: balances.length, usage_count: usage.length, metric_count: metrics.length }
+  };
+}
+
 export function normalizeAmount(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed.toFixed(2) : String(value);

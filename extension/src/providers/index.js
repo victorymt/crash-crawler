@@ -8,10 +8,12 @@ import {
   deriveOpencodeBillingUrl,
   ezaiclubSnapshot,
   extractJsonPayloads,
+  genericPageSnapshot,
   htmlTokens,
   isLoginHtml,
   opencodeSnapshot,
   pageTextTokens,
+  parseGenericPageTokens,
   parseDeepseekBalance,
   parseEzaiclubBalanceTokens,
   parseEzaiclubSubscriptionTokens,
@@ -344,10 +346,50 @@ async function collectSiliconFlow(config) {
   return siliconflowSnapshot(config, page.url, balances, metrics);
 }
 
+async function collectGenericPage(config) {
+  const parserRules = config.parserRules || {};
+  const loginHints = Array.isArray(parserRules.loginHints) ? parserRules.loginHints : [];
+  const waitOptions = {
+    ...DEFAULT_RENDER_WAIT_OPTIONS,
+    ...(parserRules.readyPattern ? { readyPattern: parserRules.readyPattern } : {}),
+    ...(parserRules.waitOptions || {})
+  };
+  const pages = [
+    { url: config.targetUrl, required: true },
+    ...(config.secondaryUrls || []).map((item) => ({ url: item.url, required: false }))
+  ];
+  const allTokens = [];
+  let snapshotUrl = config.targetUrl;
+
+  for (const pageConfig of pages) {
+    try {
+      const page = await tokensFromUrl(
+        pageConfig.url,
+        loginHints,
+        `Current browser is not logged in to ${config.name}`,
+        {
+          renderFallback: true,
+          requirePathMatch: parserRules.requirePathMatch !== false,
+          waitOptions,
+          afterLoadDelayMs: Number(parserRules.afterLoadDelayMs || 1800),
+          shouldUseRenderedTokens: (tokens) => !parseGenericPageTokens(tokens, parserRules).metrics.length
+        }
+      );
+      if (pageConfig.required) snapshotUrl = page.url;
+      allTokens.push(...page.tokens);
+    } catch (error) {
+      if (error instanceof NotLoggedInError || pageConfig.required) throw error;
+    }
+  }
+
+  return genericPageSnapshot(config, snapshotUrl, parseGenericPageTokens(allTokens, parserRules));
+}
+
 export async function collectProvider(config) {
   if (config.type === "opencode") return collectOpenCode(config);
   if (config.type === "deepseek") return collectDeepSeek(config);
   if (config.type === "ezaiclub") return collectEzaiclub(config);
   if (config.type === "siliconflow") return collectSiliconFlow(config);
+  if (config.type === "page") return collectGenericPage(config);
   throw new Error(`unsupported provider type: ${config.type}`);
 }

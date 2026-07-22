@@ -5,6 +5,7 @@ import {
   parseDeepseekBalance,
   parseEzaiclubBalanceTokens,
   parseEzaiclubSubscriptionTokens,
+  parseGenericPageTokens,
   parseOpencodeLegacy,
   parsePercent,
   parseSiliconflowBalanceTokens,
@@ -136,6 +137,43 @@ test("parseEzaiclubSubscriptionTokens handles JSON field names", () => {
     "6天13小时 后重置"
   ]);
   assert.equal(combinedUsage[0].resetIn, "6天13小时");
+});
+
+test("parseGenericPageTokens parses configurable page rules", () => {
+  const parsed = parseGenericPageTokens([
+    "Dashboard",
+    "账户余额",
+    "$74.84",
+    "Lite周卡",
+    "到期时间",
+    "剩余 6天13小时 (2026/07/29 00:17)",
+    "每周",
+    "$50.15 / $50.00",
+    "6天13小时 后重置"
+  ], {
+    balances: [
+      { label: "余额", pattern: "^[$](\\d+(?:\\.\\d+)?)$", valueGroup: 1, currency: "USD", limit: 1 }
+    ],
+    quotas: [
+      {
+        label: "每周用量",
+        pattern: "^[$](\\d+(?:\\.\\d+)?)\\s*/\\s*[$](\\d+(?:\\.\\d+)?)$",
+        usedGroup: 1,
+        limitGroup: 2,
+        currency: "USD",
+        resetPattern: "(.+?)\\s*后重置"
+      }
+    ],
+    textMetrics: [
+      { label: "到期时间", pattern: "剩余\\s*[^()]*\\(([^)]+)\\)", valueGroup: 1 }
+    ]
+  });
+  assert.equal(parsed.balances[0].value, "74.84");
+  assert.equal(parsed.usage[0].label, "每周用量");
+  assert.equal(parsed.usage[0].value, "$50.15 / $50.00");
+  assert.equal(parsed.usage[0].percent, 100);
+  assert.equal(parsed.usage[0].resetIn, "6天13小时");
+  assert.equal(parsed.textMetrics[0].value, "2026/07/29 00:17");
 });
 
 test("parseSiliconflowBalanceTokens", () => {

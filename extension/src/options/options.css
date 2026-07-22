@@ -55,6 +55,18 @@ h2 {
   font-size: 16px;
 }
 
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-head h2 {
+  margin: 0;
+}
+
 section {
   margin-bottom: 16px;
   padding: 16px;
@@ -69,14 +81,25 @@ label {
   color: var(--muted);
 }
 
-input, select {
+input, select, textarea {
   width: 100%;
-  min-height: 34px;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 6px 8px;
   background: var(--panel-2);
   color: var(--text);
+}
+
+input, select {
+  min-height: 34px;
+}
+
+textarea {
+  min-height: 360px;
+  resize: vertical;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: normal;
+  white-space: pre;
 }
 
 button {
@@ -127,5 +150,6 @@ button.primary {
 
 @media (max-width: 720px) {
   main { padding: 12px; }
+  .section-head { align-items: stretch; flex-direction: column; }
   .provider-row { grid-template-columns: 1fr; }
 }

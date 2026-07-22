@@ -50,14 +50,18 @@ export const DEFAULT_PROVIDER_CONFIGS = [
 ];
 
 export function normalizeProviderConfig(raw) {
-  const secondaryUrls = Array.isArray(raw.secondaryUrls)
-    ? raw.secondaryUrls
+  const rawSecondaryUrls = Array.isArray(raw.secondaryUrls) ? raw.secondaryUrls : raw.secondary_urls;
+  const secondaryUrls = Array.isArray(rawSecondaryUrls)
+    ? rawSecondaryUrls
         .filter((item) => item && item.url)
         .map((item) => ({
           label: String(item.label || "打开详情页"),
           url: String(item.url)
         }))
     : [];
+  const parserRules = raw.parserRules && typeof raw.parserRules === "object"
+    ? JSON.parse(JSON.stringify(raw.parserRules))
+    : null;
   return {
     id: String(raw.id),
     name: String(raw.name || raw.id),
@@ -65,7 +69,8 @@ export function normalizeProviderConfig(raw) {
     targetUrl: String(raw.targetUrl || raw.target_url),
     enabled: raw.enabled !== false,
     secondaryUrls,
-    mode: String(raw.mode || "page")
+    mode: String(raw.mode || "page"),
+    ...(parserRules ? { parserRules } : {})
   };
 }
 
