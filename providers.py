@@ -871,7 +871,23 @@ def extract_json_payloads(responses: list[dict[str, Any]]) -> list[str]:
 
 
 def next_subscription_value(tokens: list[str], start: int) -> str | None:
-    skip_words = ("订阅", "套餐", "subscription", "Subscription", "plan", "Plan")
+    skip_words = (
+        "订阅",
+        "套餐",
+        "subscription",
+        "Subscription",
+        "plan",
+        "Plan",
+        "planName",
+        "plan_name",
+        "expiresAt",
+        "expires_at",
+        "endDate",
+        "renewAt",
+        "renew_at",
+        "有效",
+        "续费",
+    )
     for idx in range(start, min(start + 4, len(tokens))):
         token = tokens[idx].strip()
         if not token or token in skip_words:
@@ -880,6 +896,63 @@ def next_subscription_value(tokens: list[str], start: int) -> str | None:
             continue
         return token
     return None
+
+
+def normalize_subscription_label(label: str) -> str:
+    clean = label.strip()
+    mappings = (
+        (re.compile(r"^(plan_name|planName|subscription_plan|subscriptionPlan)$", re.I), "当前套餐"),
+        (re.compile(r"^(expires_at|expiresAt|endDate|renewAt|renew_at)$", re.I), "到期时间"),
+        (re.compile(r"^(subscription_status|status)$", re.I), "订阅状态"),
+        (re.compile(r"^(subscription_usage|usage)$", re.I), "订阅用量"),
+        (re.compile(r"^(current_plan|currentPlan)$", re.I), "当前套餐"),
+    )
+    for pattern, normalized in mappings:
+        if pattern.search(clean):
+            return normalized
+    return clean
+
+
+def format_subscription_amount(amount: str) -> str:
+    try:
+        return f"{float(amount):.2f}"
+    except ValueError:
+        return amount
+
+
+def subscription_reset_near(tokens: list[str], idx: int) -> str | None:
+    for token in tokens[idx + 1 : min(len(tokens), idx + 5)]:
+        match = re.search(r"(.+?)\s*后重置", token.strip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def subscription_period_near(tokens: list[str], idx: int) -> str | None:
+    period_map = {
+        "每日": "每日",
+        "每天": "每日",
+        "每周": "每周",
+        "每月": "每月",
+        "daily": "每日",
+        "weekly": "每周",
+        "monthly": "每月",
+    }
+    for token in reversed(tokens[max(0, idx - 5) : idx]):
+        clean = token.strip()
+        mapped = period_map.get(clean) or period_map.get(clean.lower())
+        if mapped:
+            return mapped
+    return None
+
+
+def subscription_expiry_near(tokens: list[str], idx: int, date_re: re.Pattern[str]) -> str | None:
+    window = "\n".join(tokens[max(0, idx - 4) : min(len(tokens), idx + 5)])
+    remaining_match = re.search(r"剩余\s*[^()]*\(([^)]+)\)", window)
+    if remaining_match:
+        return remaining_match.group(1).strip()
+    date_match = date_re.search(window)
+    return date_match.group(0) if date_match else None
 
 
 def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]]:
@@ -902,14 +975,126 @@ def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]
         "Subscription",
         "plan",
         "Plan",
+        "planName",
+        "plan_name",
+        "currentPlan",
+        "current_plan",
         "active",
         "Active",
         "expires",
         "Expires",
+        "expiresAt",
+        "expires_at",
+        "endDate",
         "renew",
         "Renew",
+        "renewAt",
+        "renew_at",
+        "status",
+        "usage",
+        "subscription_status",
+        "subscription_usage",
     )
-    date_re = re.compile(r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|[A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4}")
+    date_re = re.compile(
+        r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}(?:[ T]\d{1,2}:\d{2})?|"
+        r"[A-Z][a-z]{2,8}\s+\d{1,2},?\s+\d{4}"
+    )
+    quota_pair_re = re.compile(r"([$¥￥])\s*(\d+(?:\.\d+)?)\s*/\s*([$¥￥])?\s*(\d+(?:\.\d+)?)")
+    period_fields = (
+        ("daily", "每日"),
+        ("weekly", "每周"),
+        ("monthly", "每月"),
+    )
+
+    def add_text(label: str, value: str, key_name: str | None = None) -> None:
+        normalized_label = normalize_subscription_label(label)
+        normalized_value = value.strip()
+        if not normalized_value or normalized_value in nav_tokens:
+            return
+        if normalized_label == "到期时间":
+            normalized_value = normalized_value.replace("T", " ")
+        if normalized_value == "allowed_groups" or "_" in normalized_value and normalized_label != "到期时间":
+            return
+        key = (normalized_label, normalized_value)
+        if key in seen:
+            return
+        seen.add(key)
+        metrics.append(text_metric(key_name or f"subscription_{len(metrics) + 1}", normalized_label, normalized_value))
+
+    def add_usage(label: str, value: str, percent: int | None, reset_in: str | None) -> None:
+        key = (label, value)
+        if key in seen:
+            if reset_in:
+                for metric in metrics:
+                    if (
+                        metric.get("label") == label
+                        and metric.get("value") == value
+                        and not metric.get("reset_in")
+                    ):
+                        metric["reset_in"] = reset_in
+                        break
+            return
+        seen.add(key)
+        metrics.append(usage_metric("subscription_usage", label, percent, value, reset_in))
+
+    def add_api_usage(period: str, label_prefix: str) -> bool:
+        usage_key = f"{period}_usage_usd"
+        limit_key = f"{period}_limit_usd"
+        try:
+            usage_idx = next(i for i, token in enumerate(tokens) if token.strip() == usage_key)
+            limit_idx = next(i for i, token in enumerate(tokens) if token.strip() == limit_key)
+        except StopIteration:
+            return False
+        if usage_idx + 1 >= len(tokens) or limit_idx + 1 >= len(tokens):
+            return False
+        used_raw = tokens[usage_idx + 1].strip()
+        limit_raw = tokens[limit_idx + 1].strip()
+        try:
+            used = float(used_raw)
+            limit = float(limit_raw)
+        except ValueError:
+            return False
+        if limit <= 0:
+            return False
+        percent = round(used / limit * 100)
+        add_usage(
+            f"{label_prefix}用量",
+            f"${format_subscription_amount(used_raw)} / ${format_subscription_amount(limit_raw)}",
+            percent,
+            None,
+        )
+        return True
+
+    has_usage_quota = False
+    for period, label_prefix in period_fields:
+        has_usage_quota = add_api_usage(period, label_prefix) or has_usage_quota
+
+    for idx, token in enumerate(tokens):
+        clean = token.strip()
+        quota_match = quota_pair_re.search(clean)
+        if not quota_match:
+            continue
+        symbol, used_raw, limit_symbol, limit_raw = quota_match.groups()
+        try:
+            used = float(used_raw)
+            limit = float(limit_raw)
+        except ValueError:
+            continue
+        if limit <= 0:
+            continue
+        label_prefix = subscription_period_near(tokens, idx)
+        label = f"{label_prefix}用量" if label_prefix else "订阅用量"
+        percent = round(used / limit * 100)
+        display_symbol = symbol or limit_symbol or "$"
+        value = (
+            f"{display_symbol}{format_subscription_amount(used_raw)} / "
+            f"{limit_symbol or display_symbol}{format_subscription_amount(limit_raw)}"
+        )
+        add_usage(label, value, percent, subscription_reset_near(tokens, idx))
+        has_usage_quota = True
+        expires_at = subscription_expiry_near(tokens, idx, date_re)
+        if expires_at:
+            add_text("到期时间", expires_at)
 
     for idx, token in enumerate(tokens):
         clean = token.strip()
@@ -919,20 +1104,21 @@ def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]
             continue
         if clean in nav_tokens:
             continue
-        if clean in {"last_active_at"} or "同一订阅重复" in clean:
+        if clean in {"last_active_at", "有效", "续费"} or "同一订阅重复" in clean:
+            continue
+        if re.fullmatch(r"(daily|weekly|monthly)_(usage|limit)_usd", clean):
             continue
         if len(clean) > 48 and "已达到" not in clean:
             continue
         percent_match = re.search(r"已达到\s*(\d+)%", clean)
         if percent_match:
+            if has_usage_quota:
+                continue
             date_match = date_re.search("\n".join(tokens[idx : idx + 5]))
             value = f"{percent_match.group(1)}%"
             if date_match:
                 value = f"{value}, 到期 {date_match.group(0)}"
-            key = ("订阅用量", value)
-            if key not in seen:
-                seen.add(key)
-                metrics.append(text_metric("subscription_usage", "订阅用量", value))
+            add_text("订阅用量", value, "subscription_usage")
             continue
         value = next_subscription_value(tokens, idx + 1)
         date_match = date_re.search("\n".join(tokens[idx : idx + 5]))
@@ -946,11 +1132,7 @@ def parse_ezaiclub_subscription_tokens(tokens: list[str]) -> list[dict[str, Any]
             continue
         if "_" in value or value in {"allowed_groups"}:
             continue
-        key = (clean, value)
-        if key in seen:
-            continue
-        seen.add(key)
-        metrics.append(text_metric(f"subscription_{len(metrics) + 1}", clean, value))
+        add_text(clean, value)
         if len(metrics) >= 6:
             break
     return metrics

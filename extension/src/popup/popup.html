@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provider Usage Hub</title>
+  <link rel="stylesheet" href="./popup.css">
+</head>
+<body>
+  <header>
+    <h1>Provider Usage Hub</h1>
+    <div class="toolbar">
+      <button id="refresh-all" class="primary">刷新全部</button>
+      <button id="open-all">打开全部</button>
+      <button id="options">设置</button>
+    </div>
+    <div id="message" class="message" aria-live="polite"></div>
+  </header>
+  <main>
+    <section id="provider-list" class="provider-list"></section>
+  </main>
+  <script type="module" src="./popup.js"></script>
+</body>
+</html>

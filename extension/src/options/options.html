@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provider Usage Hub 设置</title>
+  <link rel="stylesheet" href="./options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Provider Usage Hub 设置</h1>
+      <button id="save" class="primary">保存</button>
+    </header>
+    <section>
+      <h2>DeepSeek</h2>
+      <label>
+        API Key
+        <input id="deepseek-key" type="password" autocomplete="off" placeholder="留空则保持当前密钥">
+      </label>
+    </section>
+    <section>
+      <h2>Providers</h2>
+      <div id="providers"></div>
+    </section>
+    <div id="message" class="message" aria-live="polite"></div>
+  </main>
+  <script type="module" src="./options.js"></script>
+</body>
+</html>

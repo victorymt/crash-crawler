@@ -1,0 +1,251 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #eef2f7;
+  --text: #17202a;
+  --muted: #667085;
+  --line: #d7dde6;
+  --accent: #1677ff;
+  --bad: #c2410c;
+  --ok: #16803c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418;
+    --panel: #181d23;
+    --panel-2: #202833;
+    --text: #e7edf5;
+    --muted: #9aa7b7;
+    --line: #313a46;
+    --accent: #5aa2ff;
+    --bad: #ff9b72;
+    --ok: #64d987;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 720px;
+  min-width: 360px;
+  max-width: 100vw;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+}
+
+header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+}
+
+button, a.button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+button.primary, a.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+}
+
+.message {
+  grid-column: 1 / -1;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.message.error { color: var(--bad); }
+
+main {
+  padding: 12px;
+}
+
+.provider-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.provider-card {
+  display: flex;
+  min-width: 0;
+  min-height: 190px;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.provider-name {
+  min-width: 0;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.provider-meta, .empty {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.status {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status.ok { color: var(--ok); }
+.status.error, .status.stale, .status.unconfigured { color: var(--bad); }
+
+.recommendation {
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.recommendation.ok { color: var(--ok); }
+.recommendation.recharge { color: var(--bad); }
+
+.section-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.amount-grid, .metrics {
+  display: grid;
+  gap: 8px;
+}
+
+.amount-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.amount {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.amount-label, .metric-top {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.amount-value {
+  margin-top: 2px;
+  font-size: 17px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.metric {
+  display: grid;
+  gap: 4px;
+}
+
+.metric-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.metric-top span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.metric-top span:last-child {
+  text-align: right;
+}
+
+.metric-sub {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.bar {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  width: var(--value, 0%);
+  background: var(--accent);
+}
+
+.error {
+  color: var(--bad);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: auto;
+}
+
+@media (max-width: 620px) {
+  body { width: 100vw; }
+  header { grid-template-columns: 1fr; }
+  .provider-list { grid-template-columns: 1fr; }
+  .amount-grid { grid-template-columns: 1fr; }
+}

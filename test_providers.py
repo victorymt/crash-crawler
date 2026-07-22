@@ -102,6 +102,58 @@ class ProviderParserTests(unittest.TestCase):
             ["已达到 95%，但到期前没有可提前重置的窗口。", "2026/07/28"]
         )
         self.assertEqual(usage[0]["label"], "订阅用量")
+        live_usage = parse_ezaiclub_subscription_tokens(
+            [
+                "Lite周卡",
+                "OpenAI",
+                "倍率: ×1.2",
+                "已达到 95%，但到期前没有可提前重置的窗口。",
+                "有效",
+                "续费",
+                "到期时间",
+                "剩余 6天13小时 (2026/07/29 00:17)",
+                "每周",
+                "$50.15 / $50.00",
+                "6天13小时 后重置",
+            ]
+        )
+        self.assertEqual(live_usage[0]["label"], "每周用量")
+        self.assertEqual(live_usage[0]["value"], "$50.15 / $50.00")
+        self.assertEqual(live_usage[0]["percent"], 100)
+        self.assertEqual(live_usage[0]["reset_in"], "6天13小时")
+        self.assertEqual(live_usage[1]["label"], "到期时间")
+        self.assertEqual(live_usage[1]["value"], "2026/07/29 00:17")
+        self.assertFalse(any(item["label"] in {"有效", "续费"} for item in live_usage))
+        api_usage = parse_ezaiclub_subscription_tokens(
+            [
+                "weekly_usage_usd",
+                "50.1509256",
+                "monthly_usage_usd",
+                "100.5876372",
+                "weekly_limit_usd",
+                "50",
+                "monthly_limit_usd",
+                "0",
+                "expires_at",
+                "2026-07-29T00:17:57.582205+08:00",
+            ]
+        )
+        self.assertEqual(api_usage[0]["label"], "每周用量")
+        self.assertEqual(api_usage[0]["value"], "$50.15 / $50.00")
+        self.assertEqual(api_usage[1]["label"], "到期时间")
+        self.assertEqual(api_usage[1]["value"], "2026-07-29 00:17")
+        combined_usage = parse_ezaiclub_subscription_tokens(
+            [
+                "weekly_usage_usd",
+                "50.1509256",
+                "weekly_limit_usd",
+                "50",
+                "每周",
+                "$50.15 / $50.00",
+                "6天13小时 后重置",
+            ]
+        )
+        self.assertEqual(combined_usage[0]["reset_in"], "6天13小时")
 
     def test_parse_siliconflow_balance_tokens(self):
         balances = parse_siliconflow_balance_tokens(

@@ -106,3 +106,19 @@ uv run python crawler.py --provider ezaiclub --explore
 - `result.json`: CLI 最近一次输出。
 - `.provider-cache.json`: Web/API 最近一次成功或失败快照。
 - `dumps/{provider}.txt`: parser 无法识别字段时的探索文本。
+
+## 浏览器插件版
+
+当前仓库同时包含 Chrome/Edge Manifest V3 插件实现。加载扩展时请选择 `extension/` 目录，不要选择仓库根目录。
+
+```text
+/home/cv/crash-crawler/extension
+```
+
+插件版不需要启动 `server.py`，也不需要同步 BrowserOS profile。它会直接使用当前浏览器的登录态访问 provider 页面；DeepSeek API Key 在扩展设置页中保存到 `chrome.storage.local`。
+
+本地回归测试：
+
+```bash
+npm test
+```
