@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provider Usage Hub · 浏览器扩展技术报告</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6f9;
+      --panel: #ffffff;
+      --text: #15202b;
+      --muted: #5b6775;
+      --line: #d8dee8;
+      --accent: #1677ff;
+      --accent-soft: #e8f1ff;
+      --ok: #0f7a3a;
+      --warn: #b45309;
+      --code-bg: #0f1720;
+      --code-text: #e6edf5;
+      --shadow: 0 10px 30px rgba(21, 32, 43, 0.06);
+      --radius: 14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --panel: #161b22;
+        --text: #e6edf3;
+        --muted: #9aa7b5;
+        --line: #30363d;
+        --accent: #58a6ff;
+        --accent-soft: #122033;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --code-bg: #010409;
+        --code-text: #e6edf3;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(1200px 500px at 10% -10%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font: 16px/1.65 var(--sans);
+    }
+
+    .wrap {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 80px;
+    }
+
+    .hero {
+      padding: 28px 32px;
+      border: 1px solid var(--line);
+      border-radius: calc(var(--radius) + 4px);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(1.7rem, 3vw, 2.3rem);
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    .lede {
+      margin: 0;
+      max-width: 62ch;
+      color: var(--muted);
+      font-size: 1.05rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 20px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--bg);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .chip strong { color: var(--text); font-weight: 650; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 24px;
+      margin-top: 28px;
+      align-items: start;
+    }
+
+    nav.toc {
+      position: sticky;
+      top: 16px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    nav.toc h2 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    nav.toc ol {
+      margin: 0;
+      padding: 0 0 0 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    nav.toc a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    nav.toc a:hover { color: var(--accent); }
+
+    main section {
+      margin-bottom: 18px;
+      padding: 22px 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    main h2 {
+      margin: 0 0 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 1.25rem;
+      letter-spacing: -0.01em;
+    }
+
+    main h3 {
+      margin: 22px 0 8px;
+      font-size: 1.02rem;
+    }
+
+    p { margin: 0 0 12px; }
+    ul, ol { margin: 0 0 12px; padding-left: 1.25rem; }
+    li { margin: 0.25rem 0; }
+    li::marker { color: var(--accent); }
+
+    a { color: var(--accent); }
+
+    .callout {
+      margin: 14px 0;
+      padding: 12px 14px;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 10px 10px 0;
+      background: var(--accent-soft);
+      color: var(--text);
+    }
+
+    .callout.warn { border-left-color: var(--warn); }
+    .callout.ok { border-left-color: var(--ok); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 4px;
+      font-size: 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--bg);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    code, kbd {
+      font-family: var(--mono);
+      font-size: 0.9em;
+    }
+
+    :not(pre) > code {
+      padding: 0.12em 0.4em;
+      border-radius: 6px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+    }
+
+    pre {
+      margin: 12px 0;
+      padding: 14px 16px;
+      overflow: auto;
+      border-radius: 12px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      font: 13px/1.55 var(--mono);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+    }
+
+    pre code {
+      background: none;
+      border: 0;
+      padding: 0;
+      color: inherit;
+    }
+
+    .flow {
+      display: grid;
+      gap: 8px;
+      margin: 12px 0;
+    }
+
+    .flow-step {
+      display: grid;
+      grid-template-columns: 36px 1fr;
+      gap: 12px;
+      align-items: start;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--bg);
+    }
+
+    .flow-num {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .flow-step strong { display: block; margin-bottom: 2px; }
+    .flow-step span { color: var(--muted); font-size: 14px; }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin: 12px 0;
+    }
+
+    .stat {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--bg);
+    }
+
+    .stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat .value { margin-top: 4px; font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; }
+    .stat .hint { margin-top: 4px; color: var(--muted); font-size: 13px; }
+
+    footer {
+      margin-top: 24px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc { position: static; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .hero, main section { padding-left: 18px; padding-right: 18px; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .wrap { width: 100%; padding: 0; }
+      nav.toc { display: none; }
+      .layout { grid-template-columns: 1fr; }
+      .hero, main section { box-shadow: none; break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <p class="eyebrow">Technical Report · crash-crawler</p>
+      <h1>Provider Usage Hub<br>浏览器扩展技术报告</h1>
+      <p class="lede">
+        本文汇总浏览器扩展版的架构设计、采集策略、逆向结论与近期优化落地，
+        重点说明 EZAICLUB 从「开 Tab 刮 DOM」迁移到「API 优先」的路径与取舍。
+      </p>
+      <div class="meta">
+        <span class="chip"><strong>版本</strong> extension 0.3.0</span>
+        <span class="chip"><strong>形态</strong> Chrome MV3 Module SW</span>
+        <span class="chip"><strong>日期</strong> 2026-07-25</span>
+        <span class="chip"><strong>仓库</strong> crash-crawler/extension</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="目录">
+        <h2>目录</h2>
+        <ol>
+          <li><a href="#s1">背景与目标</a></li>
+          <li><a href="#s2">系统架构</a></li>
+          <li><a href="#s3">采集策略分层</a></li>
+          <li><a href="#s4">逆向方法论</a></li>
+          <li><a href="#s5">EZAICLUB API 落地</a></li>
+          <li><a href="#s6">工程优化清单</a></li>
+          <li><a href="#s7">数据与状态模型</a></li>
+          <li><a href="#s8">测试与验证</a></li>
+          <li><a href="#s9">风险与后续</a></li>
+          <li><a href="#s10">附录</a></li>
+        </ol>
+      </nav>
+
+      <main>
+        <section id="s1">
+          <h2>1. 背景与目标</h2>
+          <p>
+            Provider Usage Hub 用于聚合多家 AI Provider 的<strong>余额、用量、订阅与代金券</strong>信息。
+            仓库同时提供 Python/Web 看板与 <strong>Chrome/Edge Manifest V3 扩展</strong>。
+            扩展版不依赖 <code>server.py</code> 与 BrowserOS profile 同步，直接复用当前浏览器登录态。
+          </p>
+          <div class="grid-2">
+            <div class="stat">
+              <div class="label">核心问题</div>
+              <div class="value">采集成本</div>
+              <div class="hint">SPA 页面依赖 JS 渲染时，后台开 Tab 慢、重、易抖</div>
+            </div>
+            <div class="stat">
+              <div class="label">优化方向</div>
+              <div class="value">API First</div>
+              <div class="hint">能 JSON 则 fetch；失败再回退 DOM / Tab</div>
+            </div>
+          </div>
+          <h3>产品能力摘要</h3>
+          <ul>
+            <li>Popup 看板：并行刷新、单源刷新、打开官方页、复制 URL</li>
+            <li>Options：内置源可改 URL/名称；自定义「书源」式 CSS 选择器规则</li>
+            <li>后台 <code>chrome.alarms</code> 定时刷新 + 工具栏角标</li>
+            <li>内置：OpenCode、DeepSeek（官方 API）、EZAICLUB（API 优先）、SiliconFlow（页面）</li>
+          </ul>
+        </section>
+
+        <section id="s2">
+          <h2>2. 系统架构</h2>
+          <pre><code>┌────────────┐   message    ┌─────────────────────┐
+│ popup.js   │ ───────────► │ service_worker.js    │
+│ options.js │ ◄─────────── │  refresh / config    │
+└────────────┘   response   │  alarms / badge      │
+                            └──────────┬──────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    ▼                  ▼                  ▼
+            chrome.storage      providers/index.js    chrome.tabs
+            configs/snapshots     collectProvider      scripting
+            secrets/settings      parsers / snapshots  (token/DOM)</code></pre>
+
+          <h3>模块职责</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>路径</th>
+                <th>职责</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>background/service_worker.js</code></td>
+                <td>消息路由、并发刷新池、alarm、角标、配置读写</td>
+              </tr>
+              <tr>
+                <td><code>providers/index.js</code></td>
+                <td>各 provider 采集编排：API / HTTP / Tab / Selector</td>
+              </tr>
+              <tr>
+                <td><code>shared/parsers.js</code></td>
+                <td>HTML token、JSON API、通用书源规则解析</td>
+              </tr>
+              <tr>
+                <td><code>shared/storage.js</code></td>
+                <td>配置合并、快照写锁、密钥与自动刷新设置</td>
+              </tr>
+              <tr>
+                <td><code>popup / options</code></td>
+                <td>展示与书源编辑；popup 监听 <code>storage.onChanged</code></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="callout">
+            <strong>设计原则：</strong>Service Worker 只做编排；解析逻辑尽量纯函数并放在
+            <code>parsers.js</code>，便于 Node 单测与 Python 侧对照。
+          </div>
+        </section>
+
+        <section id="s3">
+          <h2>3. 采集策略分层</h2>
+          <p>「必须开 Tab」并非架构铁律，而是<strong>数据可达性</strong>决定的兜底手段。</p>
+
+          <div class="flow">
+            <div class="flow-step">
+              <div class="flow-num">1</div>
+              <div>
+                <strong>官方 / 内部 JSON API</strong>
+                <span>DeepSeek Bearer Key；EZAICLUB Bearer + <code>localStorage.auth_token</code></span>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">2</div>
+              <div>
+                <strong>复用已打开标签</strong>
+                <span><code>tabs.query</code> + <code>executeScript</code> 读 DOM 或 storage，不新建 Tab</span>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">3</div>
+              <div>
+                <strong>credentials 的 HTTP</strong>
+                <span><code>fetch(url, { credentials: "include" })</code> 拉 HTML（SSR 场景）</span>
+              </div>
+            </div>
+            <div class="flow-step">
+              <div class="flow-num">4</div>
+              <div>
+                <strong>后台 Tab 渲染</strong>
+                <span>SPA 无有效静态字段时 <code>tabs.create({ active: false })</code> 等待就绪再抽文本</span>
+              </div>
+            </div>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>主路径</th>
+                <th>是否常开 Tab</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>DeepSeek</td>
+                <td><code>api.deepseek.com/user/balance</code></td>
+                <td>否</td>
+              </tr>
+              <tr>
+                <td>EZAICLUB</td>
+                <td>API first，DOM fallback</td>
+                <td>有 token 时否；否则短时开 Tab 读 token 或回退 DOM</td>
+              </tr>
+              <tr>
+                <td>OpenCode</td>
+                <td>HTTP / 页面 token 解析</td>
+                <td>视页面是否 SSR</td>
+              </tr>
+              <tr>
+                <td>SiliconFlow</td>
+                <td>API first（wallets + profile），DOM fallback</td>
+                <td>有 subject id 时否；否则短时开 Tab 读 id 或回退 DOM</td>
+              </tr>
+              <tr>
+                <td>自定义 page</td>
+                <td>CSS 选择器 / 正则规则</td>
+                <td>通常是</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="s4">
+          <h2>4. 逆向方法论（实操）</h2>
+          <p>
+            目标：找出页面数字背后的 XHR/Fetch，在扩展 background 中用同一登录态复现。
+            本轮对 EZAICLUB / SiliconFlow 使用 <strong>BrowserOS</strong>（已登录会话）完成；
+            chrome-devtools MCP 因本机缺少 Google Chrome stable 可执行文件未直接使用。
+          </p>
+
+          <h3>4.1 标准步骤</h3>
+          <ol>
+            <li>登录后打开余额 / 订阅 / 券页面</li>
+            <li>DevTools → Network → 过滤 Fetch/XHR，Preserve log</li>
+            <li>刷新或切换 Tab，搜索 <code>balance</code> / <code>subscription</code> / <code>wallet</code></li>
+            <li>记录 Method、URL、鉴权头、响应 JSON 路径</li>
+            <li>在页面 Console 用 <code>fetch</code> 复现；扩展侧再落代码</li>
+          </ol>
+
+          <h3>4.2 EZAICLUB 结论</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>项</th>
+                <th>内容</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>鉴权</td>
+                <td><code>Authorization: Bearer &lt;JWT&gt;</code>，JWT 存于 <code>localStorage.auth_token</code></td>
+              </tr>
+              <tr>
+                <td>仅 Cookie</td>
+                <td>返回 <code>401 Authorization header is required</code></td>
+              </tr>
+              <tr>
+                <td>余额</td>
+                <td><code>GET /api/v1/auth/me?timezone=Asia/Shanghai</code> → <code>data.balance</code></td>
+              </tr>
+              <tr>
+                <td>订阅</td>
+                <td><code>GET /api/v1/subscriptions/active?timezone=…</code> → 套餐名、到期、日/周/月用量</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>4.3 SiliconFlow 结论（已接入 API first）</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>项</th>
+                <th>内容</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>鉴权</td>
+                <td>Cookie 会话 + 请求头 <code>x-subject-id</code></td>
+              </tr>
+              <tr>
+                <td>Subject</td>
+                <td><code>window.SF_SUBJECT_ID</code> / <code>subjectInfo.subjectId</code></td>
+              </tr>
+              <tr>
+                <td>钱包 / 券</td>
+                <td><code>/walletd-server/api/v1/subject/wallets?stage=1|3</code> + <code>profile/peek</code></td>
+              </tr>
+              <tr>
+                <td>金额单位</td>
+                <td>大整数 ÷ 1e12 为元；小数视为已是元</td>
+              </tr>
+              <tr>
+                <td>实现</td>
+                <td><code>collectSiliconflowViaApi</code> → 失败回退 DOM；<code>raw.source</code> 为 <code>api|page</code></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="callout warn">
+            <strong>安全注意：</strong>报告与日志中不得粘贴完整 JWT / refresh_token。
+            扩展 background 无法直接读页面 <code>localStorage</code>，需通过
+            <code>scripting.executeScript</code> 在目标 origin 上下文中读取。
+          </div>
+        </section>
+
+        <section id="s5">
+          <h2>5. EZAICLUB API 落地设计</h2>
+          <h3>5.1 控制流</h3>
+          <pre><code>collectEzaiclub(config)
+  ├─ collectEzaiclubViaApi(config)
+  │    ├─ getEzaiclubAuthToken()
+  │    │    ├─ 已打开 ezaiclub tab → localStorage.auth_token
+  │    │    └─ 否则短时 create 后台 tab，轮询 token 后关闭
+  │    ├─ fetch /api/v1/auth/me
+  │    ├─ fetch /api/v1/subscriptions/active
+  │    └─ ezaiclubApiSnapshot()  → raw.source = "api"
+  └─ 失败 / 无 token / 空结果
+       └─ collectEzaiclubViaPage()  → 原 DOM 双页采集，raw.source = "page"</code></pre>
+
+          <h3>5.2 解析映射</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>API 字段</th>
+                <th>看板字段</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>data.balance</code></td>
+                <td>余额 metric（USD，两位小数）</td>
+              </tr>
+              <tr>
+                <td><code>data.frozen_balance</code>（&gt;0）</td>
+                <td>冻结余额</td>
+              </tr>
+              <tr>
+                <td><code>group.name</code></td>
+                <td>当前套餐</td>
+              </tr>
+              <tr>
+                <td><code>status</code> / <code>expires_at</code></td>
+                <td>订阅状态 / 到期时间</td>
+              </tr>
+              <tr>
+                <td><code>*_usage_usd</code> / <code>*_limit_usd</code></td>
+                <td>用量条（percent + <code>$used / $limit</code>）</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>5.3 关键实现文件</h3>
+          <ul>
+            <li><code>extension/src/providers/index.js</code> — token 读取、API fetch、回退编排</li>
+            <li><code>extension/src/shared/parsers.js</code> —
+              <code>parseEzaiclubAuthMe</code>、<code>parseEzaiclubSubscriptionsApi</code>、
+              <code>ezaiclubApiSnapshot</code>
+            </li>
+            <li><code>tests/ezaiclub-api.test.mjs</code> — 解析与「有 token 时不新开 Tab」契约</li>
+          </ul>
+
+          <div class="callout ok">
+            <strong>收益：</strong>已登录且存在同站 Tab 时，刷新接近纯网络请求；
+            后台定时刷新可显著减少长时间后台 Tab 占用。DOM 路径仍保留，兼容未登录或接口变更。
+          </div>
+        </section>
+
+        <section id="s6">
+          <h2>6. 工程优化清单（0.2 → 0.3）</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>项</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>内置 URL 可配置</td>
+                <td>锁定 id/type/mode；允许改 name、targetUrl、secondaryUrls、enabled（OpenCode workspace）</td>
+              </tr>
+              <tr>
+                <td>refreshAll 批写</td>
+                <td>一次读配置/快照，API 全并行、页面限并发，一次性 <code>saveSnapshots</code></td>
+              </tr>
+              <tr>
+                <td>渲染等待收敛</td>
+                <td>轮询 250ms；selector 就绪即停；上限约 12–16s</td>
+              </tr>
+              <tr>
+                <td>图标与角标</td>
+                <td>异常 / 建议充值 / 关注数量展示在 toolbar badge</td>
+              </tr>
+              <tr>
+                <td>storage 驱动 UI</td>
+                <td>popup 监听快照变更，后台写完自动刷新卡片</td>
+              </tr>
+              <tr>
+                <td>定时刷新</td>
+                <td><code>alarms</code> + 设置页间隔（默认 30 分钟，可关）</td>
+              </tr>
+              <tr>
+                <td>快照写锁</td>
+                <td>并行 <code>saveSnapshot</code> 不丢更新</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="s7">
+          <h2>7. 数据与状态模型</h2>
+          <h3>7.1 Provider 配置（schema v2）</h3>
+          <pre><code>{
+  "schemaVersion": 2,
+  "id": "ezaiclub",
+  "name": "EZAICLUB",
+  "type": "ezaiclub",
+  "targetUrl": "https://www.ezaiclub.com/dashboard",
+  "enabled": true,
+  "secondaryUrls": [
+    { "id": "page-1", "label": "打开订阅页",
+      "url": "https://www.ezaiclub.com/subscriptions" }
+  ],
+  "mode": "page"
+}</code></pre>
+
+          <h3>7.2 Snapshot 统一形状</h3>
+          <pre><code>{
+  "id", "name", "type", "status",   // ok | stale | error | unconfigured | idle
+  "url", "updatedAt", "checkedAt",
+  "balances": [{ key, label, value, currency }],
+  "usage":    [{ key, label, percent, value, resetIn }],
+  "metrics":  [ ...balances, ...usage, ...text ],
+  "recommendation": "ok" | "watch" | "recharge",
+  "error", "links",
+  "raw": { "source": "api" | "page", ... }
+}</code></pre>
+
+          <h3>7.3 storage.local 键</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Key</th>
+                <th>用途</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>providerConfigs</code></td><td>内置 + 自定义源配置</td></tr>
+              <tr><td><code>providerSnapshots</code></td><td>最近一次成功/失败快照</td></tr>
+              <tr><td><code>secrets</code></td><td>如 DeepSeek API Key</td></tr>
+              <tr><td><code>extensionSettings</code></td><td>自动刷新间隔、上次自动刷新时间</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="s8">
+          <h2>8. 测试与验证</h2>
+          <p>扩展侧使用 Node 内置 test runner：</p>
+          <pre><code>npm test
+# node --test tests/*.test.mjs</code></pre>
+          <ul>
+            <li>Parser 单测：余额 / 订阅 token、API JSON 映射</li>
+            <li>Provider 集成：API 成功路径不 <code>tabs.create</code>；无 token 时回退 DOM</li>
+            <li>Background：并发 refreshAll、单次 snapshot 批写、alarm 设置</li>
+            <li>Storage：内置 URL 保留、快照写锁、设置归一化</li>
+          </ul>
+          <div class="callout">
+            手工验收建议：扩展重新加载 → 保持 EZAICLUB 已登录 → 刷新单卡 →
+            检查 popup 数据与 <code>raw.source === "api"</code>（可在测试预览或调试日志中观察）。
+          </div>
+        </section>
+
+        <section id="s9">
+          <h2>9. 风险与后续工作</h2>
+          <h3>风险</h3>
+          <ul>
+            <li><strong>无文档 API</strong>：路径或字段变更会导致 API 路径失败（已有 DOM 回退）</li>
+            <li><strong>Token 生命周期</strong>：JWT 过期后需用户重新打开站点或走 refresh（当前未实现 refresh_token 刷新）</li>
+            <li><strong>站点 ToS</strong>：自动化采集仅建议个人自用聚合</li>
+            <li><strong>Alarm 精度</strong>：Chrome 休眠时可能推迟触发</li>
+          </ul>
+          <h3>建议后续</h3>
+          <ol>
+            <li><s>SiliconFlow：接入 x-subject-id + wallets API</s>（已完成）</li>
+            <li>EZAICLUB：可选实现 <code>refresh_token</code> 静默续期，减少短开 Tab</li>
+            <li>OpenCode：Network 逆向是否可无渲染</li>
+            <li>修复 chrome-devtools MCP 的 Chromium 路径，便于日后纯 DevTools 抓包</li>
+          </ol>
+        </section>
+
+        <section id="s10">
+          <h2>10. 附录</h2>
+          <h3>A. 权限</h3>
+          <pre><code>permissions: storage, tabs, scripting, alarms
+host_permissions: 内置各站 origin
+optional_host_permissions: https://*/*, http://*/*  // 自定义书源</code></pre>
+
+          <h3>B. 加载扩展</h3>
+          <pre><code>chrome://extensions → 开发者模式 → 加载已解压的扩展程序
+选择目录：…/crash-crawler/extension</code></pre>
+
+          <h3>C. 相关文档与入口</h3>
+          <ul>
+            <li>仓库 README：Web 看板 + 扩展使用说明</li>
+            <li>本报告路径：<code>docs/extension-technical-report.html</code></li>
+            <li>本地打开：用浏览器直接打开该 HTML 文件即可（无需构建）</li>
+          </ul>
+
+          <h3>D. 一句话总结</h3>
+          <div class="callout ok">
+            Provider Usage Hub 扩展以「统一 snapshot + 可插拔采集」为核心；
+            页面 Tab 是通用兜底，JSON API 是性能与稳定性的主航道。
+            EZAICLUB 已完成从 DOM 刮取到 API 优先的第一跳，为其余 SPA 源提供了可复制模板。
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <footer>
+      Provider Usage Hub · crash-crawler · 技术报告 · 2026-07-25
+    </footer>
+  </div>
+</body>
+</html>

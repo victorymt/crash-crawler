@@ -132,7 +132,7 @@ function renderProviderList() {
         <div class="provider-url" title="${escapeHtml(config.targetUrl)}">${escapeHtml(config.targetUrl)}</div>
       </div>
       <div class="provider-actions">
-        <button type="button" data-provider-action="${builtin ? "view" : "edit"}">${builtin ? "查看" : "编辑"}</button>
+        <button type="button" data-provider-action="edit">编辑</button>
         ${builtin ? '<button type="button" data-provider-action="duplicate">复制</button>' : ""}
         <button type="button" data-provider-action="test">测试</button>
         <button type="button" data-provider-action="export">导出</button>
@@ -260,8 +260,13 @@ function renderMetricRules(config) {
 function renderEditor() {
   if (!draftConfig) return;
   const section = document.getElementById("source-editor-section");
+  const builtin = isBuiltinProviderId(draftConfig.id);
   section.classList.remove("hidden");
-  document.getElementById("editor-title").textContent = editorReadOnly ? `查看 ${draftConfig.name}` : draftOriginalId ? `编辑 ${draftConfig.name}` : "新增来源";
+  document.getElementById("editor-title").textContent = editorReadOnly
+    ? `查看 ${draftConfig.name}`
+    : draftOriginalId
+      ? `编辑 ${draftConfig.name}`
+      : "新增来源";
   document.getElementById("source-name").value = draftConfig.name || "";
   document.getElementById("source-id").value = draftConfig.id || "";
   document.getElementById("source-enabled").checked = draftConfig.enabled !== false;
@@ -271,16 +276,20 @@ function renderEditor() {
   document.getElementById("metric-rules").innerHTML = renderMetricRules(draftConfig);
   document.getElementById("source-login-hints").value = (draftConfig.parserRules?.loginHints || []).join("\n");
   document.getElementById("source-ready-selector").value = draftConfig.parserRules?.readySelector || "";
+  document.getElementById("builtin-editor-note").classList.toggle("hidden", !builtin || editorReadOnly);
+  document.getElementById("metric-rules-block").classList.toggle("hidden", builtin);
+  document.getElementById("advanced-block").classList.toggle("hidden", builtin);
   const form = document.getElementById("source-form");
   form.querySelectorAll("input, select, textarea").forEach((control) => {
     control.disabled = editorReadOnly;
   });
-  document.getElementById("source-id").disabled = Boolean(draftOriginalId) || editorReadOnly;
+  // Built-in id/type are fixed; existing custom sources keep a stable id.
+  document.getElementById("source-id").disabled = Boolean(draftOriginalId) || editorReadOnly || builtin;
   form.querySelectorAll('[data-editor-action^="add-"], [data-editor-action="remove-page"], [data-editor-action="remove-rule"]').forEach((button) => {
     button.classList.toggle("hidden", editorReadOnly);
   });
   form.querySelector('button[type="submit"]').classList.toggle("hidden", editorReadOnly);
-  document.getElementById("delete-source").classList.toggle("hidden", editorReadOnly || !draftOriginalId);
+  document.getElementById("delete-source").classList.toggle("hidden", editorReadOnly || !draftOriginalId || builtin);
   document.getElementById("test-preview").classList.add("hidden");
   form.querySelectorAll("button").forEach((button) => { button.disabled = activeOperation; });
   section.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -349,6 +358,24 @@ function readEditorSource() {
     label: row.querySelector('[data-page-field="label"]').value.trim(),
     url: row.querySelector('[data-page-field="url"]').value.trim()
   }));
+  const builtin = isBuiltinProviderId(draftConfig?.id || document.getElementById("source-id").value.trim());
+  const base = {
+    schemaVersion: PROVIDER_SCHEMA_VERSION,
+    id: document.getElementById("source-id").value.trim(),
+    name: document.getElementById("source-name").value.trim(),
+    type: document.getElementById("source-type").value || draftConfig?.type || "page",
+    targetUrl: document.getElementById("source-target-url").value.trim(),
+    enabled: document.getElementById("source-enabled").checked,
+    secondaryUrls,
+    mode: draftConfig?.mode || "page"
+  };
+  if (builtin) {
+    return {
+      ...base,
+      type: draftConfig?.type || base.type,
+      mode: draftConfig?.mode || base.mode
+    };
+  }
   const groupedRules = { balances: [], quotas: [], textMetrics: [] };
   document.querySelectorAll("#metric-rules .rule-card").forEach((card) => {
     const [kind, rule] = readRule(card);
@@ -364,17 +391,7 @@ function readEditorSource() {
   const readySelector = document.getElementById("source-ready-selector").value.trim();
   if (readySelector) parserRules.readySelector = readySelector;
   else delete parserRules.readySelector;
-  return {
-    schemaVersion: PROVIDER_SCHEMA_VERSION,
-    id: document.getElementById("source-id").value.trim(),
-    name: document.getElementById("source-name").value.trim(),
-    type: document.getElementById("source-type").value || "page",
-    targetUrl: document.getElementById("source-target-url").value.trim(),
-    enabled: document.getElementById("source-enabled").checked,
-    secondaryUrls,
-    mode: draftConfig?.mode || "page",
-    parserRules
-  };
+  return { ...base, parserRules };
 }
 
 function openEditor(config, options = {}) {
@@ -525,10 +542,17 @@ async function saveEditor(event) {
   return withOperationLock(async () => {
     try {
     if (!document.getElementById("source-form").reportValidity()) return;
-    const source = formStateToProvider(readEditorSource());
-    validateSelectors(source);
+    const raw = readEditorSource();
+    const source = isBuiltinProviderId(raw.id)
+      ? formStateToProvider({
+          ...raw,
+          type: draftConfig?.type || raw.type,
+          mode: draftConfig?.mode || raw.mode
+        })
+      : formStateToProvider(raw);
+    if (!isBuiltinProviderId(source.id)) validateSelectors(source);
     await requestProviderPermissions(source);
-    const response = await sendMessage({ type: "config:importProvider", provider: source });
+    const response = await sendMessage({ type: "config:saveProvider", provider: source });
     await load();
     openEditor(response.provider);
     setMessage(`${source.name} 已保存。`);
@@ -611,7 +635,7 @@ async function handleProviderAction(providerId, action) {
   if (action === "export") await exportSource(providerId);
   if (action === "delete") await deleteProvider(providerId);
   if (action === "test") {
-    openEditor(config, { readOnly: isBuiltinProviderId(providerId) });
+    openEditor(config);
     await testEditor();
   }
 }
@@ -646,6 +670,28 @@ async function importSources() {
   });
 }
 
+function formatAutoRefreshMeta(settings) {
+  const minutes = Number(settings?.autoRefreshMinutes || 0);
+  if (!minutes) return "后台自动刷新已关闭。可随时在弹窗里手动刷新。";
+  if (settings?.lastAutoRefreshError) {
+    const attempted = settings.lastAutoRefreshAttemptAt
+      ? new Date(settings.lastAutoRefreshAttemptAt).toLocaleString()
+      : "未知时间";
+    return `后台刷新失败（${attempted}）：${settings.lastAutoRefreshError}`;
+  }
+  const last = settings?.lastAutoRefreshAt
+    ? `最近自动刷新：${new Date(settings.lastAutoRefreshAt).toLocaleString()}`
+    : "尚未执行过自动刷新";
+  return `已启用：每 ${minutes} 分钟刷新已启用的 provider，并更新工具栏角标。${last}。`;
+}
+
+function applySettingsToForm(settings) {
+  const select = document.getElementById("auto-refresh-minutes");
+  if (select) select.value = String(settings?.autoRefreshMinutes ?? 30);
+  const meta = document.getElementById("auto-refresh-meta");
+  if (meta) meta.textContent = formatAutoRefreshMeta(settings);
+}
+
 async function saveGlobal() {
   return withOperationLock(async () => {
     try {
@@ -658,19 +704,45 @@ async function saveGlobal() {
       type: "secret:setDeepSeekKey",
       value: document.getElementById("deepseek-key").value.trim()
     });
+    const settingsResponse = await sendMessage({
+      type: "settings:save",
+      settings: {
+        autoRefreshMinutes: Number(document.getElementById("auto-refresh-minutes").value || 0)
+      }
+    });
     configs = updatedConfigs;
     renderProviderList();
-    setMessage("全局设置已保存。断开的站点权限会在测试或保存来源时重新申请。");
+    applySettingsToForm(settingsResponse.settings);
+    const interval = settingsResponse.settings?.autoRefreshMinutes || 0;
+    setMessage(interval
+      ? `全局设置已保存。后台将每 ${interval} 分钟自动刷新。`
+      : "全局设置已保存。后台自动刷新已关闭。");
     } catch (error) {
       setMessage(error.message || "保存失败", true);
     }
   });
 }
 
+async function clearDeepSeekKey() {
+  return withOperationLock(async () => {
+    try {
+      await sendMessage({ type: "secret:clearDeepSeekKey" });
+      document.getElementById("deepseek-key").value = "";
+      setMessage("DeepSeek 密钥已清除。");
+    } catch (error) {
+      setMessage(error.message || "清除密钥失败", true);
+    }
+  });
+}
+
 async function load() {
-  const data = await sendMessage({ type: "config:get" });
-  configs = data.configs;
+  const [configData, settingsData] = await Promise.all([
+    sendMessage({ type: "config:get" }),
+    sendMessage({ type: "settings:get" })
+  ]);
+  configs = configData.configs;
   renderProviderList();
+  applySettingsToForm(settingsData.settings);
 }
 
 function handleEditorAction(button) {
@@ -686,6 +758,7 @@ function handleEditorAction(button) {
 
 if (typeof document !== "undefined") {
   document.getElementById("save-global").addEventListener("click", saveGlobal);
+  document.getElementById("clear-deepseek-key").addEventListener("click", clearDeepSeekKey);
   document.getElementById("add-page-provider").addEventListener("click", () => {
     if (confirmDiscardChanges()) openEditor(pageProviderTemplate(configs), { isNew: true });
   });

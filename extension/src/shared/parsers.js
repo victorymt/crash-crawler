@@ -370,8 +370,16 @@ export function parseGenericSelectorResults(selectorResults, parserRules = {}) {
     let usedRaw = "";
     let limitRaw = "";
     if (separate) {
-      usedRaw = selectorValue(firstSelectorValue(result.usedValues), { ...rule, pattern: rule.usedPattern || rule.pattern || "" }, rule.usedGroup ?? 1);
-      limitRaw = selectorValue(firstSelectorValue(result.limitValues), { ...rule, pattern: rule.limitPattern || rule.pattern || "" }, rule.limitGroup ?? 1);
+      usedRaw = selectorValue(firstSelectorValue(result.usedValues), {
+        ...rule,
+        pattern: rule.usedPattern || rule.pattern || "",
+        flags: rule.usedFlags || rule.flags || ""
+      }, rule.usedGroup ?? 1);
+      limitRaw = selectorValue(firstSelectorValue(result.limitValues), {
+        ...rule,
+        pattern: rule.limitPattern || rule.pattern || "",
+        flags: rule.limitFlags || rule.flags || ""
+      }, rule.limitGroup ?? 1);
     } else {
       const raw = firstSelectorValue(result.values);
       const match = compileRulePattern(rule)?.exec(raw);
@@ -391,7 +399,11 @@ export function parseGenericSelectorResults(selectorResults, parserRules = {}) {
     const value = formatQuotaValue(usedRaw, limitRaw, rule.currency, rule.symbol || "");
     const resetRaw = firstSelectorValue(result.resetValues);
     const resetIn = resetRaw
-      ? selectorValue(resetRaw, { ...rule, pattern: rule.resetPattern || "" }, rule.resetGroup ?? 1, true)
+      ? selectorValue(resetRaw, {
+          ...rule,
+          pattern: rule.resetPattern || "",
+          flags: rule.resetFlags || rule.flags || ""
+        }, rule.resetGroup ?? 1, true)
       : null;
     usage.push(usageMetric(rule.key || rule.id || "usage", rule.label || "用量", Math.round((used / limit) * 100), value, resetIn || null));
     diagnostics.push(ruleDiagnostic(rule, result, "matched", rawValues));
@@ -550,23 +562,44 @@ export function parseEzaiclubBalanceTokens(tokens) {
   return balances.slice(0, 3);
 }
 
-export function flattenJsonValues(value) {
+export function flattenJsonValues(value, options = {}) {
+  const maxDepth = Number(options.maxDepth || 20);
+  const maxTokens = Number(options.maxTokens || 5000);
+  const maxTokenLength = Number(options.maxTokenLength || 10000);
   const result = [];
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    for (const [key, item] of Object.entries(value)) {
-      result.push(String(key));
-      result.push(...flattenJsonValues(item));
+  const seen = new WeakSet();
+  const stack = [{ value, depth: 0 }];
+  while (stack.length && result.length < maxTokens) {
+    const current = stack.pop();
+    if (current.value == null || current.depth > maxDepth) continue;
+    if (typeof current.value !== "object") {
+      result.push(String(current.value).slice(0, maxTokenLength));
+      continue;
     }
-  } else if (Array.isArray(value)) {
-    for (const item of value) result.push(...flattenJsonValues(item));
-  } else if (value != null) {
-    result.push(String(value));
+    if (seen.has(current.value)) continue;
+    seen.add(current.value);
+    if (Array.isArray(current.value)) {
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        stack.push({ value: current.value[index], depth: current.depth + 1 });
+      }
+      continue;
+    }
+    const entries = Object.entries(current.value);
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const [key, item] = entries[index];
+      stack.push({ value: item, depth: current.depth + 1 });
+      stack.push({ value: key, depth: current.depth + 1 });
+    }
   }
   return result;
 }
 
 export function extractJsonPayloads(responses) {
-  return responses.flatMap((response) => flattenJsonValues(response?.data)).map((token) => token.trim()).filter(Boolean);
+  return responses
+    .flatMap((response) => flattenJsonValues(response?.data))
+    .slice(0, 10000)
+    .map((token) => token.trim())
+    .filter(Boolean);
 }
 
 function nextSubscriptionValue(tokens, start) {
@@ -913,7 +946,7 @@ export function parseSiliconflowMetricTokens(tokens) {
   return metrics;
 }
 
-export function siliconflowSnapshot(config, url, balances, metrics) {
+export function siliconflowSnapshot(config, url, balances, metrics, options = {}) {
   const allMetrics = [...balances, ...metrics];
   return {
     id: config.id,
@@ -930,11 +963,129 @@ export function siliconflowSnapshot(config, url, balances, metrics) {
     links: linksForConfig(config),
     recommendation: recommendationFromBalances(balances),
     error: allMetrics.length ? null : "SiliconFlow page loaded, but no balance or coupon fields were recognized",
-    raw: { balance_count: balances.length, metric_count: metrics.length }
+    raw: {
+      balance_count: balances.length,
+      metric_count: metrics.length,
+      source: options.source || "page"
+    }
   };
 }
 
-export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMetrics) {
+/** Wallet API amounts are often micro-units (~1e12 = 1 CNY); small numbers are already yuan. */
+export function siliconflowAmountToYuan(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return null;
+  if (Math.abs(amount) >= 1e6) return amount / 1e12;
+  return amount;
+}
+
+export function parseSiliconflowWalletName(name) {
+  if (name == null || name === "") return "钱包";
+  if (typeof name === "object") {
+    return String(name["zh-cn"] || name["zh_cn"] || name["en-us"] || name["en_us"] || "钱包");
+  }
+  const raw = String(name);
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      return String(parsed["zh-cn"] || parsed["zh_cn"] || parsed["en-us"] || parsed["en_us"] || raw);
+    }
+  } catch {
+    // plain string label
+  }
+  return raw;
+}
+
+function formatSiliconflowEpoch(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  try {
+    return new Date(value).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+
+/** Parse walletd-server wallets list (stage 1 balance / stage 3 coupons). */
+export function parseSiliconflowWalletsApi(payload, { stage = null } = {}) {
+  const wallets = payload?.data?.wallets || payload?.wallets || [];
+  const balances = [];
+  const metrics = [];
+  const seen = new Set();
+
+  for (const wallet of wallets) {
+    if (!wallet || typeof wallet !== "object") continue;
+    const yuan = siliconflowAmountToYuan(wallet.balance);
+    if (yuan == null) continue;
+    const walletStage = Number(wallet.stage ?? stage);
+    const label = parseSiliconflowWalletName(wallet.name);
+    const amount = normalizeAmount(yuan);
+    if (walletStage === 3) {
+      const key = `coupon|${label}|${amount}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      balances.push(balanceMetric("coupon", `${label}剩余额度`, amount, "CNY"));
+      const expires = formatSiliconflowEpoch(wallet.expiresAt);
+      if (expires) {
+        metrics.push(textMetric(`siliconflow_coupon_expires_${metrics.length + 1}`, `${label}有效期`, expires));
+      }
+    } else {
+      const balanceLabel = /余额|balance/i.test(label) ? label : "余额";
+      const key = `balance|${balanceLabel}|${amount}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      balances.push(balanceMetric("balance", balanceLabel, amount, "CNY"));
+    }
+  }
+
+  return { balances, metrics };
+}
+
+/** Parse profile/peek or subjectInfo-like objects. */
+export function parseSiliconflowProfileApi(payload) {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  if (!data || typeof data !== "object") return { balances: [], metrics: [] };
+  const balances = [];
+  const seen = new Set();
+  function add(key, label, raw) {
+    const yuan = siliconflowAmountToYuan(raw);
+    if (yuan == null) return;
+    const amount = normalizeAmount(yuan);
+    const dedupe = `${key}|${amount}`;
+    if (seen.has(dedupe)) return;
+    seen.add(dedupe);
+    balances.push(balanceMetric(key, label, amount, "CNY"));
+  }
+  add("balance", "余额", data.chargeBalance ?? data.charge_balance);
+  add("gift_balance", "赠金/券余额", data.balance);
+  add("total_balance", "总余额", data.totalBalance ?? data.total_balance);
+  if (data.creditLimit != null && Number(data.creditLimit) > 0) {
+    add("credit_limit", "可透支额度", data.creditLimit ?? data.credit_limit);
+  }
+  return { balances, metrics: [] };
+}
+
+export function siliconflowApiSnapshot(config, profilePayload, balanceWalletsPayload, couponWalletsPayload) {
+  const profile = parseSiliconflowProfileApi(profilePayload || {});
+  const cash = parseSiliconflowWalletsApi(balanceWalletsPayload || {}, { stage: 1 });
+  const coupons = parseSiliconflowWalletsApi(couponWalletsPayload || {}, { stage: 3 });
+  const balances = [];
+  const seen = new Set();
+  for (const item of [...profile.balances, ...cash.balances, ...coupons.balances]) {
+    const key = `${item.key}|${item.label}|${item.value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    balances.push(item);
+  }
+  const metrics = [...profile.metrics, ...cash.metrics, ...coupons.metrics];
+  if (coupons.balances.length) {
+    metrics.unshift(textMetric("siliconflow_coupon_count", "代金券", `${coupons.balances.length} 张可用`));
+  }
+  return siliconflowSnapshot(config, config.targetUrl, balances, metrics, { source: "api" });
+}
+
+export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMetrics, options = {}) {
+  const usage = (subscriptionMetrics || []).filter((item) => Number.isInteger(item?.percent));
   const metrics = [...balances, ...subscriptionMetrics];
   return {
     id: config.id,
@@ -944,13 +1095,136 @@ export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMet
     url: dashboardUrl,
     updatedAt: nowIso(),
     checkedAt: nowIso(),
-    subscribed: null,
+    subscribed: options.subscribed ?? null,
     balances,
-    usage: [],
+    usage,
     metrics,
     links: linksForConfig(config),
-    recommendation: recommendationFromBalances(balances),
+    recommendation: usage.length
+      ? recommendationFromUsage(usage)
+      : recommendationFromBalances(balances),
     error: metrics.length ? null : "EZAICLUB pages loaded, but no balance or subscription fields were recognized",
-    raw: { balance_count: balances.length, subscription_metric_count: subscriptionMetrics.length }
+    raw: {
+      balance_count: balances.length,
+      subscription_metric_count: subscriptionMetrics.length,
+      source: options.source || "page"
+    }
   };
+}
+
+/** Parse /api/v1/auth/me JSON into balance metrics. */
+export function parseEzaiclubAuthMe(payload) {
+  const user = payload?.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+    ? payload.data
+    : payload;
+  if (!user || typeof user !== "object") return [];
+  const balances = [];
+  if (user.balance != null && user.balance !== "") {
+    balances.push(balanceMetric("balance", "余额", normalizeAmount(user.balance), "USD"));
+  }
+  if (user.frozen_balance != null && Number(user.frozen_balance) > 0) {
+    balances.push(balanceMetric("frozen_balance", "冻结余额", normalizeAmount(user.frozen_balance), "USD"));
+  }
+  return balances;
+}
+
+function formatEzaiclubApiDate(value) {
+  if (value == null || value === "") return "";
+  return String(value).replace("T", " ").replace(/\.\d+/, "").replace(/\+08:00$/, "");
+}
+
+function pushEzaiclubPeriodUsage(metrics, seen, planName, periodLabel, usedRaw, limitRaw, resetAt) {
+  const used = Number(usedRaw);
+  const limit = Number(limitRaw);
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return;
+  const label = planName ? `${planName} ${periodLabel}` : periodLabel;
+  const value = formatQuotaValue(used, limit, "USD");
+  const key = `${label}|${value}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  const percent = Math.round((used / limit) * 100);
+  const resetIn = resetAt ? formatEzaiclubApiDate(resetAt) : null;
+  metrics.push(usageMetric(`ezaiclub_${periodLabel}_${metrics.length + 1}`, label, percent, value, resetIn));
+}
+
+/** Parse /api/v1/subscriptions/active JSON into text + usage metrics. */
+export function parseEzaiclubSubscriptionsApi(payload) {
+  const list = Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload)
+      ? payload
+      : [];
+  const metrics = [];
+  const seen = new Set();
+  let subscribed = false;
+
+  for (const sub of list) {
+    if (!sub || typeof sub !== "object") continue;
+    const planName = String(sub.group?.name || sub.plan_name || sub.planName || "").trim();
+    const status = String(sub.status || "").trim();
+    if (status === "active" || status === "Active") subscribed = true;
+
+    if (planName) {
+      const key = `当前套餐|${planName}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        metrics.push(textMetric(`ezaiclub_plan_${metrics.length + 1}`, "当前套餐", planName));
+      }
+    }
+    if (status) {
+      const key = `订阅状态|${status}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        metrics.push(textMetric(`ezaiclub_status_${metrics.length + 1}`, "订阅状态", status));
+      }
+    }
+    if (sub.expires_at) {
+      const expires = formatEzaiclubApiDate(sub.expires_at);
+      const key = `到期时间|${expires}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        metrics.push(textMetric(`ezaiclub_expires_${metrics.length + 1}`, "到期时间", expires));
+      }
+    }
+
+    const group = sub.group || {};
+    pushEzaiclubPeriodUsage(
+      metrics,
+      seen,
+      planName,
+      "每日",
+      sub.daily_usage_usd,
+      group.daily_limit_usd,
+      sub.daily_window_start
+    );
+    pushEzaiclubPeriodUsage(
+      metrics,
+      seen,
+      planName,
+      "每周",
+      sub.weekly_usage_usd,
+      group.weekly_limit_usd,
+      sub.expires_at || sub.weekly_window_start
+    );
+    pushEzaiclubPeriodUsage(
+      metrics,
+      seen,
+      planName,
+      "每月",
+      sub.monthly_usage_usd,
+      group.monthly_limit_usd,
+      sub.monthly_window_start
+    );
+  }
+
+  return { metrics, subscribed: subscribed || metrics.some((item) => item.label === "当前套餐") };
+}
+
+export function ezaiclubApiSnapshot(config, authPayload, subscriptionPayload) {
+  const balances = parseEzaiclubAuthMe(authPayload);
+  const { metrics: subscriptionMetrics, subscribed } = parseEzaiclubSubscriptionsApi(subscriptionPayload);
+  return ezaiclubSnapshot(config, config.targetUrl, balances, subscriptionMetrics, {
+    subscribed,
+    source: "api"
+  });
 }

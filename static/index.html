@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provider Usage Hub</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header>
+    <h1>Provider Usage Hub</h1>
+    <div class="toolbar-wrap">
+      <div class="toolbar">
+        <button id="sync-auth">同步登录态</button>
+        <button id="refresh-all">刷新解析</button>
+        <button id="open-all">打开全部</button>
+      </div>
+      <div id="refresh-message" class="refresh-message" aria-live="polite"></div>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="status-header">状态</div>
+      <div id="provider-list"></div>
+    </aside>
+    <section class="launchers" id="launchers"></section>
+  </main>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

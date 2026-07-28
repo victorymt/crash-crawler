@@ -8,6 +8,7 @@ from providers import (
     ProviderConfig,
     ProviderManager,
     SiliconFlowProvider,
+    is_api_provider,
     parse_deepseek_balance,
     parse_ezaiclub_balance_tokens,
     parse_ezaiclub_subscription_tokens,
@@ -15,7 +16,9 @@ from providers import (
     parse_percent,
     parse_siliconflow_balance_tokens,
     parse_siliconflow_metric_tokens,
+    profile_fingerprint,
     sync_browseros_profile,
+    wait_for_page_ready,
 )
 
 
@@ -236,21 +239,161 @@ class ProviderParserTests(unittest.TestCase):
             source.mkdir()
             (source / "Cookies").write_text("cookie-db", encoding="utf-8")
             (source / "SingletonLock").write_text("source-lock", encoding="utf-8")
+            (source / "Cache" / "data").parent.mkdir()
+            (source / "Cache" / "data").write_text("heavy", encoding="utf-8")
             target.mkdir()
             (target / "SingletonSocket").write_text("target-lock", encoding="utf-8")
 
             result = sync_browseros_profile(source, target)
 
             self.assertTrue(result["ok"])
+            self.assertFalse(result.get("skipped"))
             self.assertEqual((target / "Cookies").read_text(encoding="utf-8"), "cookie-db")
             self.assertFalse((target / "SingletonLock").exists())
             self.assertFalse((target / "SingletonSocket").exists())
+            self.assertFalse((target / "Cache").exists())
+
+    def test_sync_browseros_profile_skips_unchanged_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            (source / "Cookies").write_text("cookie-db", encoding="utf-8")
+
+            first = sync_browseros_profile(source, target)
+            second = sync_browseros_profile(source, target)
+
+            self.assertTrue(first["ok"])
+            self.assertFalse(first.get("skipped"))
+            self.assertTrue(second["ok"])
+            self.assertTrue(second.get("skipped"))
+            self.assertEqual(profile_fingerprint(source)["source"], str(source.resolve()))
 
     def test_sync_browseros_profile_rejects_missing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with self.assertRaises(Exception):
                 sync_browseros_profile(root / "missing", root / "target")
+
+    def test_is_api_provider(self):
+        api = ProviderConfig(
+            id="deepseek",
+            name="DeepSeek",
+            type="deepseek",
+            target_url="https://platform.deepseek.com/usage",
+            mode="api",
+        )
+        browser = ProviderConfig(
+            id="ezaiclub",
+            name="EZAICLUB",
+            type="ezaiclub",
+            target_url="https://www.ezaiclub.com/dashboard",
+            mode="browser",
+        )
+        self.assertTrue(is_api_provider(api))
+        self.assertFalse(is_api_provider(browser))
+
+    def test_wait_for_page_ready_returns_when_pattern_matches(self):
+        class FakePage:
+            def __init__(self):
+                self.calls = 0
+
+            def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+            def inner_text(self, _selector):
+                self.calls += 1
+                if self.calls < 2:
+                    return "loading..."
+                return "账户余额 ¥ 12.00"
+
+        text = wait_for_page_ready(
+            FakePage(),
+            ready_pattern=__import__("re").compile(r"账户余额"),
+            timeout_ms=2000,
+            min_wait_ms=0,
+            poll_ms=1,
+        )
+        self.assertIn("账户余额", text)
+
+    def test_refresh_all_reuses_browser_session_and_runs_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = Path(tmp) / "cache.json"
+            configs = [
+                ProviderConfig(
+                    id="deepseek",
+                    name="DeepSeek",
+                    type="deepseek",
+                    target_url="https://platform.deepseek.com/usage",
+                    mode="api",
+                ),
+                ProviderConfig(
+                    id="ezaiclub",
+                    name="EZAICLUB",
+                    type="ezaiclub",
+                    target_url="https://www.ezaiclub.com/dashboard",
+                    mode="browser",
+                    profile_dir=str(Path(tmp) / "profile"),
+                ),
+                ProviderConfig(
+                    id="siliconflow",
+                    name="SiliconFlow",
+                    type="siliconflow",
+                    target_url="https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
+                    mode="browser",
+                    profile_dir=str(Path(tmp) / "profile"),
+                ),
+            ]
+            manager = ProviderManager(configs=configs, cache_file=cache_file)
+            seen_browsers = []
+
+            def fake_refresh(provider_id, browser=None):
+                if provider_id != "deepseek":
+                    seen_browsers.append(browser)
+                snapshot = {
+                    "id": provider_id,
+                    "name": provider_id,
+                    "type": provider_id,
+                    "status": "ok",
+                    "metrics": [],
+                    "balances": [],
+                    "usage": [],
+                    "error": None,
+                }
+                manager.cache.setdefault("providers", {})[provider_id] = snapshot
+                return snapshot
+
+            manager.refresh = fake_refresh  # type: ignore[method-assign]
+            sessions = []
+
+            class FakeSession:
+                def __init__(self, profile_dir):
+                    self.profile_dir = profile_dir
+                    sessions.append(self)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+            import providers as providers_mod
+
+            original = providers_mod.BrowserSession
+            providers_mod.BrowserSession = FakeSession
+            try:
+                results = manager.refresh_all()
+            finally:
+                providers_mod.BrowserSession = original
+
+            self.assertEqual([item["id"] for item in results], ["deepseek", "ezaiclub", "siliconflow"])
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(seen_browsers[0], seen_browsers[1])
+            self.assertIs(seen_browsers[0], sessions[0])
 
 
 if __name__ == "__main__":

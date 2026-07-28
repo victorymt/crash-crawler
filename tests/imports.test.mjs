@@ -83,6 +83,30 @@ test("options page uses a structured provider editor", async () => {
 test("manifest declares optional host permissions for user sources", async () => {
   const manifest = JSON.parse(await readFile(new URL("../extension/manifest.json", import.meta.url), "utf8"));
   assert.deepEqual(manifest.optional_host_permissions, ["https://*/*", "http://*/*"]);
+  assert.ok(manifest.icons["128"]);
+  assert.ok(manifest.action.default_icon["32"]);
+  assert.ok(manifest.permissions.includes("alarms"));
+  assert.equal(manifest.permissions.includes("tabs"), false);
+});
+
+test("options page exposes auto-refresh interval control", async () => {
+  const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
+  assert.match(html, /id="auto-refresh-minutes"/);
+  assert.match(html, /value="30"/);
+});
+
+test("badgeFromSnapshots prioritizes errors then recharge", async () => {
+  const { badgeFromSnapshots } = await import("../extension/src/shared/snapshots.js");
+  assert.equal(badgeFromSnapshots([]).text, "");
+  assert.equal(badgeFromSnapshots([
+    { status: "ok", recommendation: "ok" },
+    { status: "error", recommendation: "watch" },
+    { status: "ok", recommendation: "recharge" }
+  ]).text, "1");
+  assert.equal(badgeFromSnapshots([
+    { status: "ok", recommendation: "recharge" },
+    { status: "ok", recommendation: "recharge" }
+  ]).color, "#d97706");
 });
 
 test("popup quota summary preserves prefix and suffix currencies", async () => {

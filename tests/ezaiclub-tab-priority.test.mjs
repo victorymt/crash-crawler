@@ -39,7 +39,10 @@ test("EZAICLUB prefers the dashboard tab for balance collection", async () => {
       }
     },
     scripting: {
-      async executeScript({ target }) {
+      async executeScript({ target, args }) {
+        if (Array.isArray(args) && args[0] === "auth_token") {
+          return [{ result: "" }];
+        }
         const url = tabById.get(target.tabId);
         return [{
           result: {

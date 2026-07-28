@@ -13,11 +13,27 @@
       <button id="save-global" class="primary">保存全局设置</button>
     </header>
     <section>
+      <h2>后台刷新</h2>
+      <label>
+        自动刷新间隔
+        <select id="auto-refresh-minutes">
+          <option value="0">关闭</option>
+          <option value="15">每 15 分钟</option>
+          <option value="30" selected>每 30 分钟</option>
+          <option value="60">每 1 小时</option>
+          <option value="120">每 2 小时</option>
+          <option value="360">每 6 小时</option>
+        </select>
+      </label>
+      <p id="auto-refresh-meta" class="empty-state">默认每 30 分钟在后台刷新已启用的 provider，并更新工具栏角标。</p>
+    </section>
+    <section>
       <h2>DeepSeek</h2>
       <label>
         API Key
         <input id="deepseek-key" type="password" autocomplete="off" placeholder="留空则保持当前密钥">
       </label>
+      <button id="clear-deepseek-key" type="button">清除已保存密钥</button>
     </section>
     <section>
       <div class="section-head">
@@ -69,7 +85,9 @@
           <div id="secondary-pages"></div>
         </div>
 
-        <div class="editor-block">
+        <p id="builtin-editor-note" class="empty-state hidden">内置来源使用固定解析器，可修改名称、主页 URL 和附加页面（例如 OpenCode workspace）。</p>
+
+        <div id="metric-rules-block" class="editor-block">
           <div class="block-head">
             <h3>指标规则</h3>
             <div class="section-actions">
@@ -81,7 +99,7 @@
           <div id="metric-rules"></div>
         </div>
 
-        <details class="advanced-block">
+        <details id="advanced-block" class="advanced-block">
           <summary>高级设置</summary>
           <div class="form-grid advanced-fields">
             <label>

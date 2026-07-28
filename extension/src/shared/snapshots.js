@@ -99,3 +99,48 @@ export function errorSnapshot(config, previous, error) {
     error: error?.message || String(error)
   };
 }
+
+/** Derive toolbar badge from the latest snapshots. */
+export function badgeFromSnapshots(snapshots) {
+  const list = Array.isArray(snapshots)
+    ? snapshots.filter(Boolean)
+    : Object.values(snapshots || {}).filter(Boolean);
+  let errors = 0;
+  let recharge = 0;
+  let watch = 0;
+  for (const snapshot of list) {
+    if (snapshot.status === "error" || snapshot.status === "stale" || snapshot.status === "unconfigured") {
+      errors += 1;
+    } else if (snapshot.recommendation === "recharge") {
+      recharge += 1;
+    } else if (snapshot.recommendation === "watch") {
+      watch += 1;
+    }
+  }
+  if (errors) {
+    return {
+      text: String(Math.min(errors, 99)),
+      color: "#c2410c",
+      title: `Provider Usage Hub · ${errors} 个异常`
+    };
+  }
+  if (recharge) {
+    return {
+      text: String(Math.min(recharge, 99)),
+      color: "#d97706",
+      title: `Provider Usage Hub · ${recharge} 个建议充值`
+    };
+  }
+  if (watch) {
+    return {
+      text: String(Math.min(watch, 99)),
+      color: "#ca8a04",
+      title: `Provider Usage Hub · ${watch} 个需要关注`
+    };
+  }
+  return {
+    text: "",
+    color: "#16803c",
+    title: "Provider Usage Hub"
+  };
+}

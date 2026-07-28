@@ -108,7 +108,7 @@ function render() {
       ${usage.length ? `<div class="metrics">${usage.map(metricHtml).join("")}</div>` : '<div class="empty">暂无用量或订阅数据。</div>'}
       ${snapshot.error ? `<div class="error">${escapeHtml(snapshot.error)}</div>` : ""}
       <div class="actions">
-        ${links.map((link) => `<a class="button primary" href="${escapeHtml(link.url)}" target="_blank">${escapeHtml(link.label)}</a>`).join("")}
+        ${links.map((link) => `<a class="button primary" href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)}</a>`).join("")}
         <button data-refresh-provider="${escapeHtml(config.id)}">刷新</button>
         <button data-copy="${escapeHtml(config.id)}">复制 URL</button>
       </div>
@@ -130,11 +130,52 @@ function render() {
   setControlsDisabled(activeOperation);
 }
 
+function autoRefreshHint(settings) {
+  const minutes = Number(settings?.autoRefreshMinutes || 0);
+  if (!minutes) return "";
+  if (settings?.lastAutoRefreshError) {
+    return `后台刷新失败：${settings.lastAutoRefreshError}`;
+  }
+  if (settings?.lastAutoRefreshAt) {
+    return `后台每 ${minutes} 分钟刷新 · 上次 ${new Date(settings.lastAutoRefreshAt).toLocaleTimeString()}`;
+  }
+  return `后台每 ${minutes} 分钟自动刷新`;
+}
+
 async function loadStatus() {
   const data = await sendMessage({ type: "providers:list" });
   configs = data.configs;
   snapshots = data.providers;
   render();
+  const hint = autoRefreshHint(data.settings);
+  if (hint) setMessage(hint);
+}
+
+if (chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local" || !changes.providerSnapshots || activeOperation || !configs.length) return;
+    const next = changes.providerSnapshots.newValue || {};
+    let changed = false;
+    const merged = configs.map((config) => {
+      const snapshot = next[config.id];
+      if (!snapshot) return snapshots.find((item) => item.id === config.id);
+      const previous = snapshots.find((item) => item.id === config.id);
+      if (
+        !previous
+        || previous.checkedAt !== snapshot.checkedAt
+        || previous.updatedAt !== snapshot.updatedAt
+        || previous.status !== snapshot.status
+        || previous.error !== snapshot.error
+      ) {
+        changed = true;
+      }
+      return snapshot;
+    }).filter(Boolean);
+    if (!changed) return;
+    snapshots = merged;
+    render();
+    setMessage(`快照已更新：${new Date().toLocaleTimeString()}`);
+  });
 }
 
 async function refreshProvider(providerId) {
@@ -169,12 +210,15 @@ async function refreshAll() {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
+  setMessage("正在并行刷新所有 provider...");
   try {
-    for (let index = 0; index < configs.length; index += 1) {
-      setMessage(`正在刷新 ${configs[index].name} (${index + 1}/${configs.length})`);
-      await refreshProviderInternal(configs[index].id);
-    }
+    const data = await sendMessage({ type: "providers:refreshAll" });
+    snapshots = data.providers || [];
+    render();
     setMessage(`刷新完成：${new Date().toLocaleTimeString()}`);
+  } catch (error) {
+    await loadStatus();
+    setMessage(error.message || "刷新失败", true);
   } finally {
     activeOperation = false;
     setControlsDisabled(false);

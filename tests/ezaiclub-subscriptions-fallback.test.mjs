@@ -5,6 +5,7 @@ test("EZAICLUB collects subscriptions from the rendered subscriptions page", asy
   const originalChrome = globalThis.chrome;
   const originalFetch = globalThis.fetch;
   const createdUrls = [];
+  let createCount = 0;
   let currentUrl = "";
 
   globalThis.fetch = async (url) => ({
@@ -22,9 +23,15 @@ test("EZAICLUB collects subscriptions from the rendered subscriptions page", asy
         return [];
       },
       async create({ url }) {
+        createCount += 1;
         currentUrl = url;
         createdUrls.push(url);
-        return { id: createdUrls.length, status: "complete" };
+        return { id: 1, status: "complete" };
+      },
+      async update(_tabId, { url }) {
+        currentUrl = url;
+        createdUrls.push(`update:${url}`);
+        return { id: 1, status: "complete" };
       },
       async get(tabId) {
         return { id: tabId, status: "complete" };
@@ -36,7 +43,11 @@ test("EZAICLUB collects subscriptions from the rendered subscriptions page", asy
       }
     },
     scripting: {
-      async executeScript() {
+      async executeScript({ args }) {
+        // API path probes localStorage first; force fallback to DOM collectors.
+        if (Array.isArray(args) && args[0] === "auth_token") {
+          return [{ result: "" }];
+        }
         const isSubscription = currentUrl.includes("/subscriptions");
         return [{
           result: {
@@ -64,7 +75,10 @@ test("EZAICLUB collects subscriptions from the rendered subscriptions page", asy
     mode: "page"
   });
 
-  assert.ok(createdUrls.includes("https://www.ezaiclub.com/subscriptions"));
+  // Token probe may open one short-lived tab before the page-session collectors.
+  assert.ok(createCount >= 1);
+  assert.equal(createdUrls[0], "https://www.ezaiclub.com/dashboard");
+  assert.ok(createdUrls.some((url) => url.includes("/subscriptions")));
   assert.equal(snapshot.status, "ok");
   assert.equal(snapshot.error, null);
   assert.equal(snapshot.balances[0].value, "88.60");

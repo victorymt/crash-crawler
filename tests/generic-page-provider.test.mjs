@@ -24,7 +24,12 @@ test("generic page provider collects configured balance and quota rules", async 
       async create({ url }) {
         currentUrl = url;
         createdUrls.push(url);
-        return { id: createdUrls.length, status: "complete" };
+        return { id: 1, status: "complete" };
+      },
+      async update(_tabId, { url }) {
+        currentUrl = url;
+        createdUrls.push(url);
+        return { id: 1, status: "complete" };
       },
       async get(tabId) {
         return { id: tabId, status: "complete" };

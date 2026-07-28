@@ -7,22 +7,26 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.cookiejar import Cookie, CookieJar
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 BROWSEROS_BIN = os.environ.get("BROWSEROS_BIN", "/usr/bin/browseros")
 DEFAULT_PROFILE_DIR = os.environ.get(
-    "BROWSEROS_PROFILE_DIR", "/home/cv/.browseros-crawler-profile"
+    "BROWSEROS_PROFILE_DIR", str(Path.home() / ".browseros-crawler-profile")
 )
 BROWSEROS_SOURCE_PROFILE_DIR = os.environ.get(
-    "BROWSEROS_SOURCE_PROFILE_DIR", "/home/cv/.config/browser-os"
+    "BROWSEROS_SOURCE_PROFILE_DIR", str(Path.home() / ".config" / "browser-os")
 )
 DEFAULT_OPENCODE_URL = (
     "https://opencode.ai/workspace/wrk_01KW9MTABWQ0DNJ014CV528WC2/go"
@@ -81,6 +85,44 @@ SILICONFLOW_LOGIN_HINTS = (
     "SiliconFlow Ambassador Program",
 )
 OPENCODE_USAGE_TYPES = ("滚动用量", "每周用量", "每月用量")
+
+DEFAULT_READY_PATTERN = re.compile(
+    r"余额|可用|剩余|赠金|充值|券|优惠券|代金券|账单|费用|消费|有效|到期|"
+    r"用量|额度|重置|订阅|套餐|滚动用量|每周用量|每月用量|"
+    r"balance|coupon|credit|amount|expense|bill|valid|expires|usage|quota|plan|subscription",
+    re.I,
+)
+OPENCODE_READY_PATTERN = re.compile(r"滚动用量|每周用量|每月用量|重置于|订阅|balance|Balance|余额", re.I)
+EZAICLUB_BALANCE_READY_PATTERN = re.compile(
+    r"账户余额|可用余额|余额|充值|balance|wallet|credit|[$¥￥]\s*\d|\d+(?:\.\d+)?\s*(?:USD|CNY|RMB|元)",
+    re.I,
+)
+EZAICLUB_SUBSCRIPTION_READY_PATTERN = re.compile(
+    r"当前套餐|套餐名称|订阅状态|订阅用量|到期时间|有效期|续费时间|已达到|"
+    r"Pro|Monthly|Plan|Subscription|expires|planName|weekly_usage|monthly_usage|"
+    r"[$¥￥]\s*\d+(?:\.\d+)?\s*/\s*[$¥￥]?\s*\d+",
+    re.I,
+)
+SILICONFLOW_READY_PATTERN = re.compile(
+    r"余额|可用|剩余|赠金|充值|券|优惠券|代金券|账单|费用|消费|有效|到期|"
+    r"balance|coupon|credit|amount|expense|bill|valid|expires",
+    re.I,
+)
+PROFILE_SYNC_IGNORE = (
+    "SingletonCookie",
+    "SingletonLock",
+    "SingletonSocket",
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "GrShaderCache",
+    "ShaderCache",
+    "Service Worker",
+    "blob_storage",
+    "Crashpad",
+    "*.log",
+)
+PROFILE_SYNC_MARKER = ".provider-sync-meta.json"
 
 
 class ProviderError(RuntimeError):
@@ -245,16 +287,11 @@ def build_browser(profile_dir: str):
         ) from exc
 
     profile_path = Path(profile_dir).expanduser()
-    if profile_path.resolve() == Path(DEFAULT_PROFILE_DIR).expanduser().resolve():
-        for name in ("SingletonCookie", "SingletonLock", "SingletonSocket"):
-            try:
-                (profile_path / name).unlink()
-            except FileNotFoundError:
-                pass
+    remove_profile_singletons(profile_path)
 
     pw = sync_playwright().start()
     context = pw.chromium.launch_persistent_context(
-        profile_dir,
+        str(profile_path),
         executable_path=BROWSEROS_BIN,
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
@@ -271,9 +308,32 @@ def remove_profile_singletons(profile_dir: Path) -> None:
             pass
 
 
+def profile_fingerprint(source: Path) -> dict[str, Any]:
+    """Cheap change detector for BrowserOS profile sync."""
+    candidates = [
+        source / "Cookies",
+        source / "Default" / "Cookies",
+        source / "Default" / "Network" / "Cookies",
+        source / "Local State",
+        source / "Default" / "Preferences",
+    ]
+    files = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        files.append({"path": str(path.relative_to(source)), "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+    if not files:
+        # Fall back to directory mtime when cookie files are not present.
+        stat = source.stat()
+        files.append({"path": ".", "mtime_ns": stat.st_mtime_ns, "size": 0})
+    return {"source": str(source.resolve()), "files": files}
+
+
 def sync_browseros_profile(
     source_dir: str | Path = BROWSEROS_SOURCE_PROFILE_DIR,
     target_dir: str | Path = DEFAULT_PROFILE_DIR,
+    force: bool = False,
 ) -> dict[str, Any]:
     source = Path(source_dir).expanduser()
     target = Path(target_dir).expanduser()
@@ -284,20 +344,141 @@ def sync_browseros_profile(
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.mkdir(parents=True, exist_ok=True)
+    fingerprint = profile_fingerprint(source)
+    marker = target / PROFILE_SYNC_MARKER
+    if not force and marker.is_file():
+        try:
+            previous = json.loads(marker.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = None
+        if previous and previous.get("fingerprint") == fingerprint:
+            remove_profile_singletons(target)
+            return {
+                "ok": True,
+                "skipped": True,
+                "source": str(source),
+                "target": str(target),
+                "synced_at": previous.get("synced_at") or now_iso(),
+            }
+
     remove_profile_singletons(target)
     shutil.copytree(
         source,
         target,
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("SingletonCookie", "SingletonLock", "SingletonSocket"),
+        ignore=shutil.ignore_patterns(*PROFILE_SYNC_IGNORE),
     )
     remove_profile_singletons(target)
+    synced_at = now_iso()
+    marker.write_text(
+        json.dumps({"fingerprint": fingerprint, "synced_at": synced_at}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return {
         "ok": True,
+        "skipped": False,
         "source": str(source),
         "target": str(target),
-        "synced_at": now_iso(),
+        "synced_at": synced_at,
     }
+
+
+def wait_for_page_ready(
+    page,
+    ready_pattern: re.Pattern[str] | None = DEFAULT_READY_PATTERN,
+    timeout_ms: int = 18000,
+    min_wait_ms: int = 1200,
+    stable_samples: int = 3,
+    poll_ms: int = 400,
+) -> str:
+    """Wait until page text looks ready or stabilizes, instead of fixed sleeps."""
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000.0
+    last_text = ""
+    stable_count = 0
+    body_text = ""
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 60000))
+    except Exception:
+        pass
+
+    while time.monotonic() < deadline:
+        try:
+            body_text = page.inner_text("body")
+        except Exception:
+            page.wait_for_timeout(poll_ms)
+            continue
+
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        waited_enough = elapsed_ms >= min_wait_ms
+        ready = bool(ready_pattern.search(body_text)) if ready_pattern is not None else True
+
+        if body_text and body_text == last_text:
+            stable_count += 1
+        else:
+            stable_count = 0
+            last_text = body_text
+
+        if waited_enough and ready:
+            return body_text
+        if waited_enough and stable_count >= stable_samples and body_text.strip():
+            return body_text
+        page.wait_for_timeout(poll_ms)
+
+    try:
+        return page.inner_text("body")
+    except Exception:
+        return body_text
+
+
+class BrowserSession:
+    """Reusable Playwright persistent context for one profile directory."""
+
+    def __init__(self, profile_dir: str) -> None:
+        self.profile_dir = profile_dir
+        self._pw = None
+        self._context = None
+
+    def start(self) -> "BrowserSession":
+        if self._context is None:
+            self._pw, self._context = build_browser(self.profile_dir)
+        return self
+
+    def close(self) -> None:
+        if self._context is not None:
+            try:
+                self._context.close()
+            finally:
+                self._context = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            finally:
+                self._pw = None
+
+    def __enter__(self) -> "BrowserSession":
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    @property
+    def context(self):
+        if self._context is None:
+            self.start()
+        return self._context
+
+    def page(self):
+        context = self.context
+        return context.pages[0] if context.pages else context.new_page()
+
+    def cookies(self, urls: str | list[str] | None = None) -> list[dict[str, Any]]:
+        if urls is None:
+            return self.context.cookies()
+        if isinstance(urls, str):
+            return self.context.cookies(urls)
+        return self.context.cookies(urls)
 
 
 def html_tokens(html: str) -> list[str]:
@@ -1427,25 +1608,41 @@ class Provider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
 
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+    def uses_browser(self) -> bool:
+        return self.config.mode != "api" and self.config.type != "deepseek"
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
-    def explore(self) -> Path:
-        pw, context = build_browser(self.config.profile_dir)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
+    def explore(self, browser: BrowserSession | None = None) -> Path:
+        with self.browser_page(browser) as page:
             page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1000)
+            wait_for_page_ready(page, DEFAULT_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             return dump_tokens(self.config, page_tokens(page), page.title(), page.url)
+
+    @contextmanager
+    def browser_page(self, browser: BrowserSession | None = None) -> Iterator[Any]:
+        if browser is not None:
+            yield browser.page()
+            return
+        session = BrowserSession(self.config.profile_dir)
+        session.start()
+        try:
+            yield session.page()
         finally:
-            context.close()
-            pw.stop()
+            session.close()
 
 
 class BrowserJsonProvider(Provider):
     login_hints: tuple[str, ...] = ()
     login_error = "BrowserOS profile is not logged in"
     default_host = ""
+    ready_pattern: re.Pattern[str] = DEFAULT_READY_PATTERN
 
     def capture_json_responses(
         self,
@@ -1473,13 +1670,19 @@ class BrowserJsonProvider(Provider):
         url: str,
         host: str | None = None,
         timeout: int = 60000,
-        settle_ms: int = 3000,
+        ready_pattern: re.Pattern[str] | None = None,
+        min_wait_ms: int = 1500,
+        timeout_ms: int = 18000,
     ) -> tuple[str, list[str], list[dict[str, Any]]]:
         responses: list[dict[str, Any]] = []
         self.capture_json_responses(page, responses, host)
-        page.goto(url, wait_until="networkidle", timeout=timeout)
-        page.wait_for_timeout(settle_ms)
-        body_text = page.inner_text("body")
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        body_text = wait_for_page_ready(
+            page,
+            ready_pattern=ready_pattern or self.ready_pattern,
+            timeout_ms=timeout_ms,
+            min_wait_ms=min_wait_ms,
+        )
         login_probe = page.title() + "\n" + body_text
         if is_login_html(page.url, login_probe, self.login_hints):
             raise NotLoggedInError(self.login_error)
@@ -1487,19 +1690,26 @@ class BrowserJsonProvider(Provider):
         tokens.extend(extract_json_payloads(responses))
         return page.url, tokens, responses
 
-    def with_browser_page(self):
-        pw, context = build_browser(self.config.profile_dir)
-        page = context.pages[0] if context.pages else context.new_page()
-        return pw, context, page
-
 
 class OpenCodeProvider(Provider):
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+    def uses_browser(self) -> bool:
+        return True
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
         if not self.config.cookie_cache:
             raise MissingCookieError("opencode cookie_cache is not configured")
 
         try:
-            cookies = self.refresh_cookies() if refresh_auth else load_cookie_cache(self.config.cookie_cache)
+            cookies = (
+                self.refresh_cookies(browser=browser)
+                if refresh_auth
+                else load_cookie_cache(self.config.cookie_cache)
+            )
             html, url = request_html(self.config.target_url, cookies, OPENCODE_LOGIN_HINTS)
             legacy = parse_opencode_legacy(html_tokens(html), url)
             legacy["balances"] = self.fetch_balances(cookies)
@@ -1508,7 +1718,7 @@ class OpenCodeProvider(Provider):
             if refresh_auth:
                 raise
             try:
-                cookies = self.refresh_cookies()
+                cookies = self.refresh_cookies(browser=browser)
                 html, url = request_html(self.config.target_url, cookies, OPENCODE_LOGIN_HINTS)
                 legacy = parse_opencode_legacy(html_tokens(html), url)
                 legacy["balances"] = self.fetch_balances(cookies)
@@ -1516,35 +1726,36 @@ class OpenCodeProvider(Provider):
             except Exception:
                 if not browser_fallback:
                     raise
-                return self.browser_fetch()
+                return self.browser_fetch(browser=browser)
         except Exception:
             if not browser_fallback:
                 raise
-            return self.browser_fetch()
+            return self.browser_fetch(browser=browser)
 
-    def refresh_cookies(self) -> list[dict[str, Any]]:
+    def refresh_cookies(self, browser: BrowserSession | None = None) -> list[dict[str, Any]]:
         host = urlparse(self.config.target_url).hostname or "opencode.ai"
-        pw, context = build_browser(self.config.profile_dir)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
+        with self.browser_page(browser) as page:
             page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1000)
+            wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             html = page.content()
             if is_login_html(page.url, html, OPENCODE_LOGIN_HINTS):
                 raise NotLoggedInError("BrowserOS profile is not logged in to opencode.ai")
-            return save_cookie_cache(self.config.cookie_cache or "", context.cookies(self.config.target_url), host)
-        finally:
-            context.close()
-            pw.stop()
+            context = browser.context if browser is not None else page.context
+            return save_cookie_cache(
+                self.config.cookie_cache or "",
+                context.cookies(self.config.target_url),
+                host,
+            )
 
     def fetch_balances(self, cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
         billing_url = derive_opencode_billing_url(self.config.target_url)
+        html = ""
         try:
             html, _ = request_html(billing_url, cookies, OPENCODE_LOGIN_HINTS)
             balances = parse_opencode_balance_tokens(html_tokens(html))
         except Exception:
             return []
-        if not balances:
+        if not balances and html:
             dump_tokens(
                 self.config,
                 html_tokens(html),
@@ -1553,27 +1764,22 @@ class OpenCodeProvider(Provider):
             )
         return balances
 
-    def browser_fetch(self) -> dict[str, Any]:
-        pw, context = build_browser(self.config.profile_dir)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
+    def browser_fetch(self, browser: BrowserSession | None = None) -> dict[str, Any]:
+        with self.browser_page(browser) as page:
             page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1000)
+            wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             html = page.content()
             if is_login_html(page.url, html, OPENCODE_LOGIN_HINTS):
                 raise NotLoggedInError("BrowserOS profile is not logged in to opencode.ai")
             legacy = parse_opencode_legacy(page_tokens(page), page.url)
             legacy["balances"] = self.browser_billing_balances(page)
             return opencode_snapshot(self.config, legacy)
-        finally:
-            context.close()
-            pw.stop()
 
     def browser_billing_balances(self, page) -> list[dict[str, Any]]:
         billing_url = derive_opencode_billing_url(self.config.target_url)
         try:
             page.goto(billing_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1000)
+            wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=10000)
             tokens = page_tokens(page)
             balances = parse_opencode_balance_tokens(tokens)
             if not balances:
@@ -1584,7 +1790,15 @@ class OpenCodeProvider(Provider):
 
 
 class DeepSeekProvider(Provider):
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
+    def uses_browser(self) -> bool:
+        return False
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
         api_key_env = self.config.api_key_env or "DEEPSEEK_API_KEY"
         api_key = os.environ.get(api_key_env)
         if not api_key:
@@ -1614,11 +1828,21 @@ class EZAICLUBProvider(BrowserJsonProvider):
     login_hints = EZAICLUB_LOGIN_HINTS
     login_error = "BrowserOS profile is not logged in to EZAICLUB"
     default_host = "www.ezaiclub.com"
+    ready_pattern = EZAICLUB_BALANCE_READY_PATTERN
 
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
-        pw, context, page = self.with_browser_page()
-        try:
-            dashboard_url, dashboard_tokens, _ = self.goto_with_json(page, self.config.target_url)
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        with self.browser_page(browser) as page:
+            dashboard_url, dashboard_tokens, _ = self.goto_with_json(
+                page,
+                self.config.target_url,
+                ready_pattern=EZAICLUB_BALANCE_READY_PATTERN,
+                min_wait_ms=2000,
+            )
             balances = parse_ezaiclub_balance_tokens(dashboard_tokens)
             if not balances:
                 dump_tokens(
@@ -1636,9 +1860,6 @@ class EZAICLUBProvider(BrowserJsonProvider):
                 balances=balances,
                 subscription_metrics=subscription_metrics,
             )
-        finally:
-            context.close()
-            pw.stop()
 
     def fetch_subscription_metrics(self, page) -> list[dict[str, Any]]:
         subscription_url = next(
@@ -1650,7 +1871,13 @@ class EZAICLUBProvider(BrowserJsonProvider):
             DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL,
         )
         try:
-            page_url, tokens, _ = self.goto_with_json(page, subscription_url)
+            page_url, tokens, _ = self.goto_with_json(
+                page,
+                subscription_url,
+                ready_pattern=EZAICLUB_SUBSCRIPTION_READY_PATTERN,
+                min_wait_ms=2500,
+                timeout_ms=24000,
+            )
             metrics = parse_ezaiclub_subscription_tokens(tokens)
             if not metrics:
                 dump_tokens(
@@ -1671,11 +1898,21 @@ class SiliconFlowProvider(BrowserJsonProvider):
     login_hints = SILICONFLOW_LOGIN_HINTS
     login_error = "BrowserOS profile is not logged in to SiliconFlow"
     default_host = "cloud.siliconflow.cn"
+    ready_pattern = SILICONFLOW_READY_PATTERN
 
-    def fetch(self, refresh_auth: bool = False, browser_fallback: bool = True) -> dict[str, Any]:
-        pw, context, page = self.with_browser_page()
-        try:
-            page_url, tokens, _ = self.goto_with_json(page, self.config.target_url)
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        with self.browser_page(browser) as page:
+            page_url, tokens, _ = self.goto_with_json(
+                page,
+                self.config.target_url,
+                ready_pattern=SILICONFLOW_READY_PATTERN,
+                min_wait_ms=1500,
+            )
             balances = parse_siliconflow_balance_tokens(tokens)
             metrics = parse_siliconflow_metric_tokens(tokens)
             if not balances and not metrics:
@@ -1687,9 +1924,6 @@ class SiliconFlowProvider(BrowserJsonProvider):
                     suffix="coupon",
                 )
             return siliconflow_snapshot(self.config, page_url, balances, metrics)
-        finally:
-            context.close()
-            pw.stop()
 
 
 PROVIDER_TYPES: dict[str, type[Provider]] = {
@@ -1698,6 +1932,10 @@ PROVIDER_TYPES: dict[str, type[Provider]] = {
     "ezaiclub": EZAICLUBProvider,
     "siliconflow": SiliconFlowProvider,
 }
+
+
+def is_api_provider(config: ProviderConfig) -> bool:
+    return config.mode == "api" or config.type == "deepseek"
 
 
 class ProviderManager:
@@ -1709,6 +1947,7 @@ class ProviderManager:
         self.configs = configs if configs is not None else load_config()
         self.cache_file = cache_file
         self.cache: dict[str, Any] = self.load_cache()
+        self._lock = threading.RLock()
 
     def enabled_configs(self) -> list[ProviderConfig]:
         return [config for config in self.configs if config.enabled]
@@ -1734,27 +1973,34 @@ class ProviderManager:
         return data
 
     def save_cache(self) -> None:
-        self.cache_file.write_text(
-            json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with self._lock:
+            self.cache_file.write_text(
+                json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     def list_snapshots(self) -> list[dict[str, Any]]:
-        providers = self.cache.setdefault("providers", {})
-        rows = []
-        for config in self.enabled_configs():
-            cached = providers.get(config.id)
-            if cached:
-                rows.append(cached)
-            else:
-                rows.append(blank_snapshot(config))
-        return rows
+        with self._lock:
+            providers = self.cache.setdefault("providers", {})
+            rows = []
+            for config in self.enabled_configs():
+                cached = providers.get(config.id)
+                if cached:
+                    rows.append(cached)
+                else:
+                    rows.append(blank_snapshot(config))
+            return rows
 
-    def refresh(self, provider_id: str) -> dict[str, Any]:
+    def refresh(
+        self,
+        provider_id: str,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
         provider = self.get_provider(provider_id)
-        providers = self.cache.setdefault("providers", {})
-        previous = providers.get(provider_id)
+        with self._lock:
+            providers = self.cache.setdefault("providers", {})
+            previous = providers.get(provider_id)
         try:
-            snapshot = provider.fetch()
+            snapshot = provider.fetch(browser=browser)
         except Exception as exc:
             config = provider.config
             stale_metrics = previous.get("metrics", []) if previous else []
@@ -1776,12 +2022,34 @@ class ProviderManager:
                 "recommendation": previous.get("recommendation", "watch") if previous else "watch",
                 "error": str(exc),
             }
-        providers[provider_id] = snapshot
-        self.save_cache()
+        with self._lock:
+            self.cache.setdefault("providers", {})[provider_id] = snapshot
+            self.save_cache()
         return snapshot
 
     def refresh_all(self) -> list[dict[str, Any]]:
-        return [self.refresh(config.id) for config in self.enabled_configs()]
+        """Refresh API providers in parallel; reuse one browser per profile for the rest."""
+        enabled = self.enabled_configs()
+        results: dict[str, dict[str, Any]] = {}
+        api_ids = [config.id for config in enabled if is_api_provider(config)]
+        browser_groups: dict[str, list[str]] = {}
+        for config in enabled:
+            if is_api_provider(config):
+                continue
+            browser_groups.setdefault(config.profile_dir, []).append(config.id)
+
+        max_workers = max(1, len(api_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self.refresh, provider_id): provider_id for provider_id in api_ids}
+            for profile_dir, provider_ids in browser_groups.items():
+                with BrowserSession(profile_dir) as session:
+                    for provider_id in provider_ids:
+                        results[provider_id] = self.refresh(provider_id, browser=session)
+            for future in as_completed(futures):
+                provider_id = futures[future]
+                results[provider_id] = future.result()
+
+        return [results[config.id] for config in enabled]
 
     def explore(self, provider_id: str) -> Path:
         return self.get_provider(provider_id).explore()

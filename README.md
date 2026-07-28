@@ -40,7 +40,7 @@ http://127.0.0.1:19765
 页面包含：
 
 - “同步登录态”：把 BrowserOS 登录态同步到后端抓取 profile。
-- “刷新解析”：按 provider 顺序刷新所有数据。
+- “刷新解析”：一次并行刷新（API 并行，同 profile 的浏览器抓取复用同一 BrowserOS 实例）。
 - Provider 卡片上的“刷新”：只刷新当前 provider。
 - “打开全部”：一次打开所有 provider 主页面。
 - 官方页面按钮和“复制 URL”按钮。
@@ -123,7 +123,15 @@ uv run python crawler.py --provider ezaiclub --explore
 - 每个指标使用 CSS 选择器取值，可以选择元素属性和匹配序号；额度支持从同一元素读取 `$50.15 / $50.00`，也支持分别选择已用值和总额。
 - 点击“测试”直接预览余额、额度、文本和逐规则诊断，测试不会写入正式快照。
 - 保存或测试新域名时，浏览器会申请对应站点的访问权限。
-- 内置 provider 只读，可以复制成自定义来源；“导入书源”和“导出”用于分享 JSON 配置。批量导入会整体校验，不会只导入其中一部分。
+- 修改或删除自定义来源后，插件会回收不再使用的可选站点权限。
+- 内置 provider 可改名称、主页 URL 和附加页面（例如 OpenCode workspace），解析类型不可改；也可复制成自定义来源。“导入书源”和“导出”用于分享 JSON 配置。批量导入会整体校验，不会只导入其中一部分。
+- 刷新后工具栏角标会提示异常/建议充值数量；popup 打开时会跟随 storage 中的最新快照更新。
+- 设置页可配置后台自动刷新（默认每 30 分钟，可关）。依赖 `chrome.alarms`，浏览器启动后会继续按间隔刷新已启用 provider。
+- EZAICLUB 优先走内部 API（`localStorage.auth_token` + `/api/v1/auth/me` 与 `/api/v1/subscriptions/active`），失败时再回退到页面 DOM 解析。
+- SiliconFlow 优先走内部 API（页面 `SF_SUBJECT_ID` + `x-subject-id` 请求 `/walletd-server/.../wallets`），失败时再回退到页面 DOM 解析。
+- 页面解析不会枚举站点的 `localStorage` 或 `sessionStorage`；内置 API 只读取明确需要的登录字段。
+- 导入来源会限制页面数、规则数、正则复杂度和最长等待时间，异常配置会在保存前被拒绝。
+- DeepSeek 设置支持显式清除已保存的 API Key。
 
 设置页不要求用户直接编辑 JSON。导出的 v2 书源格式示例：
 
@@ -178,6 +186,12 @@ uv run python crawler.py --provider ezaiclub --explore
 ```
 
 旧版 v1 正则书源仍可导入和运行。CSS 选择器取得的文本需要进一步裁剪时，可以在指标的“正则提取”中填写正则和捕获组。
+
+插件刷新策略：
+
+- “刷新全部”在后台并行执行（默认并发 4，API 优先）。
+- 多页 provider（如 EZAICLUB 仪表盘 + 订阅页、自定义书源多 URL）复用同一个后台标签页导航，避免每页都新建标签。
+- 渲染等待依赖 ready 文本/选择器与稳定采样，不再叠加大段固定 sleep。
 
 本地回归测试：
 

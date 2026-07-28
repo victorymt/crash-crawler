@@ -34,7 +34,11 @@ test("SiliconFlow falls back to a rendered tab when static HTML has no balance f
       }
     },
     scripting: {
-      async executeScript() {
+      async executeScript({ args }) {
+        // API path probes SF_SUBJECT_ID first; force DOM fallback in this test.
+        if (Array.isArray(args) && args[0] === "sf-subject-id") {
+          return [{ result: "" }];
+        }
         return [{
           result: {
             title: "SiliconFlow",

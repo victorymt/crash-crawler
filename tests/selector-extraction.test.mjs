@@ -54,7 +54,7 @@ test("selector extraction waits for complete rules and excludes page-wide data",
   assert.equal(result.text, "");
   assert.deepEqual(result.tokens, []);
   assert.deepEqual(result.jsonScripts, []);
-  assert.deepEqual(result.storageValues, []);
+  assert.equal(Object.hasOwn(result, "storageValues"), false);
   assert.deepEqual(result.selectorResults.quota.usedValues, ["12"]);
   assert.deepEqual(result.selectorResults.quota.limitValues, ["20"]);
   globalThis.chrome = originalChrome;
