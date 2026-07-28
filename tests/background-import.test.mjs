@@ -47,7 +47,6 @@ test("background supports provider source import export and test messages", asyn
   const store = {};
   let messageListener = null;
   let currentUrl = "";
-  const removedOrigins = [];
 
   globalThis.fetch = async (url) => ({
     ok: true,
@@ -83,12 +82,6 @@ test("background supports provider source import export and test messages", asyn
         async set(value) {
           Object.assign(store, value);
         }
-      }
-    },
-    permissions: {
-      async remove({ origins }) {
-        removedOrigins.push(...origins);
-        return true;
       }
     },
     tabs: {
@@ -152,7 +145,6 @@ test("background supports provider source import export and test messages", asyn
     provider: { ...provider, targetUrl: "https://other.test/dashboard" }
   });
   assert.equal(moved.ok, true);
-  assert.ok(removedOrigins.includes("https://example.test/*"));
   const savedBuiltin = await send({
     type: "config:saveProvider",
     provider: {

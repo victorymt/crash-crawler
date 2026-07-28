@@ -1,4 +1,4 @@
-import { normalizeProviderConfig, originsForConfig } from "../shared/config.js";
+import { normalizeProviderConfig } from "../shared/config.js";
 import { badgeFromSnapshots, blankSnapshot, errorSnapshot } from "../shared/snapshots.js";
 import {
   exportProviderConfig,
@@ -15,8 +15,8 @@ import {
   saveExtensionSettings,
   saveProviderConfig,
   saveProviderConfigs,
-  saveSnapshot,
-  saveSnapshots,
+  saveCurrentProviderSnapshot,
+  saveCurrentProviderSnapshots,
   setSecret
 } from "../shared/storage.js";
 import { collectProvider, isApiProvider } from "../providers/index.js";
@@ -28,6 +28,7 @@ export const AUTO_REFRESH_ALARM = "providers:autoRefresh";
 /** Prevent overlapping full refreshes (manual + alarm). */
 let refreshAllInFlight = null;
 const providerRefreshes = new Map();
+let configMutationChain = Promise.resolve();
 
 async function publicConfigs() {
   return (await getProviderConfigs()).filter((config) => config.enabled);
@@ -78,26 +79,14 @@ async function collectOneExclusive(config, previousSnapshot) {
   return refresh;
 }
 
-async function removeUnusedOptionalOrigins(previousConfigs, nextConfigs) {
-  if (!globalThis.chrome?.permissions?.remove) return;
-  const nextOrigins = new Set(nextConfigs.flatMap(originsForConfig));
-  const staleOrigins = [...new Set(previousConfigs.flatMap(originsForConfig))]
-    .filter((origin) => !nextOrigins.has(origin));
-  await Promise.all(staleOrigins.map(async (origin) => {
-    try {
-      await chrome.permissions.remove({ origins: [origin] });
-    } catch {
-      // Required manifest origins cannot be removed and are safe to retain.
-    }
-  }));
-}
-
 async function mutateConfigs(work) {
-  const previous = await getProviderConfigs();
-  const value = await work();
-  const next = await getProviderConfigs();
-  await removeUnusedOptionalOrigins(previous, next);
-  return value;
+  // Keep the whole logical mutation ordered, not just its storage write. Host
+  // permissions are intentionally retained: permission requests happen in an
+  // options-page user gesture, so asynchronously revoking a "stale" origin
+  // here can race with another options page granting it for a new config.
+  const run = configMutationChain.then(work);
+  configMutationChain = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 async function refreshProvider(providerId) {
@@ -106,7 +95,8 @@ async function refreshProvider(providerId) {
   if (!config) throw new Error(`unknown provider: ${providerId}`);
   const snapshots = await getSnapshots();
   const snapshot = await collectOneExclusive(config, snapshots[providerId]);
-  const saved = await saveSnapshot(snapshot);
+  const saved = await saveCurrentProviderSnapshot(snapshot);
+  if (!saved) throw new Error(`provider was deleted while refreshing: ${providerId}`);
   await syncBadgeFromStorage();
   return saved;
 }
@@ -154,9 +144,9 @@ async function refreshAllProviders() {
   });
 
   const providers = configs.map((config) => byId.get(config.id)).filter(Boolean);
-  await saveSnapshots(providers);
-  await updateActionBadge(providers);
-  return providers;
+  const savedProviders = await saveCurrentProviderSnapshots(providers);
+  await syncBadgeFromStorage();
+  return savedProviders;
 }
 
 async function refreshAllProvidersExclusive() {
@@ -193,6 +183,24 @@ async function runAutoRefresh() {
   }
 }
 
+async function withServiceWorkerKeepAlive(work) {
+  const ping = () => {
+    try {
+      const pending = chrome.runtime?.getPlatformInfo?.();
+      pending?.catch?.(() => undefined);
+    } catch {
+      // Keep-alive is best effort; the refresh still has persisted timestamps.
+    }
+  };
+  ping();
+  const timer = setInterval(ping, 20_000);
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 async function bootstrap() {
   await syncBadgeFromStorage();
   await syncAutoRefreshAlarm();
@@ -215,7 +223,7 @@ chrome.runtime.onStartup?.addListener?.(() => {
 if (globalThis.chrome?.alarms?.onAlarm) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm?.name !== AUTO_REFRESH_ALARM) return;
-    runAutoRefresh().catch(() => undefined);
+    withServiceWorkerKeepAlive(runAutoRefresh).catch(() => undefined);
   });
 }
 

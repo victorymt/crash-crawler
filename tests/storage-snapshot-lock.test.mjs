@@ -81,3 +81,43 @@ test("storage mutations serialize delete with refresh and reject older snapshots
 
   globalThis.chrome = originalChrome;
 });
+
+test("refresh commit does not recreate a deleted provider snapshot", async () => {
+  const originalChrome = globalThis.chrome;
+  const store = {};
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(key) {
+          if (Array.isArray(key)) return Object.fromEntries(key.map((item) => [item, store[item]]));
+          return { [key]: store[key] };
+        },
+        async set(value) {
+          Object.assign(store, value);
+        }
+      }
+    }
+  };
+
+  const {
+    deleteProviderConfig,
+    getSnapshots,
+    importProviderConfig,
+    saveCurrentProviderSnapshot
+  } = await import(`../extension/src/shared/storage.js?current-provider=${Date.now()}`);
+  await importProviderConfig({
+    id: "in-flight",
+    name: "In Flight",
+    type: "page",
+    targetUrl: "https://in-flight.test"
+  });
+
+  // The collector started while the provider existed, but deletion committed
+  // before its result reached storage.
+  const collected = { id: "in-flight", status: "ok", checkedAt: new Date().toISOString() };
+  await deleteProviderConfig("in-flight");
+  assert.equal(await saveCurrentProviderSnapshot(collected), undefined);
+  assert.equal((await getSnapshots())["in-flight"], undefined);
+
+  globalThis.chrome = originalChrome;
+});

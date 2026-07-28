@@ -217,6 +217,36 @@ export async function saveSnapshots(snapshotList) {
   });
 }
 
+/**
+ * Save refresh results only for providers that still exist when the storage
+ * transaction commits. This prevents an in-flight refresh from recreating a
+ * snapshot after its provider has been deleted.
+ */
+export async function saveCurrentProviderSnapshot(snapshot) {
+  const [saved] = await saveCurrentProviderSnapshots([snapshot]);
+  return saved;
+}
+
+export async function saveCurrentProviderSnapshots(snapshotList) {
+  if (!Array.isArray(snapshotList) || !snapshotList.length) return [];
+  return withStorageMutationLock(async () => {
+    const [configs, snapshots] = await Promise.all([getProviderConfigs(), getSnapshots()]);
+    const currentIds = new Set(configs.map((config) => config.id));
+    const saved = [];
+    for (const snapshot of snapshotList) {
+      if (!snapshot?.id || !currentIds.has(snapshot.id)) continue;
+      if (!shouldReplaceSnapshot(snapshots[snapshot.id], snapshot)) {
+        saved.push(snapshots[snapshot.id]);
+        continue;
+      }
+      snapshots[snapshot.id] = snapshot;
+      saved.push(snapshot);
+    }
+    if (saved.length) await storageSet({ [SNAPSHOT_KEY]: snapshots });
+    return saved;
+  });
+}
+
 export async function getSecret(name) {
   const data = await storageGet(SECRETS_KEY);
   return data[SECRETS_KEY]?.[name] || "";
