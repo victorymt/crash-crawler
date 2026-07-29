@@ -10,7 +10,7 @@ function sendMessage(message) {
 }
 
 function statusLabel(status) {
-  return ({ ok: "ok", stale: "stale", error: "error", idle: "idle", unconfigured: "unconfigured" })[status] || status || "idle";
+  return ({ ok: "ok", stale: "stale", error: "error", idle: "idle", unconfigured: "unconfigured", needs_visit: "needs visit" })[status] || status || "idle";
 }
 
 function recommendationLabel(value) {
@@ -136,10 +136,15 @@ function autoRefreshHint(settings) {
   if (settings?.lastAutoRefreshError) {
     return `后台刷新失败：${settings.lastAutoRefreshError}`;
   }
+  const policy = settings?.autoRefreshTabPolicy === "allow-hidden-tabs"
+    ? "可创建后台页"
+    : settings?.autoRefreshTabPolicy === "api-only"
+      ? "仅 API / HTTP"
+      : "仅复用已打开页";
   if (settings?.lastAutoRefreshAt) {
-    return `后台每 ${minutes} 分钟刷新 · 上次 ${new Date(settings.lastAutoRefreshAt).toLocaleTimeString()}`;
+    return `后台每 ${minutes} 分钟刷新 · ${policy} · 上次 ${new Date(settings.lastAutoRefreshAt).toLocaleTimeString()}`;
   }
-  return `后台每 ${minutes} 分钟自动刷新`;
+  return `后台每 ${minutes} 分钟自动刷新 · ${policy}`;
 }
 
 async function loadStatus() {

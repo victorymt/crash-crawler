@@ -658,7 +658,7 @@
         </section>
 
         <section id="s6">
-          <h2>6. 工程优化清单（0.2 → 0.3）</h2>
+          <h2>6. 工程优化清单（0.2 → 0.4）</h2>
           <table>
             <thead>
               <tr>
@@ -689,11 +689,23 @@
               </tr>
               <tr>
                 <td>定时刷新</td>
-                <td><code>alarms</code> + 设置页间隔（默认 30 分钟，可关）</td>
+                <td><code>alarms</code> + 设置页间隔；默认只复用已打开页面，不静默创建后台 Tab</td>
               </tr>
               <tr>
                 <td>快照写锁</td>
                 <td>并行 <code>saveSnapshot</code> 不丢更新</td>
+              </tr>
+              <tr>
+                <td>可恢复刷新任务</td>
+                <td>网络/页面步骤独立限流，单来源完成即落盘；<code>storage.session</code> 保存进度并清理遗留 Tab</td>
+              </tr>
+              <tr>
+                <td>访问时更新</td>
+                <td>内置来源默认监听页面访问；自定义来源显式选择，content script 不读取或上传任意存储内容</td>
+              </tr>
+              <tr>
+                <td>采集诊断</td>
+                <td><code>raw.collection</code> 记录策略、耗时、错误码与 fallback，敏感字段统一脱敏</td>
               </tr>
             </tbody>
           </table>
@@ -740,7 +752,8 @@
               <tr><td><code>providerConfigs</code></td><td>内置 + 自定义源配置</td></tr>
               <tr><td><code>providerSnapshots</code></td><td>最近一次成功/失败快照</td></tr>
               <tr><td><code>secrets</code></td><td>如 DeepSeek API Key</td></tr>
-              <tr><td><code>extensionSettings</code></td><td>自动刷新间隔、上次自动刷新时间</td></tr>
+              <tr><td><code>extensionSettings</code></td><td>自动刷新间隔、后台页面策略、上次自动刷新时间</td></tr>
+              <tr><td><code>storage.session</code></td><td>刷新任务进度与短期会话提示；浏览器重启后自动清除</td></tr>
             </tbody>
           </table>
         </section>

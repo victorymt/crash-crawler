@@ -28,10 +28,23 @@ import {
 } from "../shared/parsers.js";
 import { blankSnapshot } from "../shared/snapshots.js";
 import { getSecret } from "../shared/storage.js";
+import {
+  attachCollectionDiagnostics,
+  createCollectionContext,
+  decorateCollectionError,
+  NeedsVisitError,
+  TAB_POLICIES
+} from "./runtime.js";
+import { deleteSessionHint, getSessionHint, setSessionHint } from "./session_cache.js";
+import { createProviderRegistry } from "./registry.js";
 
 const EZAICLUB_AUTH_TOKEN_KEY = "auth_token";
+const EZAICLUB_SESSION_HINT = "authToken";
+const EZAICLUB_SESSION_TTL_MS = 20 * 60 * 1000;
 const EZAICLUB_API_TIMEZONE = "Asia/Shanghai";
 const SILICONFLOW_SUBJECT_PROBE = "sf-subject-id";
+const SILICONFLOW_SESSION_HINT = "subjectId";
+const SILICONFLOW_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const NETWORK_TIMEOUT_MS = 15000;
 const MAX_PAGE_TEXT_LENGTH = 250000;
 const MAX_JSON_SCRIPTS = 10;
@@ -113,29 +126,49 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function isApiProvider(config) {
-  return config?.mode === "api" || config?.type === "deepseek";
+async function notifyCollectionContext(context, hook, ...args) {
+  try {
+    await context?.[hook]?.(...args);
+  } catch {
+    // Refresh progress bookkeeping must not break provider collection.
+  }
+}
+
+function scopedSessionHint(name, url) {
+  return `${name}:${new URL(url).origin}`;
 }
 
 /** Reuse one background tab across multiple navigations (same provider multi-page). */
-export function createTabSession() {
+export function createTabSession(contextInput = {}) {
+  const defaultContext = createCollectionContext(contextInput);
   let tabId = null;
+  let tabContext = defaultContext;
   return {
     async load(url, options = {}) {
       if (!chrome.tabs || !chrome.scripting) return null;
+      const context = options.collectionContext || defaultContext;
       if (tabId == null) {
+        if (context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) {
+          throw new NeedsVisitError(`Open ${new URL(url).origin} to refresh this provider`);
+        }
         const tab = await chrome.tabs.create({ url, active: false });
         tabId = tab.id ?? null;
+        tabContext = context;
+        if (tabId != null) await notifyCollectionContext(context, "onTabCreated", tabId, url);
       } else if (chrome.tabs.update) {
         await chrome.tabs.update(tabId, { url });
       } else {
+        const previousTabId = tabId;
         try {
           await chrome.tabs.remove(tabId);
         } catch {
           // ignore
         }
+        await notifyCollectionContext(context, "onTabClosed", previousTabId);
         const tab = await chrome.tabs.create({ url, active: false });
         tabId = tab.id ?? null;
+        tabContext = context;
+        if (tabId != null) await notifyCollectionContext(context, "onTabCreated", tabId, url);
       }
       if (tabId == null) return null;
       await waitForTabComplete(tabId);
@@ -145,12 +178,14 @@ export function createTabSession() {
     },
     async close() {
       if (tabId == null) return;
+      const closingTabId = tabId;
       try {
         await chrome.tabs.remove(tabId);
       } catch {
         // The user or browser may already have closed the tab.
       }
       tabId = null;
+      await notifyCollectionContext(tabContext, "onTabClosed", closingTabId);
     }
   };
 }
@@ -304,11 +339,12 @@ export async function extractTokensFromTab(tabId, waitOptions = {}, selectorRule
 }
 
 export async function waitForTabComplete(tabId, timeoutMs = 20000) {
-  const tab = await chrome.tabs.get(tabId);
-  if (tab.status === "complete") return;
   await new Promise((resolve, reject) => {
+    let settled = false;
     const timeout = setTimeout(() => done(new Error(`Timed out after ${timeoutMs}ms while loading browser tab`)), timeoutMs);
     function done(error = null) {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
       chrome.tabs.onRemoved?.removeListener?.(removedListener);
@@ -325,11 +361,21 @@ export async function waitForTabComplete(tabId, timeoutMs = 20000) {
     }
     chrome.tabs.onUpdated.addListener(listener);
     chrome.tabs.onRemoved?.addListener?.(removedListener);
+    // Register listeners before checking the current state. Otherwise a tab can
+    // finish between tabs.get() and addListener(), leaving this promise waiting
+    // until its timeout even though the page is already complete.
+    chrome.tabs.get(tabId).then(
+      (tab) => {
+        if (tab?.status === "complete") done();
+      },
+      (error) => done(error)
+    );
   });
 }
 
 async function getOpenTabTokens(url, options = {}) {
   if (!chrome.tabs || !chrome.scripting) return null;
+  if (options.collectionContext?.tabPolicy === TAB_POLICIES.API_ONLY) return null;
   const tabs = await chrome.tabs.query({ url: `${new URL(url).origin}/*` });
   const matchingTab = pickBestTab(tabs, url, options);
   if (!matchingTab?.id) return null;
@@ -341,7 +387,11 @@ async function getRenderedTabTokens(url, options = {}) {
   if (options.tabSession) {
     return options.tabSession.load(url, options);
   }
-  const session = createTabSession();
+  const context = options.collectionContext || createCollectionContext();
+  if (context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) {
+    throw new NeedsVisitError(`Open ${new URL(url).origin} to refresh this provider`);
+  }
+  const session = createTabSession(context);
   try {
     return await session.load(url, options);
   } finally {
@@ -422,11 +472,12 @@ async function tokensFromUrl(url, loginHints, loginError, options = {}) {
   return { url: page.url, tokens: fetchedTokens };
 }
 
-async function collectOpenCode(config) {
+async function collectOpenCode(config, context) {
   const main = await tokensFromUrl(
     config.targetUrl,
     OPENCODE_LOGIN_HINTS,
-    "Current browser is not logged in to opencode.ai"
+    "Current browser is not logged in to opencode.ai",
+    { collectionContext: context }
   );
   const legacy = parseOpencodeLegacy(main.tokens, main.url);
   try {
@@ -473,34 +524,44 @@ async function readTabLocalStorageKey(tabId, key) {
   }
 }
 
-async function getEzaiclubAuthToken(config) {
+async function getEzaiclubAuthToken(config, context) {
+  const hintName = scopedSessionHint(EZAICLUB_SESSION_HINT, config.targetUrl);
+  const cached = await getSessionHint(config.id, hintName);
+  if (cached) return cached;
   if (!chrome.scripting?.executeScript) return "";
   const origin = new URL(config.targetUrl).origin;
   const target = new URL(config.targetUrl);
 
-  if (chrome.tabs?.query) {
+  if (chrome.tabs?.query && context.tabPolicy !== TAB_POLICIES.API_ONLY) {
     const tabs = await chrome.tabs.query({ url: `${origin}/*` });
     const ranked = [...tabs]
       .filter((tab) => tab.id != null && tab.url)
       .sort((left, right) => tabMatchScore(right.url, target) - tabMatchScore(left.url, target));
     for (const tab of ranked) {
       const token = await readTabLocalStorageKey(tab.id, EZAICLUB_AUTH_TOKEN_KEY);
-      if (token) return token;
+      if (token) {
+        await setSessionHint(config.id, hintName, token, EZAICLUB_SESSION_TTL_MS);
+        return token;
+      }
     }
   }
 
   // No usable open tab: open dashboard briefly only to read localStorage (no long DOM wait).
-  if (!chrome.tabs?.create) return "";
+  if (!chrome.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return "";
   let tabId = null;
   try {
     const tab = await chrome.tabs.create({ url: config.targetUrl, active: false });
     tabId = tab.id ?? null;
     if (tabId == null) return "";
+    await notifyCollectionContext(context, "onTabCreated", tabId, config.targetUrl);
     await waitForTabComplete(tabId, 15000);
     // SPA writes auth_token after boot; poll briefly instead of full render scrape.
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const token = await readTabLocalStorageKey(tabId, EZAICLUB_AUTH_TOKEN_KEY);
-      if (token) return token;
+      if (token) {
+        await setSessionHint(config.id, hintName, token, EZAICLUB_SESSION_TTL_MS);
+        return token;
+      }
       await delay(300);
     }
     return "";
@@ -508,11 +569,13 @@ async function getEzaiclubAuthToken(config) {
     return "";
   } finally {
     if (tabId != null) {
+      const closingTabId = tabId;
       try {
         await chrome.tabs.remove(tabId);
       } catch {
         // Tab may already be closed.
       }
+      await notifyCollectionContext(context, "onTabClosed", closingTabId);
     }
   }
 }
@@ -534,31 +597,38 @@ async function fetchEzaiclubJson(url, token) {
   });
 }
 
-async function collectEzaiclubViaApi(config) {
-  const token = await getEzaiclubAuthToken(config);
+async function collectEzaiclubViaApi(config, context) {
+  const token = await getEzaiclubAuthToken(config, context);
   if (!token) return null;
-  const origin = new URL(config.targetUrl).origin;
-  const timezone = encodeURIComponent(EZAICLUB_API_TIMEZONE);
-  const me = await fetchEzaiclubJson(`${origin}/api/v1/auth/me?timezone=${timezone}`, token);
-  if (me?.code != null && Number(me.code) !== 0) {
-    throw new Error(me.message || `EZAICLUB auth/me failed with code ${me.code}`);
-  }
-  let subscriptions = { code: 0, data: [] };
   try {
-    subscriptions = await fetchEzaiclubJson(
-      `${origin}/api/v1/subscriptions/active?timezone=${timezone}`,
-      token
-    );
+    const origin = new URL(config.targetUrl).origin;
+    const timezone = encodeURIComponent(EZAICLUB_API_TIMEZONE);
+    const me = await fetchEzaiclubJson(`${origin}/api/v1/auth/me?timezone=${timezone}`, token);
+    if (me?.code != null && Number(me.code) !== 0) {
+      throw new Error(me.message || `EZAICLUB auth/me failed with code ${me.code}`);
+    }
+    let subscriptions = { code: 0, data: [] };
+    try {
+      subscriptions = await fetchEzaiclubJson(
+        `${origin}/api/v1/subscriptions/active?timezone=${timezone}`,
+        token
+      );
+    } catch (error) {
+      if (error instanceof NotLoggedInError) throw error;
+    }
+    const snapshot = ezaiclubApiSnapshot(config, me, subscriptions);
+    if (!snapshot.balances.length && !snapshot.metrics.length) return null;
+    return snapshot;
   } catch (error) {
-    if (error instanceof NotLoggedInError) throw error;
+    if (error instanceof NotLoggedInError) {
+      await deleteSessionHint(config.id, scopedSessionHint(EZAICLUB_SESSION_HINT, config.targetUrl));
+    }
+    throw error;
   }
-  const snapshot = ezaiclubApiSnapshot(config, me, subscriptions);
-  if (!snapshot.balances.length && !snapshot.metrics.length) return null;
-  return snapshot;
 }
 
-async function collectEzaiclubViaPage(config) {
-  const tabSession = createTabSession();
+async function collectEzaiclubViaPage(config, context) {
+  const tabSession = createTabSession(context);
   try {
     const dashboard = await tokensFromUrl(
       config.targetUrl,
@@ -569,6 +639,7 @@ async function collectEzaiclubViaPage(config) {
         requirePathMatch: true,
         waitOptions: EZAICLUB_BALANCE_WAIT_OPTIONS,
         afterLoadDelayMs: 0,
+        collectionContext: context,
         tabSession,
         shouldUseRenderedTokens: (tokens) => {
           return !parseEzaiclubBalanceTokens(tokens).length;
@@ -591,6 +662,7 @@ async function collectEzaiclubViaPage(config) {
           requirePathMatch: true,
           waitOptions: EZAICLUB_SUBSCRIPTION_WAIT_OPTIONS,
           afterLoadDelayMs: 0,
+          collectionContext: context,
           tabSession,
           shouldUseRenderedTokens: (tokens) => {
             return !parseEzaiclubSubscriptionTokens(tokens).length;
@@ -607,18 +679,22 @@ async function collectEzaiclubViaPage(config) {
   }
 }
 
-async function collectEzaiclub(config) {
+async function collectEzaiclub(config, context) {
   try {
-    const apiSnapshot = await collectEzaiclubViaApi(config);
+    const apiSnapshot = await context.runAttempt(
+      "ezaiclub-api",
+      "network",
+      () => collectEzaiclubViaApi(config, context)
+    );
     if (apiSnapshot) return apiSnapshot;
-  } catch (error) {
-    if (error instanceof NotLoggedInError) {
-      // Token missing/expired: fall back to DOM scrape which surfaces login state.
-    } else {
-      // API shape/network failures fall back to the existing page collectors.
-    }
+  } catch {
+    // The attempt is recorded on the collection context before falling back.
   }
-  return collectEzaiclubViaPage(config);
+  return context.runAttempt(
+    "ezaiclub-page",
+    "page",
+    () => collectEzaiclubViaPage(config, context)
+  );
 }
 
 async function readTabSiliconflowSubjectId(tabId) {
@@ -626,6 +702,9 @@ async function readTabSiliconflowSubjectId(tabId) {
   try {
     const [{ result } = {}] = await chrome.scripting.executeScript({
       target: { tabId },
+      // SF_SUBJECT_ID is created by the page application. The default isolated
+      // world cannot observe page-owned JavaScript globals.
+      world: "MAIN",
       // args tag lets tests distinguish this probe from DOM extraction.
       func: (_probe) => {
         try {
@@ -643,32 +722,42 @@ async function readTabSiliconflowSubjectId(tabId) {
   }
 }
 
-async function getSiliconflowSubjectId(config) {
+async function getSiliconflowSubjectId(config, context) {
+  const hintName = scopedSessionHint(SILICONFLOW_SESSION_HINT, config.targetUrl);
+  const cached = await getSessionHint(config.id, hintName);
+  if (cached) return cached;
   if (!chrome.scripting?.executeScript) return "";
   const origin = new URL(config.targetUrl).origin;
   const target = new URL(config.targetUrl);
 
-  if (chrome.tabs?.query) {
+  if (chrome.tabs?.query && context.tabPolicy !== TAB_POLICIES.API_ONLY) {
     const tabs = await chrome.tabs.query({ url: `${origin}/*` });
     const ranked = [...tabs]
       .filter((tab) => tab.id != null && tab.url)
       .sort((left, right) => tabMatchScore(right.url, target) - tabMatchScore(left.url, target));
     for (const tab of ranked) {
       const subjectId = await readTabSiliconflowSubjectId(tab.id);
-      if (subjectId) return subjectId;
+      if (subjectId) {
+        await setSessionHint(config.id, hintName, subjectId, SILICONFLOW_SESSION_TTL_MS);
+        return subjectId;
+      }
     }
   }
 
-  if (!chrome.tabs?.create) return "";
+  if (!chrome.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return "";
   let tabId = null;
   try {
     const tab = await chrome.tabs.create({ url: config.targetUrl, active: false });
     tabId = tab.id ?? null;
     if (tabId == null) return "";
+    await notifyCollectionContext(context, "onTabCreated", tabId, config.targetUrl);
     await waitForTabComplete(tabId, 15000);
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const subjectId = await readTabSiliconflowSubjectId(tabId);
-      if (subjectId) return subjectId;
+      if (subjectId) {
+        await setSessionHint(config.id, hintName, subjectId, SILICONFLOW_SESSION_TTL_MS);
+        return subjectId;
+      }
       await delay(300);
     }
     return "";
@@ -676,11 +765,13 @@ async function getSiliconflowSubjectId(config) {
     return "";
   } finally {
     if (tabId != null) {
+      const closingTabId = tabId;
       try {
         await chrome.tabs.remove(tabId);
       } catch {
         // ignore
       }
+      await notifyCollectionContext(context, "onTabClosed", closingTabId);
     }
   }
 }
@@ -710,21 +801,25 @@ function siliconflowApiOk(payload) {
   return code === 0 || code === 200 || code === 20000;
 }
 
-async function collectSiliconflowViaApi(config) {
-  const subjectId = await getSiliconflowSubjectId(config);
+async function collectSiliconflowViaApi(config, context) {
+  const subjectId = await getSiliconflowSubjectId(config, context);
   if (!subjectId) return null;
   const origin = "https://cloud.siliconflow.cn";
+  let authenticationError = null;
+  const fetchOptional = (url) => fetchSiliconflowJson(url, subjectId).catch((error) => {
+    if (error instanceof NotLoggedInError) authenticationError = error;
+    return null;
+  });
   const [profile, balanceWallets, couponWallets] = await Promise.all([
-    fetchSiliconflowJson(`${origin}/walletd-server/api/v1/subject/profile/peek`, subjectId).catch(() => null),
-    fetchSiliconflowJson(
-      `${origin}/walletd-server/api/v1/subject/wallets?pageSize=5&stage=1&visible=1&serviceable=1`,
-      subjectId
-    ).catch(() => null),
-    fetchSiliconflowJson(
-      `${origin}/walletd-server/api/v1/subject/wallets?pageSize=20&stage=3`,
-      subjectId
-    ).catch(() => null)
+    fetchOptional(`${origin}/walletd-server/api/v1/subject/profile/peek`),
+    fetchOptional(`${origin}/walletd-server/api/v1/subject/wallets?pageSize=5&stage=1&visible=1&serviceable=1`),
+    fetchOptional(`${origin}/walletd-server/api/v1/subject/wallets?pageSize=20&stage=3`)
   ]);
+
+  if (authenticationError) {
+    await deleteSessionHint(config.id, scopedSessionHint(SILICONFLOW_SESSION_HINT, config.targetUrl));
+    throw authenticationError;
+  }
 
   const payloads = [profile, balanceWallets, couponWallets].filter(Boolean);
   if (!payloads.length) return null;
@@ -737,13 +832,14 @@ async function collectSiliconflowViaApi(config) {
   return snapshot;
 }
 
-async function collectSiliconflowViaPage(config) {
+async function collectSiliconflowViaPage(config, context) {
   const page = await tokensFromUrl(
     config.targetUrl,
     SILICONFLOW_LOGIN_HINTS,
     "Current browser is not logged in to SiliconFlow",
     {
       renderFallback: true,
+      collectionContext: context,
       shouldUseRenderedTokens: (tokens) => {
         return !parseSiliconflowBalanceTokens(tokens).length && !parseSiliconflowMetricTokens(tokens).length;
       }
@@ -754,14 +850,22 @@ async function collectSiliconflowViaPage(config) {
   return siliconflowSnapshot(config, page.url, balances, metrics, { source: "page" });
 }
 
-async function collectSiliconFlow(config) {
+async function collectSiliconFlow(config, context) {
   try {
-    const apiSnapshot = await collectSiliconflowViaApi(config);
+    const apiSnapshot = await context.runAttempt(
+      "siliconflow-api",
+      "network",
+      () => collectSiliconflowViaApi(config, context)
+    );
     if (apiSnapshot) return apiSnapshot;
   } catch {
-    // Fall back to DOM scrape for login walls or API shape changes.
+    // The attempt is recorded on the collection context before falling back.
   }
-  return collectSiliconflowViaPage(config);
+  return context.runAttempt(
+    "siliconflow-page",
+    "page",
+    () => collectSiliconflowViaPage(config, context)
+  );
 }
 
 function selectorRulesForPage(parserRules, pageId) {
@@ -792,7 +896,7 @@ function mergeGenericParsed(left, right) {
   };
 }
 
-async function collectGenericPage(config) {
+async function collectGenericPage(config, context) {
   const parserRules = config.parserRules || {};
   const loginHints = Array.isArray(parserRules.loginHints) ? parserRules.loginHints : [];
   const waitOptions = {
@@ -809,7 +913,7 @@ async function collectGenericPage(config) {
   const allTokens = [];
   const selectorResults = {};
   let snapshotUrl = config.targetUrl;
-  const tabSession = createTabSession();
+  const tabSession = createTabSession(context);
   const afterLoadDelayMs = Number(parserRules.afterLoadDelayMs ?? 0);
 
   try {
@@ -826,6 +930,7 @@ async function collectGenericPage(config) {
             waitOptions,
             selectorRules: pageSelectorRules,
             afterLoadDelayMs,
+            collectionContext: context,
             tabSession,
             shouldUseRenderedTokens: (tokens, page) => {
               if (!pageSelectorRules.length) return !parseGenericPageTokens(tokens, parserRules).metrics.length;
@@ -859,13 +964,46 @@ async function ensureProviderPermission(config) {
   }
 }
 
-export async function collectProvider(config) {
-  await ensureProviderPermission(config);
-  if (hasSelectorRules(config.parserRules)) return collectGenericPage(config);
-  if (config.type === "opencode") return collectOpenCode(config);
-  if (config.type === "deepseek") return collectDeepSeek(config);
-  if (config.type === "ezaiclub") return collectEzaiclub(config);
-  if (config.type === "siliconflow") return collectSiliconFlow(config);
-  if (config.type === "page") return collectGenericPage(config);
-  throw new Error(`unsupported provider type: ${config.type}`);
+const providerAdapters = createProviderRegistry([
+  ["page", {
+    collect: (config, context) => context.runAttempt(
+      "generic-page",
+      "page",
+      () => collectGenericPage(config, context)
+    )
+  }],
+  ["opencode", {
+    collect: (config, context) => context.runAttempt(
+      "opencode-http-or-page",
+      "page",
+      () => collectOpenCode(config, context)
+    )
+  }],
+  ["deepseek", {
+    collect: (config, context) => context.runAttempt(
+      "deepseek-api",
+      "network",
+      () => collectDeepSeek(config)
+    )
+  }],
+  ["ezaiclub", { collect: collectEzaiclub }],
+  ["siliconflow", { collect: collectSiliconFlow }]
+]);
+
+export function providerAdapterTypes() {
+  return providerAdapters.types();
+}
+
+export async function collectProvider(config, contextInput = {}) {
+  const context = createCollectionContext(contextInput);
+  try {
+    await ensureProviderPermission(config);
+    const adapterType = hasSelectorRules(config.parserRules) ? "page" : config.type;
+    const adapter = providerAdapters.get(adapterType);
+    if (!adapter) throw new Error(`unsupported provider type: ${config.type}`);
+    const snapshot = await adapter.collect(config, context);
+    return attachCollectionDiagnostics(snapshot, context);
+  } catch (error) {
+    throw decorateCollectionError(error, context);
+  }
 }

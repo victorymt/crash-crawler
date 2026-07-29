@@ -1,4 +1,5 @@
 import { linksForConfig } from "./config.js";
+import { classifyCollectionError, sanitizeDiagnosticMessage } from "../providers/runtime.js";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -72,7 +73,7 @@ export function blankSnapshot(config, status = "idle", error = null) {
     usage: [],
     metrics: [],
     links: linksForConfig(config),
-    recommendation: ["error", "unconfigured"].includes(status) ? "watch" : "ok",
+    recommendation: ["error", "unconfigured", "needs_visit"].includes(status) ? "watch" : "ok",
     error
   };
 }
@@ -82,11 +83,12 @@ export function errorSnapshot(config, previous, error) {
   const staleBalances = previous?.balances || [];
   const staleUsage = previous?.usage || [];
   const hasStaleData = Boolean(staleMetrics.length || staleBalances.length || staleUsage.length);
+  const errorCode = classifyCollectionError(error);
   return {
     id: config.id,
     name: config.name,
     type: config.type,
-    status: hasStaleData ? "stale" : "error",
+    status: hasStaleData ? "stale" : errorCode === "NEEDS_VISIT" ? "needs_visit" : "error",
     url: config.targetUrl,
     updatedAt: previous?.updatedAt || null,
     checkedAt: nowIso(),
@@ -96,7 +98,14 @@ export function errorSnapshot(config, previous, error) {
     metrics: staleMetrics,
     links: previous?.links || linksForConfig(config),
     recommendation: previous?.recommendation || "watch",
-    error: error?.message || String(error)
+    error: sanitizeDiagnosticMessage(error?.message || error),
+    errorCode,
+    ...(error?.collection ? {
+      raw: {
+        ...(previous?.raw && typeof previous.raw === "object" ? previous.raw : {}),
+        collection: error.collection
+      }
+    } : {})
   };
 }
 

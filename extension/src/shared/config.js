@@ -12,6 +12,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     type: "opencode",
     targetUrl: DEFAULT_OPENCODE_URL,
     enabled: true,
+    refreshOnVisit: true,
     secondaryUrls: [],
     mode: "http_then_page"
   },
@@ -21,6 +22,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     type: "deepseek",
     targetUrl: DEFAULT_DEEPSEEK_URL,
     enabled: true,
+    refreshOnVisit: true,
     secondaryUrls: [],
     mode: "api"
   },
@@ -30,6 +32,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     type: "ezaiclub",
     targetUrl: DEFAULT_EZAICLUB_DASHBOARD_URL,
     enabled: true,
+    refreshOnVisit: true,
     secondaryUrls: [
       {
         label: "打开订阅页",
@@ -44,6 +47,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     type: "siliconflow",
     targetUrl: DEFAULT_SILICONFLOW_COUPON_URL,
     enabled: true,
+    refreshOnVisit: true,
     secondaryUrls: [],
     mode: "page"
   }
@@ -337,6 +341,7 @@ export function normalizeProviderConfig(raw) {
     type: raw.type == null ? "" : String(raw.type),
     targetUrl: raw.targetUrl || raw.target_url ? String(raw.targetUrl || raw.target_url) : "",
     enabled: raw.enabled !== false,
+    refreshOnVisit: raw.refreshOnVisit === true,
     secondaryUrls: normalizeSecondaryUrls(raw),
     mode: String(raw.mode || "page"),
     ...(parserRules ? { parserRules } : {})

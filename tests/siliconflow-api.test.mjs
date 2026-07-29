@@ -66,6 +66,8 @@ test("SiliconFlow prefers API collection when subject id is available", async ()
   const originalFetch = globalThis.fetch;
   const fetchUrls = [];
   let createdTabs = 0;
+  let subjectProbeWorld = null;
+  const sessionStore = {};
 
   globalThis.fetch = async (url, options = {}) => {
     fetchUrls.push(String(url));
@@ -108,6 +110,12 @@ test("SiliconFlow prefers API collection when subject id is available", async ()
   };
 
   globalThis.chrome = {
+    storage: {
+      session: {
+        async get(key) { return { [key]: sessionStore[key] }; },
+        async set(value) { Object.assign(sessionStore, value); }
+      }
+    },
     tabs: {
       async query() {
         return [{ id: 3, url: "https://cloud.siliconflow.cn/me/expensebill?tab=coupon" }];
@@ -121,8 +129,9 @@ test("SiliconFlow prefers API collection when subject id is available", async ()
       onUpdated: { addListener() {}, removeListener() {} }
     },
     scripting: {
-      async executeScript({ args }) {
+      async executeScript({ args, world }) {
         if (Array.isArray(args) && args[0] === "sf-subject-id") {
+          subjectProbeWorld = world;
           return [{ result: "subj-test-001" }];
         }
         throw new Error("DOM scrape should not run when SiliconFlow API succeeds");
@@ -142,11 +151,38 @@ test("SiliconFlow prefers API collection when subject id is available", async ()
   });
 
   assert.equal(createdTabs, 0);
+  assert.equal(subjectProbeWorld, "MAIN");
   assert.equal(snapshot.raw.source, "api");
+  assert.equal(snapshot.raw.collection.fallbackUsed, false);
+  assert.deepEqual(
+    snapshot.raw.collection.attempts.map((attempt) => [attempt.strategy, attempt.status]),
+    [["siliconflow-api", "ok"]]
+  );
   assert.equal(snapshot.balances.find((item) => item.label === "余额").value, "8.50");
   assert.ok(snapshot.balances.some((item) => item.label.includes("认证奖励券")));
   assert.ok(fetchUrls.some((url) => url.includes("/walletd-server/api/v1/subject/profile/peek")));
   assert.ok(fetchUrls.some((url) => url.includes("stage=3")));
+
+  globalThis.chrome.tabs.query = async () => {
+    throw new Error("api-only refresh should use the cached subject id");
+  };
+  globalThis.chrome.scripting.executeScript = async () => {
+    throw new Error("api-only refresh should not probe a page");
+  };
+  const cachedSnapshot = await collectProvider({
+    id: "siliconflow",
+    name: "SiliconFlow",
+    type: "siliconflow",
+    targetUrl: "https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
+    enabled: true,
+    secondaryUrls: [],
+    mode: "page"
+  }, {
+    trigger: "auto",
+    tabPolicy: "api-only"
+  });
+  assert.equal(cachedSnapshot.raw.source, "api");
+  assert.equal(cachedSnapshot.raw.collection.tabPolicy, "api-only");
 
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;

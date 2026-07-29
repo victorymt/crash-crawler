@@ -80,6 +80,7 @@ test("storage imports and exports single provider sources", async () => {
   assert.equal(protectedConfigs.find((item) => item.id === "deepseek").type, "deepseek");
   assert.equal(protectedConfigs.find((item) => item.id === "deepseek").targetUrl, "https://example.test/replaced");
   assert.equal(protectedConfigs.find((item) => item.id === "deepseek").enabled, false);
+  assert.equal(protectedConfigs.find((item) => item.id === "opencode-go").refreshOnVisit, true);
   assert.equal(protectedConfigs.some((item) => item.id === "ezaiclub"), true);
 
   globalThis.chrome = originalChrome;
@@ -146,10 +147,14 @@ test("extension settings normalize auto-refresh intervals", async () => {
 
   assert.equal(normalizeExtensionSettings({ autoRefreshMinutes: 7 }).autoRefreshMinutes, 30);
   assert.equal(normalizeExtensionSettings({ autoRefreshMinutes: 0 }).autoRefreshMinutes, 0);
+  assert.equal(normalizeExtensionSettings({}).autoRefreshTabPolicy, "reuse-open-tabs");
+  assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "api-only" }).autoRefreshTabPolicy, "api-only");
+  assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "invalid" }).autoRefreshTabPolicy, "reuse-open-tabs");
   assert.equal((await getExtensionSettings()).autoRefreshMinutes, 30);
 
-  const saved = await saveExtensionSettings({ autoRefreshMinutes: 60 });
+  const saved = await saveExtensionSettings({ autoRefreshMinutes: 60, autoRefreshTabPolicy: "allow-hidden-tabs" });
   assert.equal(saved.autoRefreshMinutes, 60);
+  assert.equal(saved.autoRefreshTabPolicy, "allow-hidden-tabs");
   assert.equal((await getExtensionSettings()).autoRefreshMinutes, 60);
 
   globalThis.chrome = originalChrome;

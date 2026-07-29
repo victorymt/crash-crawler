@@ -126,9 +126,11 @@ uv run python crawler.py --provider ezaiclub --explore
 - 修改或删除自定义来源后，插件会回收不再使用的可选站点权限。
 - 内置 provider 可改名称、主页 URL 和附加页面（例如 OpenCode workspace），解析类型不可改；也可复制成自定义来源。“导入书源”和“导出”用于分享 JSON 配置。批量导入会整体校验，不会只导入其中一部分。
 - 刷新后工具栏角标会提示异常/建议充值数量；popup 打开时会跟随 storage 中的最新快照更新。
-- 设置页可配置后台自动刷新（默认每 30 分钟，可关）。依赖 `chrome.alarms`，浏览器启动后会继续按间隔刷新已启用 provider。
+- 设置页可配置后台自动刷新（默认每 30 分钟，可关）。默认只使用 API/HTTP 或复用已打开页面，不会静默创建后台标签页；也可显式选择“仅 API / HTTP”或允许后台标签页。
+- 内置来源默认在用户访问对应站点时主动更新；自定义来源需在编辑器中显式启用“访问页面时自动更新”。监听页面的 content script 只发送访问通知，指标仍由后台按已验证的 CSS/正则规则解析。
 - EZAICLUB 优先走内部 API（`localStorage.auth_token` + `/api/v1/auth/me` 与 `/api/v1/subscriptions/active`），失败时再回退到页面 DOM 解析。
 - SiliconFlow 优先走内部 API（页面 `SF_SUBJECT_ID` + `x-subject-id` 请求 `/walletd-server/.../wallets`），失败时再回退到页面 DOM 解析。
+- EZAICLUB token 与 SiliconFlow subject id 只短期缓存到 `chrome.storage.session`，按 provider 和 origin 隔离；不会写入持久化快照或日志，鉴权失败后会立即清除。
 - 页面解析不会枚举站点的 `localStorage` 或 `sessionStorage`；内置 API 只读取明确需要的登录字段。
 - 导入来源会限制页面数、规则数、正则复杂度和最长等待时间，异常配置会在保存前被拒绝。
 - DeepSeek 设置支持显式清除已保存的 API Key。
@@ -143,6 +145,7 @@ uv run python crawler.py --provider ezaiclub --explore
   "type": "page",
   "targetUrl": "https://example.com/dashboard",
   "enabled": true,
+  "refreshOnVisit": false,
   "secondaryUrls": [
     { "id": "subscriptions", "label": "订阅页", "url": "https://example.com/subscriptions" }
   ],
@@ -189,9 +192,12 @@ uv run python crawler.py --provider ezaiclub --explore
 
 插件刷新策略：
 
-- “刷新全部”在后台并行执行（默认并发 4，API 优先）。
+- “刷新全部”按实际采集步骤调度：网络步骤和页面步骤使用独立并发池，不再静态地把 provider 分成 API/Page 两批。
+- 每个 provider 完成后立即写入快照；刷新运行状态保存在 `chrome.storage.session`，Service Worker 重启后会跳过已完成来源、继续未完成来源并清理遗留标签页。
+- 自动刷新默认禁止新建后台标签页；手动刷新仍允许完整的页面降级路径。
 - 多页 provider（如 EZAICLUB 仪表盘 + 订阅页、自定义书源多 URL）复用同一个后台标签页导航，避免每页都新建标签。
 - 渲染等待依赖 ready 文本/选择器与稳定采样，不再叠加大段固定 sleep。
+- 快照的 `raw.collection` 会记录各采集策略的成功/失败、耗时和 fallback 原因，并对 Token、Cookie、API Key 做脱敏。
 
 本地回归测试：
 

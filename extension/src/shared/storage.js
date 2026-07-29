@@ -4,6 +4,7 @@ import {
   normalizeProviderConfig,
   normalizeProviderConfigs
 } from "./config.js";
+import { TAB_POLICIES, TAB_POLICY_VALUES } from "../providers/runtime.js";
 
 const CONFIG_KEY = "providerConfigs";
 const SNAPSHOT_KEY = "providerSnapshots";
@@ -25,6 +26,7 @@ function withStorageMutationLock(work) {
 export const AUTO_REFRESH_MINUTES_OPTIONS = [0, 15, 30, 60, 120, 360];
 export const DEFAULT_EXTENSION_SETTINGS = {
   autoRefreshMinutes: 30,
+  autoRefreshTabPolicy: TAB_POLICIES.REUSE_OPEN_TABS,
   lastAutoRefreshAt: null,
   lastAutoRefreshAttemptAt: null,
   lastAutoRefreshError: null
@@ -36,6 +38,9 @@ export function normalizeExtensionSettings(raw = {}) {
     autoRefreshMinutes: AUTO_REFRESH_MINUTES_OPTIONS.includes(minutes)
       ? minutes
       : DEFAULT_EXTENSION_SETTINGS.autoRefreshMinutes,
+    autoRefreshTabPolicy: TAB_POLICY_VALUES.includes(raw?.autoRefreshTabPolicy)
+      ? raw.autoRefreshTabPolicy
+      : DEFAULT_EXTENSION_SETTINGS.autoRefreshTabPolicy,
     lastAutoRefreshAt: raw?.lastAutoRefreshAt ? String(raw.lastAutoRefreshAt) : null,
     lastAutoRefreshAttemptAt: raw?.lastAutoRefreshAttemptAt ? String(raw.lastAutoRefreshAttemptAt) : null,
     lastAutoRefreshError: raw?.lastAutoRefreshError ? String(raw.lastAutoRefreshError).slice(0, 500) : null
@@ -65,6 +70,7 @@ export function mergeBuiltinConfig(defaultConfig, stored) {
     type: defaultConfig.type,
     mode: defaultConfig.mode,
     enabled: stored.enabled ?? defaultConfig.enabled,
+    refreshOnVisit: stored.refreshOnVisit ?? defaultConfig.refreshOnVisit,
     name,
     targetUrl,
     secondaryUrls

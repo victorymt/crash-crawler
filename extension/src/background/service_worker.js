@@ -16,19 +16,21 @@ import {
   saveProviderConfig,
   saveProviderConfigs,
   saveCurrentProviderSnapshot,
-  saveCurrentProviderSnapshots,
   setSecret
 } from "../shared/storage.js";
-import { collectProvider, isApiProvider } from "../providers/index.js";
+import { collectProvider } from "../providers/index.js";
+import { clearProviderSessionHints } from "../providers/session_cache.js";
+import { recoverRefreshRun, runRefreshBatch } from "./refresh_runner.js";
+import { configsForObservedUrl, syncVisitObserver } from "./visit_observer.js";
 
-/** Cap concurrent page collectors to avoid opening too many tabs at once. */
-const REFRESH_CONCURRENCY = 4;
 export const AUTO_REFRESH_ALARM = "providers:autoRefresh";
 
-/** Prevent overlapping full refreshes (manual + alarm). */
-let refreshAllInFlight = null;
+/** Keep full refreshes serialized so they cannot overwrite one session job. */
+let refreshAllFlight = null;
 const providerRefreshes = new Map();
+const observedRefreshTimes = new Map();
 let configMutationChain = Promise.resolve();
+const OBSERVED_REFRESH_THROTTLE_MS = 15_000;
 
 async function publicConfigs() {
   return (await getProviderConfigs()).filter((config) => config.enabled);
@@ -61,21 +63,36 @@ async function listProviders() {
   return { providers, configs, settings };
 }
 
-async function collectOne(config, previousSnapshot) {
+async function collectOne(config, previousSnapshot, context = {}) {
   try {
-    return await collectProvider(config);
+    return await collectProvider(config, context);
   } catch (error) {
     return errorSnapshot(config, previousSnapshot, error);
   }
 }
 
-async function collectOneExclusive(config, previousSnapshot) {
+function contextCapability(context = {}) {
+  if (context.tabPolicy === "allow-hidden-tabs") return 2;
+  if (context.tabPolicy === "reuse-open-tabs") return 1;
+  return 0;
+}
+
+async function collectOneExclusive(config, previousSnapshot, context = {}) {
   const existing = providerRefreshes.get(config.id);
-  if (existing) return existing;
-  const refresh = collectOne(config, previousSnapshot).finally(() => {
-    if (providerRefreshes.get(config.id) === refresh) providerRefreshes.delete(config.id);
+  const capability = contextCapability(context);
+  if (existing) {
+    if (existing.capability >= capability) return existing.promise;
+    try {
+      await existing.promise;
+    } catch {
+      // A more capable refresh should still get its own attempt.
+    }
+    return collectOneExclusive(config, previousSnapshot, context);
+  }
+  const refresh = collectOne(config, previousSnapshot, context).finally(() => {
+    if (providerRefreshes.get(config.id)?.promise === refresh) providerRefreshes.delete(config.id);
   });
-  providerRefreshes.set(config.id, refresh);
+  providerRefreshes.set(config.id, { promise: refresh, capability });
   return refresh;
 }
 
@@ -94,7 +111,10 @@ async function refreshProvider(providerId) {
   const config = configs.find((item) => item.id === providerId);
   if (!config) throw new Error(`unknown provider: ${providerId}`);
   const snapshots = await getSnapshots();
-  const snapshot = await collectOneExclusive(config, snapshots[providerId]);
+  const snapshot = await collectOneExclusive(config, snapshots[providerId], {
+    trigger: "manual",
+    tabPolicy: "allow-hidden-tabs"
+  });
   const saved = await saveCurrentProviderSnapshot(snapshot);
   if (!saved) throw new Error(`provider was deleted while refreshing: ${providerId}`);
   await syncBadgeFromStorage();
@@ -107,55 +127,76 @@ async function testProvider(providerInput) {
     ? configs.find((item) => item.id === providerInput)
     : normalizeProviderConfig(providerInput);
   if (!config) throw new Error(`unknown provider: ${providerInput}`);
-  return collectProvider(config);
+  return collectProvider(config, { trigger: "test", tabPolicy: "allow-hidden-tabs" });
 }
 
-async function mapPool(items, concurrency, worker) {
-  if (!items.length) return [];
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      results[index] = await worker(items[index], index);
-    }
+async function refreshObservedProviders(pageUrl) {
+  const configs = configsForObservedUrl(await getProviderConfigs(), pageUrl);
+  const now = Date.now();
+  const selected = configs.filter((config) => {
+    const previous = observedRefreshTimes.get(config.id) || 0;
+    if (now - previous < OBSERVED_REFRESH_THROTTLE_MS) return false;
+    observedRefreshTimes.set(config.id, now);
+    return true;
   });
-  await Promise.all(runners);
-  return results;
+  if (!selected.length) return [];
+
+  const previous = await getSnapshots();
+  const saved = await Promise.all(selected.map(async (config) => {
+    const snapshot = await collectOneExclusive(config, previous[config.id], {
+      trigger: "page-visit",
+      tabPolicy: "reuse-open-tabs"
+    });
+    return saveCurrentProviderSnapshot(snapshot);
+  }));
+  await syncBadgeFromStorage();
+  return saved.filter(Boolean);
 }
 
-async function refreshAllProviders() {
+function observedPageUrl(message, sender) {
+  const senderUrl = sender?.tab?.url;
+  if (!senderUrl) return "";
+  try {
+    const senderParsed = new URL(senderUrl);
+    const reported = new URL(message?.url || senderUrl);
+    if (!["http:", "https:"].includes(senderParsed.protocol) || senderParsed.origin !== reported.origin) return "";
+    return reported.href;
+  } catch {
+    return "";
+  }
+}
+
+async function refreshAllProviders(context = {}) {
   const configs = await publicConfigs();
   const previous = await getSnapshots();
-  // API providers finish independently; page tabs share a concurrency pool.
-  const apiConfigs = configs.filter((config) => isApiProvider(config));
-  const pageConfigs = configs.filter((config) => !isApiProvider(config));
-  const byId = new Map();
-
-  await Promise.all(apiConfigs.map(async (config) => {
-    byId.set(config.id, await collectOneExclusive(config, previous[config.id]));
-  }));
-
-  await mapPool(pageConfigs, REFRESH_CONCURRENCY, async (config) => {
-    const snapshot = await collectOneExclusive(config, previous[config.id]);
-    byId.set(config.id, snapshot);
-    return snapshot;
+  const providers = await runRefreshBatch({
+    configs,
+    previousSnapshots: previous,
+    context,
+    collect: collectOneExclusive,
+    saveSnapshot: saveCurrentProviderSnapshot
   });
-
-  const providers = configs.map((config) => byId.get(config.id)).filter(Boolean);
-  const savedProviders = await saveCurrentProviderSnapshots(providers);
   await syncBadgeFromStorage();
-  return savedProviders;
+  return providers;
 }
 
-async function refreshAllProvidersExclusive() {
-  if (refreshAllInFlight) return refreshAllInFlight;
-  refreshAllInFlight = refreshAllProviders()
+async function refreshAllProvidersExclusive(context = {}) {
+  const capability = contextCapability(context);
+  if (refreshAllFlight) {
+    if (refreshAllFlight.capability >= capability) return refreshAllFlight.promise;
+    try {
+      await refreshAllFlight.promise;
+    } catch {
+      // Continue with the more capable queued refresh.
+    }
+    return refreshAllProvidersExclusive(context);
+  }
+  const refresh = refreshAllProviders(context)
     .finally(() => {
-      refreshAllInFlight = null;
+      if (refreshAllFlight?.promise === refresh) refreshAllFlight = null;
     });
-  return refreshAllInFlight;
+  refreshAllFlight = { promise: refresh, capability };
+  return refresh;
 }
 
 export async function syncAutoRefreshAlarm(settingsInput) {
@@ -171,10 +212,14 @@ export async function syncAutoRefreshAlarm(settingsInput) {
   return { enabled: true, periodMinutes: settings.autoRefreshMinutes };
 }
 
-async function runAutoRefresh() {
+async function runAutoRefresh(contextInput = null) {
   await markAutoRefreshStarted();
   try {
-    const providers = await refreshAllProvidersExclusive();
+    const context = contextInput || {
+      trigger: "auto",
+      tabPolicy: (await getExtensionSettings()).autoRefreshTabPolicy
+    };
+    const providers = await refreshAllProvidersExclusive(context);
     const settings = await markAutoRefreshCompleted();
     return { providers, settings };
   } catch (error) {
@@ -183,25 +228,8 @@ async function runAutoRefresh() {
   }
 }
 
-async function withServiceWorkerKeepAlive(work) {
-  const ping = () => {
-    try {
-      const pending = chrome.runtime?.getPlatformInfo?.();
-      pending?.catch?.(() => undefined);
-    } catch {
-      // Keep-alive is best effort; the refresh still has persisted timestamps.
-    }
-  };
-  ping();
-  const timer = setInterval(ping, 20_000);
-  try {
-    return await work();
-  } finally {
-    clearInterval(timer);
-  }
-}
-
 async function bootstrap() {
+  await syncVisitObserver(await getProviderConfigs());
   await syncBadgeFromStorage();
   await syncAutoRefreshAlarm();
 }
@@ -223,7 +251,7 @@ chrome.runtime.onStartup?.addListener?.(() => {
 if (globalThis.chrome?.alarms?.onAlarm) {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm?.name !== AUTO_REFRESH_ALARM) return;
-    withServiceWorkerKeepAlive(runAutoRefresh).catch(() => undefined);
+    runAutoRefresh().catch(() => undefined);
   });
 }
 
@@ -235,7 +263,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case "providers:refresh":
         return { provider: await refreshProvider(message.providerId) };
       case "providers:refreshAll":
-        return { providers: await refreshAllProvidersExclusive() };
+        return { providers: await refreshAllProvidersExclusive({
+          trigger: "manual",
+          tabPolicy: "allow-hidden-tabs"
+        }) };
       case "settings:get":
         return { settings: await getExtensionSettings() };
       case "settings:save": {
@@ -247,26 +278,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { configs: await getProviderConfigs() };
       case "config:save": {
         const configs = await mutateConfigs(() => saveProviderConfigs(message.configs || []));
+        await syncVisitObserver(configs);
         await syncBadgeFromStorage();
         return { configs };
       }
       case "config:saveProvider": {
         const provider = await mutateConfigs(() => saveProviderConfig(message.provider));
+        await syncVisitObserver(await getProviderConfigs());
         await syncBadgeFromStorage();
         return { provider };
       }
       case "config:importProvider": {
         const provider = await mutateConfigs(() => importProviderConfig(message.provider));
+        await syncVisitObserver(await getProviderConfigs());
         await syncBadgeFromStorage();
         return { provider };
       }
       case "config:importProviders": {
         const providers = await mutateConfigs(() => importProviderConfigs(message.providers));
+        await syncVisitObserver(await getProviderConfigs());
         await syncBadgeFromStorage();
         return { providers };
       }
       case "config:deleteProvider": {
         const configs = await mutateConfigs(() => deleteProviderConfig(message.providerId));
+        await clearProviderSessionHints(message.providerId);
+        await syncVisitObserver(configs);
         await syncBadgeFromStorage();
         return { configs };
       }
@@ -274,6 +311,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { provider: await exportProviderConfig(message.providerId) };
       case "providers:test":
         return { provider: await testProvider(message.provider || message.providerId) };
+      case "provider:pageObserved": {
+        const pageUrl = observedPageUrl(message, sender);
+        if (!pageUrl) throw new Error("invalid observed provider page");
+        return { providers: await refreshObservedProviders(pageUrl) };
+      }
       case "secret:setDeepSeekKey":
         if (message.value) {
           await setSecret("deepseekApiKey", message.value);
@@ -292,3 +334,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   );
   return true;
 });
+
+// A Manifest V3 worker can stop between provider steps. Session-backed progress
+// lets a fresh worker continue a recent run without repeating completed sources.
+recoverRefreshRun((context) => context.trigger === "auto"
+  ? runAutoRefresh(context)
+  : refreshAllProvidersExclusive(context)).catch(() => undefined);

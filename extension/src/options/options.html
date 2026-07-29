@@ -25,6 +25,14 @@
           <option value="360">每 6 小时</option>
         </select>
       </label>
+      <label>
+        后台页面策略
+        <select id="auto-refresh-tab-policy">
+          <option value="reuse-open-tabs" selected>仅复用已打开页面（推荐）</option>
+          <option value="api-only">仅 API / HTTP</option>
+          <option value="allow-hidden-tabs">允许创建后台标签页</option>
+        </select>
+      </label>
       <p id="auto-refresh-meta" class="empty-state">默认每 30 分钟在后台刷新已启用的 provider，并更新工具栏角标。</p>
     </section>
     <section>
@@ -63,6 +71,10 @@
           <label class="checkbox-label enabled-field">
             <input id="source-enabled" type="checkbox">
             启用
+          </label>
+          <label class="checkbox-label enabled-field">
+            <input id="source-refresh-on-visit" type="checkbox">
+            访问页面时自动更新
           </label>
         </div>
         <input id="source-type" type="hidden" value="page">

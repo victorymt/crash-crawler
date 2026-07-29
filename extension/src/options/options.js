@@ -59,6 +59,7 @@ export function pageProviderTemplate(existingConfigs) {
     type: "page",
     targetUrl: "",
     enabled: true,
+    refreshOnVisit: false,
     secondaryUrls: [],
     mode: "page",
     parserRules: {
@@ -76,6 +77,7 @@ export function duplicateProviderSource(config, existingConfigs) {
   copied.schemaVersion = PROVIDER_SCHEMA_VERSION;
   copied.id = uniqueId(new Set(existingConfigs.map((item) => item.id)), `${config.id}-copy`);
   copied.name = `${config.name} Copy`;
+  copied.refreshOnVisit = false;
   copied.parserRules ||= { loginHints: [], readySelector: "", balances: [], quotas: [], textMetrics: [] };
   return copied;
 }
@@ -270,6 +272,7 @@ function renderEditor() {
   document.getElementById("source-name").value = draftConfig.name || "";
   document.getElementById("source-id").value = draftConfig.id || "";
   document.getElementById("source-enabled").checked = draftConfig.enabled !== false;
+  document.getElementById("source-refresh-on-visit").checked = draftConfig.refreshOnVisit === true;
   document.getElementById("source-type").value = draftConfig.type || "page";
   document.getElementById("source-target-url").value = draftConfig.targetUrl || "";
   document.getElementById("secondary-pages").innerHTML = renderSecondaryPages(draftConfig);
@@ -366,6 +369,7 @@ function readEditorSource() {
     type: document.getElementById("source-type").value || draftConfig?.type || "page",
     targetUrl: document.getElementById("source-target-url").value.trim(),
     enabled: document.getElementById("source-enabled").checked,
+    refreshOnVisit: document.getElementById("source-refresh-on-visit").checked,
     secondaryUrls,
     mode: draftConfig?.mode || "page"
   };
@@ -682,12 +686,19 @@ function formatAutoRefreshMeta(settings) {
   const last = settings?.lastAutoRefreshAt
     ? `最近自动刷新：${new Date(settings.lastAutoRefreshAt).toLocaleString()}`
     : "尚未执行过自动刷新";
-  return `已启用：每 ${minutes} 分钟刷新已启用的 provider，并更新工具栏角标。${last}。`;
+  const policy = ({
+    "reuse-open-tabs": "仅复用已打开页面",
+    "api-only": "仅使用 API / HTTP",
+    "allow-hidden-tabs": "允许创建后台标签页"
+  })[settings?.autoRefreshTabPolicy] || "仅复用已打开页面";
+  return `已启用：每 ${minutes} 分钟刷新已启用的 provider，${policy}，并更新工具栏角标。${last}。`;
 }
 
 function applySettingsToForm(settings) {
   const select = document.getElementById("auto-refresh-minutes");
   if (select) select.value = String(settings?.autoRefreshMinutes ?? 30);
+  const tabPolicy = document.getElementById("auto-refresh-tab-policy");
+  if (tabPolicy) tabPolicy.value = settings?.autoRefreshTabPolicy || "reuse-open-tabs";
   const meta = document.getElementById("auto-refresh-meta");
   if (meta) meta.textContent = formatAutoRefreshMeta(settings);
 }
@@ -707,7 +718,8 @@ async function saveGlobal() {
     const settingsResponse = await sendMessage({
       type: "settings:save",
       settings: {
-        autoRefreshMinutes: Number(document.getElementById("auto-refresh-minutes").value || 0)
+        autoRefreshMinutes: Number(document.getElementById("auto-refresh-minutes").value || 0),
+        autoRefreshTabPolicy: document.getElementById("auto-refresh-tab-policy").value
       }
     });
     configs = updatedConfigs;

@@ -83,6 +83,11 @@ test("EZAICLUB collects subscriptions from the rendered subscriptions page", asy
   assert.equal(snapshot.error, null);
   assert.equal(snapshot.balances[0].value, "88.60");
   assert.equal(snapshot.metrics.some((item) => item.label === "当前套餐" && item.value === "Pro Monthly"), true);
+  assert.equal(snapshot.raw.collection.fallbackUsed, true);
+  assert.deepEqual(
+    snapshot.raw.collection.attempts.map((attempt) => [attempt.strategy, attempt.status]),
+    [["ezaiclub-api", "empty"], ["ezaiclub-page", "ok"]]
+  );
 
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;

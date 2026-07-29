@@ -285,8 +285,8 @@ test("background refreshAll runs providers concurrently and preserves all snapsh
   assert.equal(Object.keys(store.providerSnapshots || {}).length, 3);
   assert.ok(store.providerSnapshots.deepseek);
   assert.ok(store.providerSnapshots["opencode-go"] || store.providerSnapshots.siliconflow);
-  // One batched snapshot write for refreshAll (not N per-provider writes).
-  assert.equal(snapshotWriteCount, 1);
+  // Each provider is persisted as soon as it completes so popup updates stream in.
+  assert.equal(snapshotWriteCount, 3);
   assert.equal(typeof badgeText, "string");
 
   const saved = await send({ type: "settings:save", settings: { autoRefreshMinutes: 15 } });

@@ -49,6 +49,7 @@ test("page provider template generates a unique id", async () => {
   ]);
   assert.equal(template.id, "page-provider-3");
   assert.equal(template.type, "page");
+  assert.equal(template.refreshOnVisit, false);
   assert.equal(template.schemaVersion, 2);
   assert.deepEqual(template.parserRules.quotas, []);
   assert.equal(metricRuleTemplate("quotas").mode, "combined");
@@ -68,6 +69,7 @@ test("page provider template generates a unique id", async () => {
 test("options page uses a structured provider editor", async () => {
   const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
   assert.match(html, /id="source-target-url"/);
+  assert.match(html, /id="source-refresh-on-visit"/);
   assert.match(html, /data-editor-action="add-balance"/);
   assert.match(html, /data-editor-action="add-quota"/);
   assert.doesNotMatch(html, /id="source-json"/);

@@ -143,6 +143,7 @@ main {
 
 .status.ok { color: var(--ok); }
 .status.error, .status.stale, .status.unconfigured { color: var(--bad); }
+.status.needs_visit { color: #ca8a04; }
 
 .recommendation {
   border-radius: 6px;
