@@ -4,6 +4,7 @@ export const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
 export const DEFAULT_EZAICLUB_DASHBOARD_URL = "https://www.ezaiclub.com/dashboard";
 export const DEFAULT_EZAICLUB_SUBSCRIPTIONS_URL = "https://www.ezaiclub.com/subscriptions";
 export const DEFAULT_SILICONFLOW_COUPON_URL = "https://cloud.siliconflow.cn/me/expensebill?tab=coupon";
+export const NEWAPI_QUOTA_PER_UNIT = 500000;
 
 export const DEFAULT_PROVIDER_CONFIGS = [
   {
@@ -54,7 +55,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
 ];
 
 export const PROVIDER_SCHEMA_VERSION = 2;
-export const SUPPORTED_PROVIDER_TYPES = ["page", "opencode", "deepseek", "ezaiclub", "siliconflow"];
+export const SUPPORTED_PROVIDER_TYPES = ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"];
 export const BUILTIN_PROVIDER_IDS = DEFAULT_PROVIDER_CONFIGS.map((config) => config.id);
 
 const MAX_PROVIDERS = 64;
@@ -80,6 +81,156 @@ const WAIT_OPTION_LIMITS = {
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function safeUrl(value) {
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+
+function urlWithPath(value, path) {
+  const parsed = safeUrl(value);
+  if (!parsed) return value;
+  parsed.pathname = path;
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.href;
+}
+
+function isNewApiTemplateRequest(raw) {
+  return ["newapi", "new-api", "oneapi", "one-api"].includes(String(raw?.template || raw?.sourceTemplate || raw?.adapter || "").toLowerCase());
+}
+
+function isSub2ApiTemplateRequest(raw) {
+  return ["sub2api", "sub-2-api", "aihub"].includes(String(raw?.template || raw?.sourceTemplate || raw?.adapter || "").toLowerCase());
+}
+
+function newApiParserRules() {
+  return {
+    loginHints: ["/login", "/user/login", "Sign in to", "Sign up", "用户登录", "登录账号", "登录 / 注册"],
+    readyPattern: "额度|余额|用量|充值|quota|balance|usage|top up|token",
+    balances: [
+      {
+        id: "newapi-balance",
+        label: "剩余额度",
+        pattern: "剩余额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+        valueGroup: 1,
+        currency: "USD",
+        limit: 1
+      }
+    ],
+    quotas: [
+      {
+        id: "newapi-quota-usage",
+        label: "额度用量",
+        pattern: "已用额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)\\s*/\\s*总额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+        usedGroup: 1,
+        limitGroup: 2,
+        currency: "USD",
+        limit: 1
+      }
+    ],
+    textMetrics: [
+      {
+        id: "newapi-request-count",
+        label: "请求次数",
+        pattern: "请求次数\\s*[:：]?\\s*(\\d+)",
+        valueGroup: 1,
+        limit: 1
+      }
+    ]
+  };
+}
+
+function sub2ApiParserRules() {
+  return {
+    loginHints: ["/login", "登录", "用户登录", "Authorization header is required"],
+    readyPattern: "余额|今日请求|总计|今日消费|累计 Token|balance|usage|dashboard|AIHub",
+    balances: [
+      {
+        id: "sub2api-balance",
+        label: "余额",
+        pattern: "^\\$\\s*(\\d+(?:\\.\\d+)?)$",
+        valueGroup: 1,
+        currency: "USD",
+        limit: 1
+      }
+    ],
+    quotas: [],
+    textMetrics: [
+      {
+        id: "sub2api-today-requests",
+        label: "今日请求",
+        pattern: "今日请求\\s*(\\d+)",
+        valueGroup: 1,
+        limit: 1
+      }
+    ]
+  };
+}
+
+function normalizeNewApiParserRules(parserRules) {
+  const defaults = newApiParserRules();
+  return {
+    ...(parserRules || defaults),
+    loginHints: defaults.loginHints
+  };
+}
+
+function normalizeSub2ApiParserRules(parserRules) {
+  return parserRules || sub2ApiParserRules();
+}
+
+function hasParserRuleEntries(parserRules = {}) {
+  return [parserRules.balances, parserRules.quotas, parserRules.textMetrics]
+    .some((rules) => (rules || []).some((rule) => (
+      rule.selector || rule.usedSelector || rule.limitSelector || rule.pattern || rule.valuePattern || rule.staticValue != null
+    )));
+}
+
+function withNewApiTemplate(config, raw) {
+  const targetUrl = config.targetUrl
+    ? urlWithPath(config.targetUrl, safeUrl(config.targetUrl)?.pathname === "/" ? "/dashboard" : safeUrl(config.targetUrl)?.pathname || "/dashboard")
+    : config.targetUrl;
+  const secondaryUrls = config.secondaryUrls.length
+    ? config.secondaryUrls
+    : [{
+        id: "subscriptions",
+        label: "打开订阅页",
+        url: urlWithPath(targetUrl, "/subscriptions")
+      }];
+  return {
+    ...config,
+    type: "newapi",
+    mode: String(raw.mode || "api_then_page"),
+    targetUrl,
+    secondaryUrls,
+    parserRules: normalizeNewApiParserRules(hasParserRuleEntries(config.parserRules) ? config.parserRules : null)
+  };
+}
+
+function withSub2ApiTemplate(config, raw) {
+  const targetUrl = config.targetUrl
+    ? urlWithPath(config.targetUrl, safeUrl(config.targetUrl)?.pathname === "/" ? "/dashboard" : safeUrl(config.targetUrl)?.pathname || "/dashboard")
+    : config.targetUrl;
+  const secondaryUrls = config.secondaryUrls.length
+    ? config.secondaryUrls
+    : [{
+        id: "subscriptions",
+        label: "打开订阅页",
+        url: urlWithPath(targetUrl, "/subscriptions")
+      }];
+  return {
+    ...config,
+    type: "sub2api",
+    mode: String(raw.mode || "api_then_page"),
+    targetUrl,
+    secondaryUrls,
+    parserRules: normalizeSub2ApiParserRules(hasParserRuleEntries(config.parserRules) ? config.parserRules : null)
+  };
 }
 
 function normalizeSecondaryUrls(raw) {
@@ -334,11 +485,14 @@ export function validateProviderConfig(config, existingConfigs = []) {
 export function normalizeProviderConfig(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Provider config must be an object");
   const parserRules = normalizeParserRules(raw.parserRules);
+  const requestedType = raw.type == null || raw.type === ""
+    ? (isNewApiTemplateRequest(raw) ? "newapi" : isSub2ApiTemplateRequest(raw) ? "sub2api" : "")
+    : String(raw.type);
   const config = {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id: raw.id == null ? "" : String(raw.id),
     name: raw.name == null ? String(raw.id || "") : String(raw.name),
-    type: raw.type == null ? "" : String(raw.type),
+    type: requestedType,
     targetUrl: raw.targetUrl || raw.target_url ? String(raw.targetUrl || raw.target_url) : "",
     enabled: raw.enabled !== false,
     refreshOnVisit: raw.refreshOnVisit === true,
@@ -346,6 +500,12 @@ export function normalizeProviderConfig(raw) {
     mode: String(raw.mode || "page"),
     ...(parserRules ? { parserRules } : {})
   };
+  if (config.type === "newapi" || isNewApiTemplateRequest(raw)) {
+    return validateProviderConfig(withNewApiTemplate(config, raw));
+  }
+  if (config.type === "sub2api" || isSub2ApiTemplateRequest(raw)) {
+    return validateProviderConfig(withSub2ApiTemplate(config, raw));
+  }
   return validateProviderConfig(config);
 }
 

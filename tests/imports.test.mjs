@@ -42,7 +42,7 @@ test("normalizeProviderConfig preserves parser rules", async () => {
 });
 
 test("page provider template generates a unique id", async () => {
-  const { metricRuleTemplate, pageProviderTemplate, ruleFormValuesToRule } = await import("../extension/src/options/options.js");
+  const { metricRuleTemplate, newApiProviderTemplate, pageProviderTemplate, ruleFormValuesToRule, sub2ApiProviderTemplate } = await import("../extension/src/options/options.js");
   const template = pageProviderTemplate([
     { id: "page-provider-1" },
     { id: "page-provider-2" }
@@ -52,6 +52,16 @@ test("page provider template generates a unique id", async () => {
   assert.equal(template.refreshOnVisit, false);
   assert.equal(template.schemaVersion, 2);
   assert.deepEqual(template.parserRules.quotas, []);
+  const newApiTemplate = newApiProviderTemplate([{ id: "newapi-1" }]);
+  assert.equal(newApiTemplate.id, "newapi-2");
+  assert.equal(newApiTemplate.type, "newapi");
+  assert.equal(newApiTemplate.mode, "api_then_page");
+  assert.equal(newApiTemplate.parserRules.balances[0].id, "newapi-balance");
+  const sub2ApiTemplate = sub2ApiProviderTemplate([{ id: "sub2api-1" }]);
+  assert.equal(sub2ApiTemplate.id, "sub2api-2");
+  assert.equal(sub2ApiTemplate.type, "sub2api");
+  assert.equal(sub2ApiTemplate.mode, "api_then_page");
+  assert.equal(sub2ApiTemplate.parserRules.balances[0].id, "sub2api-balance");
   assert.equal(metricRuleTemplate("quotas").mode, "combined");
   assert.deepEqual(ruleFormValuesToRule("quotas", "quota-1", {
     label: "月度用量", pageId: "main", mode: "separate", currency: "USDT",
@@ -95,6 +105,19 @@ test("options page exposes auto-refresh interval control", async () => {
   const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
   assert.match(html, /id="auto-refresh-minutes"/);
   assert.match(html, /value="30"/);
+});
+
+test("options page exposes export all sources control", async () => {
+  const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
+  const script = await readFile(new URL("../extension/src/options/options.js", import.meta.url), "utf8");
+  assert.match(html, /id="export-all-sources"/);
+  assert.match(html, /id="add-newapi-provider"/);
+  assert.match(html, /id="add-sub2api-provider"/);
+  assert.match(script, /function exportAllSources/);
+  assert.match(script, /newApiProviderTemplate/);
+  assert.match(script, /sub2ApiProviderTemplate/);
+  assert.match(script, /config:get/);
+  assert.match(script, /providers\.provider\.json/);
 });
 
 test("badgeFromSnapshots prioritizes errors then recharge", async () => {

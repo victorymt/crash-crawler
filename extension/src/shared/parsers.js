@@ -1,4 +1,4 @@
-import { linksForConfig } from "./config.js";
+import { linksForConfig, NEWAPI_QUOTA_PER_UNIT } from "./config.js";
 import {
   balanceMetric,
   nowIso,
@@ -26,6 +26,16 @@ export const SILICONFLOW_LOGIN_HINTS = [
   "Blazing-fast, cost-effective Generative AI cloud services",
   "SiliconFlow Ambassador Program"
 ];
+export const NEWAPI_LOGIN_HINTS = [
+  "/login",
+  "/user/login",
+  "Sign in to",
+  "Sign up",
+  "用户登录",
+  "登录账号",
+  "登录 / 注册"
+];
+export const SUB2API_LOGIN_HINTS = ["/login", "登录", "用户登录", "Authorization header is required"];
 export const OPENCODE_USAGE_TYPES = ["滚动用量", "每周用量", "每月用量"];
 
 export function htmlTokens(html) {
@@ -501,6 +511,310 @@ export function genericPageSnapshot(config, url, parsed) {
     error: metrics.length ? null : "Page loaded, but no configured provider rules matched",
     diagnostics: parsed.diagnostics || [],
     raw: { balance_count: balances.length, usage_count: usage.length, metric_count: metrics.length }
+  };
+}
+
+function quotaUnitsToUsd(value, quotaPerUnit = NEWAPI_QUOTA_PER_UNIT) {
+  const units = Number(value);
+  const perUnit = Number(quotaPerUnit) || NEWAPI_QUOTA_PER_UNIT;
+  if (!Number.isFinite(units)) return null;
+  return units / perUnit;
+}
+
+function newApiSelfData(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload.data && typeof payload.data === "object" ? payload.data : payload;
+  if (data.quota == null && data.used_quota == null) return null;
+  return data;
+}
+
+export function isNewApiSelfPayload(payload) {
+  return Boolean(newApiSelfData(payload));
+}
+
+export function newApiSnapshot(config, url, payload) {
+  const data = newApiSelfData(payload);
+  if (!data) throw new Error("New API self payload did not contain quota fields");
+  const quotaPerUnit = Number(config.quotaPerUnit || config.quota_per_unit || NEWAPI_QUOTA_PER_UNIT);
+  const remainUsd = quotaUnitsToUsd(data.quota, quotaPerUnit);
+  const usedUsd = quotaUnitsToUsd(data.used_quota || 0, quotaPerUnit);
+  const totalUsd = remainUsd == null || usedUsd == null ? null : remainUsd + usedUsd;
+  const balances = [];
+  const usage = [];
+  const textMetrics = [];
+
+  if (remainUsd != null) {
+    balances.push(balanceMetric("balance", "剩余额度", normalizeAmount(remainUsd), "USD"));
+  }
+  if (usedUsd != null && totalUsd != null && totalUsd > 0) {
+    usage.push(usageMetric(
+      "quota_usage",
+      "额度用量",
+      Math.round((usedUsd / totalUsd) * 100),
+      formatQuotaValue(usedUsd, totalUsd, "USD")
+    ));
+  }
+  if (data.request_count != null) {
+    textMetrics.push(textMetric("request_count", "请求次数", String(data.request_count)));
+  }
+  if (data.username || data.display_name) {
+    textMetrics.push(textMetric("account", "账号", String(data.display_name || data.username)));
+  }
+
+  const metrics = [...balances, ...usage, ...textMetrics];
+  return {
+    id: config.id,
+    name: config.name,
+    type: config.type,
+    status: "ok",
+    url,
+    updatedAt: nowIso(),
+    checkedAt: nowIso(),
+    subscribed: null,
+    balances,
+    usage,
+    metrics,
+    links: linksForConfig(config),
+    recommendation: recommendationFromBalances(balances),
+    error: metrics.length ? null : "New API returned an empty user quota payload",
+    raw: {
+      source: "newapi",
+      quota: data.quota ?? null,
+      used_quota: data.used_quota ?? null,
+      quota_per_unit: quotaPerUnit,
+      request_count: data.request_count ?? null
+    }
+  };
+}
+
+function sub2ApiData(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (payload.code === "UNAUTHORIZED" || payload.code === 401) return null;
+  const data = payload.data && typeof payload.data === "object" ? payload.data : payload;
+  return data && typeof data === "object" ? data : null;
+}
+
+function firstPresent(object, keys) {
+  if (!object || typeof object !== "object") return null;
+  for (const key of keys) {
+    if (object[key] != null && object[key] !== "") return object[key];
+  }
+  return null;
+}
+
+function findPresentDeep(object, keys, seen = new WeakSet(), depth = 0) {
+  if (!object || typeof object !== "object" || depth > 4 || seen.has(object)) return null;
+  seen.add(object);
+  const direct = firstPresent(object, keys);
+  if (direct != null) return direct;
+  const values = Array.isArray(object) ? object : Object.values(object);
+  for (const value of values) {
+    const found = findPresentDeep(value, keys, seen, depth + 1);
+    if (found != null) return found;
+  }
+  return null;
+}
+
+export function isSub2ApiAuthPayload(payload) {
+  const data = sub2ApiData(payload);
+  if (!data) return false;
+  return firstPresent(data, ["balance", "frozen_balance", "username", "email", "display_name", "name"]) != null;
+}
+
+function addSub2ApiUsage(usage, key, label, usedRaw, limitRaw) {
+  const used = Number(usedRaw);
+  const limit = Number(limitRaw);
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return;
+  usage.push(usageMetric(
+    key,
+    label,
+    Math.round((used / limit) * 100),
+    formatQuotaValue(used, limit, "USD")
+  ));
+}
+
+function parseSub2ApiCostPair(value) {
+  const match = String(value || "").match(/\$\s*(\d+(?:\.\d+)?)\s*\/\s*\$\s*(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const used = Number(match[1]);
+  const limit = Number(match[2]);
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
+  return {
+    percent: Math.round((used / limit) * 100),
+    value: formatQuotaValue(match[1], match[2], "USD")
+  };
+}
+
+function nextTokenMatching(tokens, start, pattern, lookahead = 4) {
+  for (let idx = start; idx < Math.min(tokens.length, start + lookahead); idx += 1) {
+    const clean = String(tokens[idx] || "").trim();
+    const match = clean.match(pattern);
+    if (match) return { match, idx, token: clean };
+  }
+  return null;
+}
+
+export function parseSub2ApiDashboardTokens(tokens) {
+  const balances = [];
+  const usage = [];
+  const textMetrics = [];
+  const seen = new Set();
+
+  function addBalance(label, raw) {
+    const match = String(raw || "").match(/\$\s*(\d+(?:\.\d+)?)/);
+    if (!match) return;
+    const amount = normalizeAmount(match[1]);
+    const key = `${label}|${amount}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    balances.push(balanceMetric("balance", label, amount, "USD"));
+  }
+
+  function addText(key, label, value) {
+    const clean = String(value || "").trim();
+    if (!clean) return;
+    const seenKey = `${label}|${clean}`;
+    if (seen.has(seenKey)) return;
+    seen.add(seenKey);
+    textMetrics.push(textMetric(key, label, clean));
+  }
+
+  function addUsage(key, label, raw) {
+    const pair = parseSub2ApiCostPair(raw);
+    if (!pair) return;
+    const seenKey = `${label}|${pair.value}`;
+    if (seen.has(seenKey)) return;
+    seen.add(seenKey);
+    usage.push(usageMetric(key, label, pair.percent, pair.value));
+  }
+
+  for (let idx = 0; idx < tokens.length; idx += 1) {
+    const clean = String(tokens[idx] || "").trim();
+    if (clean === "余额") {
+      const found = nextTokenMatching(tokens, idx + 1, /^\$\s*\d+(?:\.\d+)?$/);
+      if (found) addBalance("余额", found.token);
+      continue;
+    }
+    if (clean === "今日请求") {
+      const found = nextTokenMatching(tokens, idx + 1, /^\d+$/);
+      if (found) addText("today_requests", "今日请求", found.token);
+      const total = nextTokenMatching(tokens, found ? found.idx + 1 : idx + 1, /^总计[:：]\s*(\d+)$/);
+      if (total) addText("total_requests", "总请求", total.match[1]);
+      continue;
+    }
+    if (clean === "今日消费") {
+      const today = nextTokenMatching(tokens, idx + 1, /^\$\s*\d+(?:\.\d+)?\s*\/\s*\$\s*\d+(?:\.\d+)?$/);
+      if (today) addUsage("today_cost", "今日消费", today.token);
+      const total = nextTokenMatching(tokens, today ? today.idx + 1 : idx + 1, /^总计[:：]\s*(\$\s*\d+(?:\.\d+)?\s*\/\s*\$\s*\d+(?:\.\d+)?)$/);
+      if (total) addUsage("total_cost", "累计消费", total.match[1]);
+      continue;
+    }
+    if (clean === "今日 Token") {
+      const found = nextTokenMatching(tokens, idx + 1, /^\d+(?:\.\d+)?\s*[KM]?$/i);
+      if (found) addText("today_tokens", "今日 Token", found.token);
+      continue;
+    }
+    if (clean === "累计 Token") {
+      const found = nextTokenMatching(tokens, idx + 1, /^\d+(?:\.\d+)?\s*[KM]?$/i);
+      if (found) addText("total_tokens", "累计 Token", found.token);
+    }
+  }
+
+  return { balances, usage, textMetrics, metrics: [...balances, ...usage, ...textMetrics] };
+}
+
+export function sub2ApiPageSnapshot(config, url, parsed) {
+  const balances = parsed.balances || [];
+  const usage = parsed.usage || [];
+  const textMetrics = parsed.textMetrics || [];
+  const metrics = parsed.metrics || [...balances, ...usage, ...textMetrics];
+  return {
+    id: config.id,
+    name: config.name,
+    type: config.type,
+    status: "ok",
+    url,
+    updatedAt: nowIso(),
+    checkedAt: nowIso(),
+    subscribed: null,
+    balances,
+    usage,
+    metrics,
+    links: linksForConfig(config),
+    recommendation: usage.length ? recommendationFromUsage(usage) : recommendationFromBalances(balances),
+    error: metrics.length ? null : "Sub2API page loaded, but no dashboard metrics were recognized",
+    raw: {
+      source: "sub2api-page",
+      balance_count: balances.length,
+      usage_count: usage.length,
+      metric_count: metrics.length
+    }
+  };
+}
+
+export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null) {
+  const user = sub2ApiData(authPayload);
+  if (!user) throw new Error("Sub2API auth payload did not contain user fields");
+  const stats = sub2ApiData(statsPayload) || {};
+  const balances = [];
+  const usage = [];
+  const textMetrics = [];
+
+  const balance = firstPresent(user, ["balance", "remaining_balance", "available_balance"]);
+  if (balance != null) balances.push(balanceMetric("balance", "余额", normalizeAmount(balance), "USD"));
+  const frozen = firstPresent(user, ["frozen_balance", "frozenBalance"]);
+  if (frozen != null && Number(frozen) > 0) balances.push(balanceMetric("frozen_balance", "冻结余额", normalizeAmount(frozen), "USD"));
+
+  const account = firstPresent(user, ["display_name", "displayName", "username", "name", "email"]);
+  if (account) textMetrics.push(textMetric("account", "账号", String(account)));
+
+  const todayRequests = findPresentDeep(stats, ["today_requests", "todayRequests", "today_request_count", "todayRequestCount"]);
+  const totalRequests = findPresentDeep(stats, ["total_requests", "totalRequests", "total_request_count", "totalRequestCount", "request_count", "requestCount"]);
+  if (todayRequests != null) textMetrics.push(textMetric("today_requests", "今日请求", String(todayRequests)));
+  if (totalRequests != null) textMetrics.push(textMetric("total_requests", "总请求", String(totalRequests)));
+
+  addSub2ApiUsage(
+    usage,
+    "today_cost",
+    "今日消费",
+    findPresentDeep(stats, ["today_actual_cost", "todayActualCost", "today_cost", "todayCost"]),
+    findPresentDeep(stats, ["today_standard_cost", "todayStandardCost", "today_quota_cost", "todayQuotaCost"])
+  );
+  addSub2ApiUsage(
+    usage,
+    "total_cost",
+    "累计消费",
+    findPresentDeep(stats, ["total_actual_cost", "totalActualCost", "total_cost", "totalCost"]),
+    findPresentDeep(stats, ["total_standard_cost", "totalStandardCost", "total_quota_cost", "totalQuotaCost"])
+  );
+
+  const todayTokens = findPresentDeep(stats, ["today_tokens", "todayTokens", "today_total_tokens", "todayTotalTokens"]);
+  const totalTokens = findPresentDeep(stats, ["total_tokens", "totalTokens", "all_tokens", "allTokens"]);
+  if (todayTokens != null) textMetrics.push(textMetric("today_tokens", "今日 Token", String(todayTokens)));
+  if (totalTokens != null) textMetrics.push(textMetric("total_tokens", "累计 Token", String(totalTokens)));
+
+  const metrics = [...balances, ...usage, ...textMetrics];
+  return {
+    id: config.id,
+    name: config.name,
+    type: config.type,
+    status: "ok",
+    url,
+    updatedAt: nowIso(),
+    checkedAt: nowIso(),
+    subscribed: null,
+    balances,
+    usage,
+    metrics,
+    links: linksForConfig(config),
+    recommendation: usage.length ? recommendationFromUsage(usage) : recommendationFromBalances(balances),
+    error: metrics.length ? null : "Sub2API returned an empty dashboard payload",
+    raw: {
+      source: "sub2api",
+      balance: balance ?? null,
+      today_requests: todayRequests ?? null,
+      total_requests: totalRequests ?? null
+    }
   };
 }
 

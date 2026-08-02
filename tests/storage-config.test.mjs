@@ -86,6 +86,50 @@ test("storage imports and exports single provider sources", async () => {
   globalThis.chrome = originalChrome;
 });
 
+test("New API provider configs apply the built-in template", async () => {
+  const { normalizeProviderConfig } = await import(`../extension/src/shared/config.js?newapi=${Date.now()}`);
+  const config = normalizeProviderConfig({
+    id: "newapi-site",
+    name: "New API Site",
+    template: "newapi",
+    targetUrl: "https://api.example.test"
+  });
+
+  assert.equal(config.type, "newapi");
+  assert.equal(config.mode, "api_then_page");
+  assert.equal(config.targetUrl, "https://api.example.test/dashboard");
+  assert.equal(config.secondaryUrls[0].url, "https://api.example.test/subscriptions");
+  assert.equal(config.parserRules.balances[0].id, "newapi-balance");
+  const migrated = normalizeProviderConfig({
+    id: "old-newapi-site",
+    name: "Old New API Site",
+    type: "newapi",
+    targetUrl: "https://api.example.test/dashboard",
+    parserRules: {
+      loginHints: ["New API", "API Key", "令牌"],
+      balances: [{ id: "newapi-balance", label: "剩余额度", pattern: "余额 (\\d+)" }]
+    }
+  });
+  assert.equal(migrated.parserRules.loginHints.includes("API Key"), false);
+  assert.equal(migrated.parserRules.loginHints.includes("令牌"), false);
+});
+
+test("Sub2API provider configs apply the built-in template", async () => {
+  const { normalizeProviderConfig } = await import(`../extension/src/shared/config.js?sub2api=${Date.now()}`);
+  const config = normalizeProviderConfig({
+    id: "aihub",
+    name: "AIHub",
+    template: "aihub",
+    targetUrl: "https://aihub.top/"
+  });
+
+  assert.equal(config.type, "sub2api");
+  assert.equal(config.mode, "api_then_page");
+  assert.equal(config.targetUrl, "https://aihub.top/dashboard");
+  assert.equal(config.secondaryUrls[0].url, "https://aihub.top/subscriptions");
+  assert.equal(config.parserRules.balances[0].id, "sub2api-balance");
+});
+
 test("storage preserves builtin OpenCode workspace URL customizations", async () => {
   const originalChrome = globalThis.chrome;
   const store = {};

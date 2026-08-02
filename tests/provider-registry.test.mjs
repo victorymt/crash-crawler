@@ -16,5 +16,5 @@ test("provider registry validates adapters and preserves registration order", as
 
 test("built-in provider adapters are registered through the public facade", async () => {
   const { providerAdapterTypes } = await import(`../extension/src/providers/index.js?adapter-types=${Date.now()}`);
-  assert.deepEqual(providerAdapterTypes(), ["page", "opencode", "deepseek", "ezaiclub", "siliconflow"]);
+  assert.deepEqual(providerAdapterTypes(), ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"]);
 });

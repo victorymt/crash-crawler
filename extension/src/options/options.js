@@ -72,6 +72,96 @@ export function pageProviderTemplate(existingConfigs) {
   };
 }
 
+export function newApiProviderTemplate(existingConfigs) {
+  const existingIds = new Set(existingConfigs.map((config) => config.id));
+  const id = uniqueId(existingIds, `newapi-${existingConfigs.length + 1}`);
+  return {
+    schemaVersion: PROVIDER_SCHEMA_VERSION,
+    id,
+    name: "New API",
+    type: "newapi",
+    targetUrl: "",
+    enabled: true,
+    refreshOnVisit: false,
+    secondaryUrls: [],
+    mode: "api_then_page",
+    parserRules: {
+      loginHints: ["/login", "/user/login", "Sign in to", "Sign up", "用户登录", "登录账号", "登录 / 注册"],
+      readyPattern: "额度|余额|用量|充值|quota|balance|usage|top up|token",
+      balances: [
+        {
+          id: "newapi-balance",
+          label: "剩余额度",
+          pattern: "剩余额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+          valueGroup: 1,
+          currency: "USD",
+          limit: 1
+        }
+      ],
+      quotas: [
+        {
+          id: "newapi-quota-usage",
+          label: "额度用量",
+          pattern: "已用额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)\\s*/\\s*总额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+          usedGroup: 1,
+          limitGroup: 2,
+          currency: "USD",
+          limit: 1
+        }
+      ],
+      textMetrics: [
+        {
+          id: "newapi-request-count",
+          label: "请求次数",
+          pattern: "请求次数\\s*[:：]?\\s*(\\d+)",
+          valueGroup: 1,
+          limit: 1
+        }
+      ]
+    }
+  };
+}
+
+export function sub2ApiProviderTemplate(existingConfigs) {
+  const existingIds = new Set(existingConfigs.map((config) => config.id));
+  const id = uniqueId(existingIds, `sub2api-${existingConfigs.length + 1}`);
+  return {
+    schemaVersion: PROVIDER_SCHEMA_VERSION,
+    id,
+    name: "AIHub/Sub2API",
+    type: "sub2api",
+    targetUrl: "",
+    enabled: true,
+    refreshOnVisit: false,
+    secondaryUrls: [],
+    mode: "api_then_page",
+    parserRules: {
+      loginHints: ["/login", "登录", "用户登录", "Authorization header is required"],
+      readyPattern: "余额|今日请求|总计|今日消费|累计 Token|balance|usage|dashboard|AIHub",
+      balances: [
+        {
+          id: "sub2api-balance",
+          label: "余额",
+          pattern: "^\\$\\s*(\\d+(?:\\.\\d+)?)$",
+          valueGroup: 1,
+          currency: "USD",
+          limit: 1
+        }
+      ],
+      quotas: [],
+      textMetrics: [
+        {
+          id: "sub2api-today-requests",
+          label: "今日请求",
+          pattern: "今日请求\\s*(\\d+)",
+          valueGroup: 1,
+          limit: 1
+        }
+      ]
+    }
+  };
+}
+
 export function duplicateProviderSource(config, existingConfigs) {
   const copied = clone(config);
   copied.schemaVersion = PROVIDER_SCHEMA_VERSION;
@@ -263,6 +353,7 @@ function renderEditor() {
   if (!draftConfig) return;
   const section = document.getElementById("source-editor-section");
   const builtin = isBuiltinProviderId(draftConfig.id);
+  const fixedAdapter = builtin || draftConfig.type === "newapi" || draftConfig.type === "sub2api";
   section.classList.remove("hidden");
   document.getElementById("editor-title").textContent = editorReadOnly
     ? `查看 ${draftConfig.name}`
@@ -280,8 +371,8 @@ function renderEditor() {
   document.getElementById("source-login-hints").value = (draftConfig.parserRules?.loginHints || []).join("\n");
   document.getElementById("source-ready-selector").value = draftConfig.parserRules?.readySelector || "";
   document.getElementById("builtin-editor-note").classList.toggle("hidden", !builtin || editorReadOnly);
-  document.getElementById("metric-rules-block").classList.toggle("hidden", builtin);
-  document.getElementById("advanced-block").classList.toggle("hidden", builtin);
+  document.getElementById("metric-rules-block").classList.toggle("hidden", fixedAdapter);
+  document.getElementById("advanced-block").classList.toggle("hidden", fixedAdapter);
   const form = document.getElementById("source-form");
   form.querySelectorAll("input, select, textarea").forEach((control) => {
     control.disabled = editorReadOnly;
@@ -601,12 +692,12 @@ async function deleteProvider(providerId) {
   });
 }
 
-function downloadJson(provider) {
-  const blob = new Blob([JSON.stringify(provider, null, 2)], { type: "application/json" });
+function downloadJson(value, filename) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `${provider.id}.provider.json`;
+  anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
 }
@@ -620,11 +711,31 @@ async function exportSource(providerId) {
       await navigator.clipboard.writeText(json);
       setMessage(`${response.provider.name} 书源已复制。`);
     } catch {
-      downloadJson(response.provider);
+      downloadJson(response.provider, `${response.provider.id}.provider.json`);
       setMessage(`${response.provider.name} 书源已下载。`);
     }
     } catch (error) {
       setMessage(error.message || "导出失败", true);
+    }
+  });
+}
+
+async function exportAllSources() {
+  return withOperationLock(async () => {
+    try {
+    const response = await sendMessage({ type: "config:get" });
+    const sources = (response.configs || []).filter((config) => !isBuiltinProviderId(config.id));
+    if (!sources.length) throw new Error("没有可导出的自定义 Provider。");
+    const json = JSON.stringify(sources, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+      setMessage(`已复制 ${sources.length} 个自定义 Provider。`);
+    } catch {
+      downloadJson(sources, "providers.provider.json");
+      setMessage(`已下载 ${sources.length} 个自定义 Provider。`);
+    }
+    } catch (error) {
+      setMessage(error.message || "导出全部失败", true);
     }
   });
 }
@@ -774,6 +885,12 @@ if (typeof document !== "undefined") {
   document.getElementById("add-page-provider").addEventListener("click", () => {
     if (confirmDiscardChanges()) openEditor(pageProviderTemplate(configs), { isNew: true });
   });
+  document.getElementById("add-newapi-provider").addEventListener("click", () => {
+    if (confirmDiscardChanges()) openEditor(newApiProviderTemplate(configs), { isNew: true });
+  });
+  document.getElementById("add-sub2api-provider").addEventListener("click", () => {
+    if (confirmDiscardChanges()) openEditor(sub2ApiProviderTemplate(configs), { isNew: true });
+  });
   document.getElementById("close-editor").addEventListener("click", closeEditor);
   document.getElementById("source-form").addEventListener("submit", saveEditor);
   document.getElementById("delete-source").addEventListener("click", () => deleteProvider(draftOriginalId));
@@ -797,6 +914,7 @@ if (typeof document !== "undefined") {
     if (draftConfig) closeEditor(true);
     document.getElementById("import-panel").classList.remove("hidden");
   });
+  document.getElementById("export-all-sources").addEventListener("click", exportAllSources);
   document.getElementById("close-import").addEventListener("click", () => document.getElementById("import-panel").classList.add("hidden"));
   document.getElementById("choose-import-file").addEventListener("click", () => document.getElementById("import-file").click());
   document.getElementById("import-file").addEventListener("change", async (event) => {

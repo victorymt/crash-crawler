@@ -3,6 +3,8 @@ import {
   NotLoggedInError,
   OPENCODE_LOGIN_HINTS,
   EZAICLUB_LOGIN_HINTS,
+  NEWAPI_LOGIN_HINTS,
+  SUB2API_LOGIN_HINTS,
   SILICONFLOW_LOGIN_HINTS,
   deepseekHttpErrorMessage,
   deriveOpencodeBillingUrl,
@@ -19,12 +21,18 @@ import {
   parseDeepseekBalance,
   parseEzaiclubBalanceTokens,
   parseEzaiclubSubscriptionTokens,
+  isNewApiSelfPayload,
+  isSub2ApiAuthPayload,
+  newApiSnapshot,
   parseOpencodeBalanceTokens,
   parseOpencodeLegacy,
   parseSiliconflowBalanceTokens,
   parseSiliconflowMetricTokens,
+  parseSub2ApiDashboardTokens,
   siliconflowApiSnapshot,
-  siliconflowSnapshot
+  siliconflowSnapshot,
+  sub2ApiPageSnapshot,
+  sub2ApiSnapshot
 } from "../shared/parsers.js";
 import { blankSnapshot } from "../shared/snapshots.js";
 import { getSecret } from "../shared/storage.js";
@@ -42,6 +50,10 @@ const EZAICLUB_AUTH_TOKEN_KEY = "auth_token";
 const EZAICLUB_SESSION_HINT = "authToken";
 const EZAICLUB_SESSION_TTL_MS = 20 * 60 * 1000;
 const EZAICLUB_API_TIMEZONE = "Asia/Shanghai";
+const SUB2API_AUTH_TOKEN_KEY = "auth_token";
+const SUB2API_SESSION_HINT = "authToken";
+const SUB2API_SESSION_TTL_MS = 20 * 60 * 1000;
+const SUB2API_API_TIMEZONE = "Asia/Shanghai";
 const SILICONFLOW_SUBJECT_PROBE = "sf-subject-id";
 const SILICONFLOW_SESSION_HINT = "subjectId";
 const SILICONFLOW_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
@@ -96,6 +108,60 @@ async function fetchJson(url, options = {}) {
       throw new Error(deepseekHttpErrorMessage(response.status));
     }
     return response.json();
+  });
+}
+
+async function fetchNewApiJson(url, options = {}) {
+  return requestWithTimeout(url, {
+    credentials: "include",
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {})
+    }
+  }, async (response) => {
+    const contentType = response.headers?.get?.("content-type") || "";
+    if (response.status === 401 || response.status === 403) {
+      throw new NotLoggedInError("Current browser is not logged in to New API");
+    }
+    if (response.status === 404 || (contentType && !contentType.includes("json"))) return null;
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      return null;
+    }
+    if (!response.ok) {
+      const message = payload?.message || `New API returned HTTP ${response.status}`;
+      throw new Error(message);
+    }
+    return payload;
+  });
+}
+
+async function fetchSub2ApiJson(url, token, providerName = "Sub2API") {
+  return requestWithTimeout(url, {
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`
+    }
+  }, async (response) => {
+    const contentType = response.headers?.get?.("content-type") || "";
+    let payload = null;
+    try {
+      payload = contentType.includes("json") ? await response.json() : null;
+    } catch {
+      payload = null;
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new NotLoggedInError(`Current browser is not logged in to ${providerName}`);
+    }
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      throw new Error(payload?.message || `${providerName} API returned HTTP ${response.status}`);
+    }
+    return payload;
   });
 }
 
@@ -524,43 +590,42 @@ async function readTabLocalStorageKey(tabId, key) {
   }
 }
 
-async function getEzaiclubAuthToken(config, context) {
-  const hintName = scopedSessionHint(EZAICLUB_SESSION_HINT, config.targetUrl);
+async function getLocalStorageSessionValue(config, context, { storageKey, sessionHint, ttlMs }) {
+  const hintName = scopedSessionHint(sessionHint, config.targetUrl);
   const cached = await getSessionHint(config.id, hintName);
   if (cached) return cached;
-  if (!chrome.scripting?.executeScript) return "";
+  const browser = globalThis.chrome;
+  if (!browser?.scripting?.executeScript) return "";
   const origin = new URL(config.targetUrl).origin;
   const target = new URL(config.targetUrl);
 
-  if (chrome.tabs?.query && context.tabPolicy !== TAB_POLICIES.API_ONLY) {
-    const tabs = await chrome.tabs.query({ url: `${origin}/*` });
+  if (browser.tabs?.query && context.tabPolicy !== TAB_POLICIES.API_ONLY) {
+    const tabs = await browser.tabs.query({ url: `${origin}/*` });
     const ranked = [...tabs]
       .filter((tab) => tab.id != null && tab.url)
       .sort((left, right) => tabMatchScore(right.url, target) - tabMatchScore(left.url, target));
     for (const tab of ranked) {
-      const token = await readTabLocalStorageKey(tab.id, EZAICLUB_AUTH_TOKEN_KEY);
-      if (token) {
-        await setSessionHint(config.id, hintName, token, EZAICLUB_SESSION_TTL_MS);
-        return token;
+      const value = await readTabLocalStorageKey(tab.id, storageKey);
+      if (value) {
+        await setSessionHint(config.id, hintName, value, ttlMs);
+        return value;
       }
     }
   }
 
-  // No usable open tab: open dashboard briefly only to read localStorage (no long DOM wait).
-  if (!chrome.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return "";
+  if (!browser.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return "";
   let tabId = null;
   try {
-    const tab = await chrome.tabs.create({ url: config.targetUrl, active: false });
+    const tab = await browser.tabs.create({ url: config.targetUrl, active: false });
     tabId = tab.id ?? null;
     if (tabId == null) return "";
     await notifyCollectionContext(context, "onTabCreated", tabId, config.targetUrl);
     await waitForTabComplete(tabId, 15000);
-    // SPA writes auth_token after boot; poll briefly instead of full render scrape.
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      const token = await readTabLocalStorageKey(tabId, EZAICLUB_AUTH_TOKEN_KEY);
-      if (token) {
-        await setSessionHint(config.id, hintName, token, EZAICLUB_SESSION_TTL_MS);
-        return token;
+      const value = await readTabLocalStorageKey(tabId, storageKey);
+      if (value) {
+        await setSessionHint(config.id, hintName, value, ttlMs);
+        return value;
       }
       await delay(300);
     }
@@ -571,13 +636,21 @@ async function getEzaiclubAuthToken(config, context) {
     if (tabId != null) {
       const closingTabId = tabId;
       try {
-        await chrome.tabs.remove(tabId);
+        await browser.tabs.remove(tabId);
       } catch {
         // Tab may already be closed.
       }
       await notifyCollectionContext(context, "onTabClosed", closingTabId);
     }
   }
+}
+
+async function getEzaiclubAuthToken(config, context) {
+  return getLocalStorageSessionValue(config, context, {
+    storageKey: EZAICLUB_AUTH_TOKEN_KEY,
+    sessionHint: EZAICLUB_SESSION_HINT,
+    ttlMs: EZAICLUB_SESSION_TTL_MS
+  });
 }
 
 async function fetchEzaiclubJson(url, token) {
@@ -883,6 +956,205 @@ function hasSelectorRules(parserRules = {}) {
     .some((rules) => (rules || []).some((rule) => rule.selector || rule.usedSelector || rule.limitSelector));
 }
 
+function hasConfiguredParserRules(parserRules = {}) {
+  return [parserRules.balances, parserRules.quotas, parserRules.textMetrics]
+    .some((rules) => (rules || []).some((rule) => (
+      rule.selector || rule.usedSelector || rule.limitSelector || rule.pattern || rule.valuePattern || rule.staticValue != null
+    )));
+}
+
+function sameOriginUrl(config, path) {
+  const parsed = new URL(config.targetUrl);
+  parsed.pathname = path;
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.href;
+}
+
+async function collectNewApiViaApi(config, { probe = false } = {}) {
+  let payload;
+  try {
+    payload = await fetchNewApiJson(sameOriginUrl(config, "/api/user/self"));
+  } catch (error) {
+    if (probe) return null;
+    if (error instanceof NotLoggedInError) {
+      throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
+    }
+    throw error;
+  }
+  if (!payload || !isNewApiSelfPayload(payload)) return null;
+  return newApiSnapshot(config, sameOriginUrl(config, "/dashboard"), payload);
+}
+
+function withNewApiFallbackRules(config) {
+  if (hasConfiguredParserRules(config.parserRules)) return config;
+  return {
+    ...config,
+    parserRules: {
+      loginHints: NEWAPI_LOGIN_HINTS,
+      readyPattern: "额度|余额|用量|充值|quota|balance|usage|top up|token",
+      balances: [{
+        id: "newapi-balance",
+        label: "剩余额度",
+        pattern: "剩余额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+        valueGroup: 1,
+        currency: "USD",
+        limit: 1
+      }],
+      quotas: [{
+        id: "newapi-quota-usage",
+        label: "额度用量",
+        pattern: "已用额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)\\s*/\\s*总额度\\s*[:：]?\\s*[$]?\\s*(\\d+(?:\\.\\d+)?)",
+        usedGroup: 1,
+        limitGroup: 2,
+        currency: "USD",
+        limit: 1
+      }],
+      textMetrics: [{
+        id: "newapi-request-count",
+        label: "请求次数",
+        pattern: "请求次数\\s*[:：]?\\s*(\\d+)",
+        valueGroup: 1,
+        limit: 1
+      }]
+    }
+  };
+}
+
+async function collectNewApi(config, context) {
+  let authenticationError = null;
+  try {
+    const apiSnapshot = await context.runAttempt(
+      "newapi-api",
+      "network",
+      () => collectNewApiViaApi(config)
+    );
+    if (apiSnapshot) return apiSnapshot;
+  } catch (error) {
+    if (error instanceof NotLoggedInError) authenticationError = error;
+  }
+  try {
+    return await context.runAttempt(
+      "newapi-page",
+      "page",
+      () => collectGenericPage(withNewApiFallbackRules(config), context)
+    );
+  } catch (error) {
+    if (authenticationError && error instanceof NotLoggedInError) throw authenticationError;
+    throw error;
+  }
+}
+
+async function getSub2ApiAuthToken(config, context) {
+  return getLocalStorageSessionValue(config, context, {
+    storageKey: SUB2API_AUTH_TOKEN_KEY,
+    sessionHint: SUB2API_SESSION_HINT,
+    ttlMs: SUB2API_SESSION_TTL_MS
+  });
+}
+
+async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
+  const token = await getSub2ApiAuthToken(config, context);
+  if (!token) {
+    if (probe) return null;
+    throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
+  }
+  try {
+    const timezone = encodeURIComponent(SUB2API_API_TIMEZONE);
+    const origin = new URL(config.targetUrl).origin;
+    const authUrl = `${origin}/api/v1/auth/me?timezone=${timezone}`;
+    const statsUrl = `${origin}/api/v1/usage/dashboard/stats?timezone=${timezone}`;
+    const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
+    if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
+    let statsPayload = null;
+    try {
+      statsPayload = await fetchSub2ApiJson(statsUrl, token, config.name);
+    } catch (error) {
+      if (error instanceof NotLoggedInError) throw error;
+    }
+    return sub2ApiSnapshot(config, sameOriginUrl(config, "/dashboard"), authPayload, statsPayload);
+  } catch (error) {
+    if (error instanceof NotLoggedInError) {
+      await deleteSessionHint(config.id, scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl));
+      if (probe) return null;
+    }
+    throw error;
+  }
+}
+
+async function collectSub2ApiViaPage(config, context) {
+  const page = await tokensFromUrl(
+    config.targetUrl,
+    SUB2API_LOGIN_HINTS,
+    `Current browser is not logged in to ${config.name}`,
+    {
+      renderFallback: true,
+      requirePathMatch: true,
+      waitOptions: {
+        ...DEFAULT_RENDER_WAIT_OPTIONS,
+        readyPattern: "余额|今日请求|今日消费|累计 Token|AIHub|balance|usage"
+      },
+      collectionContext: context,
+      shouldUseRenderedTokens: (tokens) => !parseSub2ApiDashboardTokens(tokens).metrics.length
+    }
+  );
+  return sub2ApiPageSnapshot(config, page.url, parseSub2ApiDashboardTokens(page.tokens));
+}
+
+async function collectSub2Api(config, context) {
+  let authenticationError = null;
+  try {
+    const apiSnapshot = await context.runAttempt(
+      "sub2api-api",
+      "network",
+      () => collectSub2ApiViaApi(config, context)
+    );
+    if (apiSnapshot) return apiSnapshot;
+  } catch (error) {
+    if (error instanceof NotLoggedInError) authenticationError = error;
+  }
+  try {
+    return await context.runAttempt(
+      "sub2api-page",
+      "page",
+      () => collectSub2ApiViaPage(config, context)
+    );
+  } catch (error) {
+    if (authenticationError && error instanceof NotLoggedInError) throw authenticationError;
+    throw error;
+  }
+}
+
+async function collectPageProvider(config, context) {
+  if (!hasConfiguredParserRules(config.parserRules)) {
+    try {
+      const apiSnapshot = await context.runAttempt(
+        "newapi-auto",
+        "network",
+        () => collectNewApiViaApi(config, { probe: true })
+      );
+      if (apiSnapshot) return apiSnapshot;
+    } catch {
+      // Non-New API pages continue through the generic page collector.
+    }
+    try {
+      const apiSnapshot = await context.runAttempt(
+        "sub2api-auto",
+        "network",
+        () => collectSub2ApiViaApi(config, context, { probe: true })
+      );
+      if (apiSnapshot) return apiSnapshot;
+    } catch {
+      // Non-Sub2API pages continue through the generic page collector.
+    }
+  }
+  return context.runAttempt(
+    "generic-page",
+    "page",
+    () => collectGenericPage(config, context)
+  );
+}
+
 function mergeGenericParsed(left, right) {
   const balances = [...(left.balances || []), ...(right.balances || [])];
   const usage = [...(left.usage || []), ...(right.usage || [])];
@@ -965,13 +1237,7 @@ async function ensureProviderPermission(config) {
 }
 
 const providerAdapters = createProviderRegistry([
-  ["page", {
-    collect: (config, context) => context.runAttempt(
-      "generic-page",
-      "page",
-      () => collectGenericPage(config, context)
-    )
-  }],
+  ["page", { collect: collectPageProvider }],
   ["opencode", {
     collect: (config, context) => context.runAttempt(
       "opencode-http-or-page",
@@ -987,7 +1253,9 @@ const providerAdapters = createProviderRegistry([
     )
   }],
   ["ezaiclub", { collect: collectEzaiclub }],
-  ["siliconflow", { collect: collectSiliconFlow }]
+  ["siliconflow", { collect: collectSiliconFlow }],
+  ["newapi", { collect: collectNewApi }],
+  ["sub2api", { collect: collectSub2Api }]
 ]);
 
 export function providerAdapterTypes() {
