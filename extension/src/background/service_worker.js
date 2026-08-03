@@ -1,4 +1,4 @@
-import { normalizeProviderConfig } from "../shared/config.js";
+import { linksForConfig, normalizeProviderConfig } from "../shared/config.js";
 import { summarizeChannelRefresh } from "../shared/channels.js";
 import { badgeFromSnapshots, blankSnapshot, errorSnapshot, preservePreviousChannels } from "../shared/snapshots.js";
 import {
@@ -19,7 +19,7 @@ import {
   saveCurrentProviderSnapshot,
   setSecret
 } from "../shared/storage.js";
-import { channelProviderConfigs, collectProvider } from "../providers/index.js";
+import { channelProviderConfigs, collectProvider, detectProvider } from "../providers/index.js";
 import { clearProviderSessionHints } from "../providers/session_cache.js";
 import { recoverRefreshRun, runRefreshBatch } from "./refresh_runner.js";
 import { configsForObservedUrl, syncVisitObserver } from "./visit_observer.js";
@@ -129,6 +129,119 @@ async function testProvider(providerInput) {
     : normalizeProviderConfig(providerInput);
   if (!config) throw new Error(`unknown provider: ${providerInput}`);
   return collectProvider(config, { trigger: "test", tabPolicy: "allow-hidden-tabs" });
+}
+
+function providerOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin : "";
+  } catch {
+    return "";
+  }
+}
+
+function configForOrigin(configs, origin) {
+  return (configs || []).find((config) => providerOrigin(config?.targetUrl) === origin) || null;
+}
+
+function providerNameForPage(page, parsed) {
+  const title = String(page?.title || "").trim().replace(/\s+/g, " ");
+  if (!title) return parsed.hostname.replace(/^www\./, "");
+  const parts = title.split(/\s+[|·–—-]\s+/).filter(Boolean);
+  const hostLabel = parsed.hostname.replace(/^www\./, "").split(".")[0].toLowerCase();
+  const matching = parts.find((part) => part.toLowerCase().includes(hostLabel));
+  return String(matching || parts.at(-1) || title).slice(0, 200);
+}
+
+function uniqueProviderId(configs, hostname) {
+  const base = hostname.replace(/^www\./, "").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").slice(0, 110) || "provider";
+  const ids = new Set((configs || []).map((config) => config.id));
+  if (!ids.has(base)) return base;
+  let suffix = 2;
+  while (ids.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
+}
+
+function detectedSnapshotForProvider(snapshot, provider) {
+  return {
+    ...snapshot,
+    id: provider.id,
+    name: provider.name,
+    type: provider.type,
+    links: linksForConfig(provider),
+    channels: (snapshot.channels || []).map((channel) => ({
+      ...channel,
+      providerId: provider.id,
+      providerName: provider.name
+    }))
+  };
+}
+
+async function addDetectedProvider(page) {
+  const origin = providerOrigin(page?.url);
+  if (!origin) throw new Error("当前页面不是可添加的 HTTP/HTTPS 网站");
+  const parsed = new URL(page.url);
+  const before = await getProviderConfigs();
+  const existing = configForOrigin(before, origin);
+  if (existing && existing.type !== "page") {
+    return {
+      provider: existing,
+      snapshot: (await getSnapshots())[existing.id] || null,
+      added: false,
+      upgraded: false,
+      detectedType: existing.type
+    };
+  }
+
+  const probeConfig = normalizeProviderConfig({
+    id: existing?.id || uniqueProviderId(before, parsed.hostname),
+    name: existing?.name || providerNameForPage(page, parsed),
+    type: "page",
+    targetUrl: parsed.href,
+    enabled: true,
+    refreshOnVisit: true,
+    rechargeRatio: 1,
+    mode: "page"
+  });
+  const detected = await detectProvider(probeConfig, {
+    trigger: "add-current-page",
+    tabPolicy: "reuse-open-tabs"
+  });
+  if (!detected) {
+    throw new Error("未识别为支持的 NewAPI/Sub2API 中转站，请确认当前页面已登录");
+  }
+
+  const savedResult = await mutateConfigs(async () => {
+    const current = await getProviderConfigs();
+    const duplicate = configForOrigin(current, origin);
+    if (duplicate && duplicate.type !== "page") {
+      return { provider: duplicate, added: false, upgraded: false };
+    }
+    const previous = duplicate || probeConfig;
+    const provider = normalizeProviderConfig({
+      id: duplicate?.id || uniqueProviderId(current, parsed.hostname),
+      name: previous.name,
+      type: detected.type,
+      targetUrl: new URL("/dashboard", origin).href,
+      enabled: previous.enabled !== false,
+      refreshOnVisit: previous.refreshOnVisit ?? true,
+      rechargeRatio: previous.rechargeRatio ?? 1
+    });
+    return {
+      provider: await saveProviderConfig(provider),
+      added: !duplicate,
+      upgraded: Boolean(duplicate)
+    };
+  });
+  if (!savedResult.added && !savedResult.upgraded) {
+    return { ...savedResult, snapshot: (await getSnapshots())[savedResult.provider.id] || null };
+  }
+
+  const snapshot = detectedSnapshotForProvider(detected.snapshot, savedResult.provider);
+  await saveCurrentProviderSnapshot(snapshot);
+  await syncVisitObserver(await getProviderConfigs());
+  await syncBadgeFromStorage();
+  return { ...savedResult, snapshot, detectedType: detected.type };
 }
 
 async function refreshObservedProviders(pageUrl) {
@@ -341,6 +454,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { provider: await exportProviderConfig(message.providerId) };
       case "providers:test":
         return { provider: await testProvider(message.provider || message.providerId) };
+      case "providers:addCurrentPage":
+        return addDetectedProvider(message.page || {});
       case "provider:pageObserved": {
         const pageUrl = observedPageUrl(message, sender);
         if (!pageUrl) throw new Error("invalid observed provider page");

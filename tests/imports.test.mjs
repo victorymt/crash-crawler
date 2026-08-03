@@ -101,6 +101,7 @@ test("manifest declares optional host permissions for user sources", async () =>
   assert.ok(manifest.icons["128"]);
   assert.ok(manifest.action.default_icon["32"]);
   assert.ok(manifest.permissions.includes("alarms"));
+  assert.ok(manifest.permissions.includes("activeTab"));
   assert.equal(manifest.permissions.includes("tabs"), false);
 });
 
@@ -126,6 +127,16 @@ test("channel ranking lives on a dedicated extension page", async () => {
   assert.match(channelsScript, /statusTimelineHtml/);
   assert.match(channelsScript, /settings:save/);
   assert.match(channelsScript, /providers:refreshChannels/);
+});
+
+test("popup can detect and add the current relay site", async () => {
+  const html = await readFile(new URL("../extension/src/popup/popup.html", import.meta.url), "utf8");
+  const script = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
+
+  assert.match(html, /id="add-current-page"/);
+  assert.match(script, /chrome\.tabs\.query\(\{ active: true, currentWindow: true \}\)/);
+  assert.match(script, /chrome\.permissions\.request/);
+  assert.match(script, /providers:addCurrentPage/);
 });
 
 test("options page exposes export all sources control", async () => {

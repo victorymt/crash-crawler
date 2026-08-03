@@ -1,6 +1,8 @@
 let configs = [];
 let snapshots = [];
 let activeOperation = false;
+let providersLoaded = false;
+let currentPage = null;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -25,9 +27,40 @@ function setMessage(message, isError = false) {
 
 function setControlsDisabled(disabled) {
   document.getElementById("refresh-all").disabled = disabled;
+  const addButton = document.getElementById("add-current-page");
+  const existing = providerForCurrentPage();
+  addButton.textContent = existing?.type === "page"
+    ? "识别 Provider"
+    : existing
+      ? "已在 Provider"
+      : "添加到 Provider";
+  addButton.disabled = disabled || !providersLoaded || !currentPage || Boolean(existing && existing.type !== "page");
   document.querySelectorAll("[data-refresh-provider]").forEach((button) => {
     button.disabled = disabled;
   });
+}
+
+function pageOrigin(value) {
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin : "";
+  } catch {
+    return "";
+  }
+}
+
+function providerForCurrentPage() {
+  const origin = pageOrigin(currentPage?.url);
+  return origin ? configs.find((config) => pageOrigin(config.targetUrl) === origin) : null;
+}
+
+async function loadCurrentPage() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const origin = pageOrigin(tab?.url);
+  currentPage = origin ? { url: tab.url, title: tab.title || new URL(tab.url).hostname } : null;
+  const button = document.getElementById("add-current-page");
+  button.title = currentPage ? `添加 ${new URL(currentPage.url).hostname}` : "当前页面不可添加";
+  setControlsDisabled(activeOperation);
 }
 
 function escapeHtml(value) {
@@ -151,9 +184,41 @@ async function loadStatus() {
   const data = await sendMessage({ type: "providers:list" });
   configs = data.configs;
   snapshots = data.providers;
+  providersLoaded = true;
   render();
   const hint = autoRefreshHint(data.settings);
   if (hint) setMessage(hint);
+}
+
+function detectedTypeLabel(type) {
+  return ({ newapi: "NewAPI", sub2api: "Sub2API" })[type] || type || "Provider";
+}
+
+async function addCurrentPage() {
+  const existing = providerForCurrentPage();
+  if (activeOperation || !currentPage || (existing && existing.type !== "page")) return;
+  activeOperation = true;
+  setControlsDisabled(true);
+  const hostname = new URL(currentPage.url).hostname;
+  setMessage(`正在识别 ${hostname}...`);
+  try {
+    const origin = `${new URL(currentPage.url).origin}/*`;
+    if (!await chrome.permissions.request({ origins: [origin] })) {
+      throw new Error(`未获得站点访问权限：${origin}`);
+    }
+    const data = await sendMessage({ type: "providers:addCurrentPage", page: currentPage });
+    await loadStatus();
+    setMessage(data.upgraded
+      ? `${data.provider.name} 已识别为 ${detectedTypeLabel(data.detectedType)}`
+      : data.added
+        ? `${data.provider.name} 已添加为 ${detectedTypeLabel(data.detectedType)}`
+        : `${data.provider.name} 已在 Provider 中`);
+  } catch (error) {
+    setMessage(error.message || "当前页面添加失败", true);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+  }
 }
 
 if (chrome.storage?.onChanged) {
@@ -231,6 +296,7 @@ async function refreshAll() {
 }
 
 document.getElementById("refresh-all").addEventListener("click", refreshAll);
+document.getElementById("add-current-page").addEventListener("click", addCurrentPage);
 document.getElementById("open-all").addEventListener("click", () => {
   configs.forEach((config) => chrome.tabs.create({ url: config.targetUrl, active: false }));
 });
@@ -239,4 +305,4 @@ document.getElementById("channels").addEventListener("click", () => {
 });
 document.getElementById("options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-loadStatus().catch((error) => setMessage(error.message, true));
+Promise.all([loadStatus(), loadCurrentPage()]).catch((error) => setMessage(error.message, true));

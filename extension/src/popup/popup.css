@@ -79,6 +79,8 @@ button:disabled {
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
 }
 
@@ -247,6 +249,7 @@ main {
 @media (max-width: 620px) {
   body { width: 100vw; }
   header { grid-template-columns: 1fr; }
+  .toolbar { justify-content: flex-start; }
   .provider-list { grid-template-columns: 1fr; }
   .amount-grid { grid-template-columns: 1fr; }
 }

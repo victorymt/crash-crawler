@@ -1166,28 +1166,34 @@ async function collectSub2Api(config, context) {
   }
 }
 
+async function probeKnownPageProvider(config, context) {
+  try {
+    const apiSnapshot = await context.runAttempt(
+      "newapi-auto",
+      "network",
+      () => collectNewApiViaApi(config, { probe: true })
+    );
+    if (apiSnapshot) return apiSnapshot;
+  } catch {
+    // Continue probing other supported relay APIs.
+  }
+  try {
+    const apiSnapshot = await context.runAttempt(
+      "sub2api-auto",
+      "network",
+      () => collectSub2ApiViaApi(config, context, { probe: true })
+    );
+    if (apiSnapshot) return apiSnapshot;
+  } catch {
+    // Unsupported sites are handled by the caller.
+  }
+  return null;
+}
+
 async function collectPageProvider(config, context) {
   if (!hasConfiguredParserRules(config.parserRules)) {
-    try {
-      const apiSnapshot = await context.runAttempt(
-        "newapi-auto",
-        "network",
-        () => collectNewApiViaApi(config, { probe: true })
-      );
-      if (apiSnapshot) return apiSnapshot;
-    } catch {
-      // Non-New API pages continue through the generic page collector.
-    }
-    try {
-      const apiSnapshot = await context.runAttempt(
-        "sub2api-auto",
-        "network",
-        () => collectSub2ApiViaApi(config, context, { probe: true })
-      );
-      if (apiSnapshot) return apiSnapshot;
-    } catch {
-      // Non-Sub2API pages continue through the generic page collector.
-    }
+    const apiSnapshot = await probeKnownPageProvider(config, context);
+    if (apiSnapshot) return apiSnapshot;
   }
   return context.runAttempt(
     "generic-page",
@@ -1310,6 +1316,15 @@ export function providerSupportsChannels(type) {
 export function channelProviderConfigs(configs) {
   return (Array.isArray(configs) ? configs : [])
     .filter((config) => config?.enabled !== false && providerSupportsChannels(config?.type));
+}
+
+export async function detectProvider(config, contextInput = {}) {
+  const context = createCollectionContext(contextInput);
+  await ensureProviderPermission(config);
+  const snapshot = await probeKnownPageProvider(config, context);
+  const type = snapshot?.raw?.source;
+  if (!snapshot || !["newapi", "sub2api"].includes(type)) return null;
+  return { type, snapshot: attachCollectionDiagnostics(snapshot, context) };
 }
 
 export async function collectProvider(config, contextInput = {}) {

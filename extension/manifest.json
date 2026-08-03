@@ -27,7 +27,8 @@
   "permissions": [
     "storage",
     "scripting",
-    "alarms"
+    "alarms",
+    "activeTab"
   ],
   "host_permissions": [
     "https://opencode.ai/*",
