@@ -139,6 +139,40 @@ async function fetchNewApiJson(url, options = {}) {
   });
 }
 
+async function refreshNewApiSession(url) {
+  const refreshUrl = new URL("/api/user/auth/refresh", url).href;
+  return requestWithTimeout(refreshUrl, {
+    method: "POST",
+    credentials: "include",
+    headers: { Accept: "application/json" }
+  }, async (response) => {
+    const contentType = response.headers?.get?.("content-type") || "";
+    if (response.status === 401 || response.status === 403 || response.status === 404) return null;
+    if (contentType && !contentType.includes("json")) return null;
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      return null;
+    }
+    if (!response.ok) return null;
+    const data = payload?.data;
+    const token = data?.access_token;
+    if (!token) return null;
+    const headers = { Authorization: `Bearer ${token}` };
+    const userId = data?.user?.id;
+    if (userId != null) headers["New-Api-User"] = String(userId);
+    return headers;
+  });
+}
+
+function isNewApiStatusPayload(payload) {
+  const data = payload?.data;
+  if (!data || typeof data !== "object") return false;
+  return ["system_name", "quota_per_unit", "version", "start_time"]
+    .some((key) => Object.hasOwn(data, key));
+}
+
 async function fetchSub2ApiJson(url, token, providerName = "Sub2API") {
   return requestWithTimeout(url, {
     credentials: "include",
@@ -988,15 +1022,37 @@ function sameOriginUrl(config, path) {
 }
 
 async function collectNewApiViaApi(config, { probe = false } = {}) {
+  const selfUrl = sameOriginUrl(config, "/api/user/self");
   let payload;
   try {
-    payload = await fetchNewApiJson(sameOriginUrl(config, "/api/user/self"));
+    payload = await fetchNewApiJson(selfUrl);
   } catch (error) {
-    if (probe) return null;
-    if (error instanceof NotLoggedInError) {
+    if (!(error instanceof NotLoggedInError)) {
+      if (probe) return null;
+      throw error;
+    }
+    if (probe) {
+      try {
+        const status = await fetchNewApiJson(sameOriginUrl(config, "/api/status"));
+        if (!isNewApiStatusPayload(status)) return null;
+      } catch {
+        return null;
+      }
+    }
+    const sessionHeaders = await refreshNewApiSession(selfUrl);
+    if (!sessionHeaders) {
+      if (probe) return null;
       throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
     }
-    throw error;
+    try {
+      payload = await fetchNewApiJson(selfUrl, { headers: sessionHeaders });
+    } catch (retryError) {
+      if (probe && retryError instanceof NotLoggedInError) return null;
+      if (retryError instanceof NotLoggedInError) {
+        throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
+      }
+      throw retryError;
+    }
   }
   if (!payload || !isNewApiSelfPayload(payload)) return null;
   return newApiSnapshot(config, sameOriginUrl(config, "/dashboard"), payload);

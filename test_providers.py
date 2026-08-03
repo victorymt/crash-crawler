@@ -7,6 +7,7 @@ from providers import (
     EZAICLUBProvider,
     GenericPageProvider,
     NewAPIProvider,
+    NotLoggedInError,
     ProviderConfig,
     ProviderManager,
     SiliconFlowProvider,
@@ -243,6 +244,101 @@ class ProviderParserTests(unittest.TestCase):
         self.assertIsInstance(manager.get_provider("siliconflow"), SiliconFlowProvider)
         self.assertIsInstance(manager.get_provider("newapi"), NewAPIProvider)
         self.assertIsInstance(manager.get_provider("sub2api"), Sub2APIProvider)
+
+    def test_newapi_provider_uses_authenticated_response_captured_during_load(self):
+        config = ProviderConfig(
+            id="newapi",
+            name="New API",
+            type="newapi",
+            target_url="https://newapi.example/dashboard/overview",
+        )
+        provider = NewAPIProvider(config)
+        responses = [
+            {
+                "url": "https://newapi.example/api/user/self",
+                "status": 401,
+                "data": {"success": False, "message": "unauthorized"},
+            },
+            {
+                "url": "https://newapi.example/api/user/self?after-refresh=1",
+                "status": 200,
+                "data": {
+                    "success": True,
+                    "data": {
+                        "username": "alice",
+                        "quota": 2500000,
+                        "used_quota": 500000,
+                        "request_count": 12,
+                    },
+                },
+            },
+        ]
+
+        class FakeBrowser:
+            def page(self):
+                return object()
+
+        provider.goto_with_json = lambda *_args, **_kwargs: (
+            config.target_url,
+            [],
+            responses,
+        )
+
+        def fail_direct_request(*_args, **_kwargs):
+            raise AssertionError("captured authenticated response should avoid a direct API request")
+
+        provider.page_api_json = fail_direct_request
+        snapshot = provider.fetch(browser=FakeBrowser())
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["balances"][0]["value"], "5.00")
+        self.assertEqual(snapshot["usage"][0]["value"], "$1.00 / $6.00")
+        self.assertTrue(any(item.get("value") == "alice" for item in snapshot["metrics"]))
+
+    def test_captured_json_response_reports_latest_unauthorized_response(self):
+        provider = NewAPIProvider(ProviderConfig(
+            id="newapi",
+            name="New API",
+            type="newapi",
+            target_url="https://newapi.example/dashboard",
+        ))
+        with self.assertRaises(NotLoggedInError):
+            provider.captured_json_response([
+                {
+                    "url": "https://newapi.example/api/user/self",
+                    "status": 401,
+                    "data": {"success": False},
+                }
+            ], "/api/user/self")
+
+    def test_newapi_session_refresh_fallback_returns_self_payload(self):
+        provider = NewAPIProvider(ProviderConfig(
+            id="newapi",
+            name="New API",
+            type="newapi",
+            target_url="https://newapi.example/dashboard",
+        ))
+
+        class FakePage:
+            def evaluate(self, script, url):
+                self.script = script
+                self.url = url
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "data": {"data": {"quota": 500000, "used_quota": 0}},
+                }
+
+        page = FakePage()
+        payload = provider.page_api_json_with_session_refresh(
+            page,
+            "https://newapi.example/api/user/self",
+        )
+
+        self.assertEqual(payload["data"]["quota"], 500000)
+        self.assertIn("/api/user/auth/refresh", page.script)
+        self.assertIn("New-Api-User", page.script)
+        self.assertEqual(page.url, "https://newapi.example/api/user/self")
 
     def test_provider_config_accepts_extension_field_names(self):
         config = ProviderConfig.from_dict({

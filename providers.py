@@ -2171,7 +2171,11 @@ class BrowserJsonProvider(Provider):
                 content_type = response.headers.get("content-type", "")
                 if response_host != target_host or "json" not in content_type.lower():
                     return
-                responses.append({"url": response.url, "data": response.json()})
+                responses.append({
+                    "url": response.url,
+                    "status": response.status,
+                    "data": response.json(),
+                })
             except Exception:
                 return
 
@@ -2202,6 +2206,20 @@ class BrowserJsonProvider(Provider):
         tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
         tokens.extend(extract_json_payloads(responses))
         return page.url, tokens, responses
+
+    def captured_json_response(self, responses: list[dict[str, Any]], path: str) -> Any:
+        """Return the newest successful JSON response for a path captured during navigation."""
+        target_path = urlparse(path).path
+        for response in reversed(responses):
+            if urlparse(str(response.get("url") or "")).path != target_path:
+                continue
+            status = response.get("status")
+            if status in (401, 403):
+                raise NotLoggedInError(self.login_error)
+            if isinstance(status, int) and status >= 400:
+                continue
+            return response.get("data")
+        return None
 
 
 class GenericPageProvider(Provider):
@@ -2491,6 +2509,50 @@ class NewAPIProvider(BrowserJsonProvider):
     login_error = "BrowserOS profile is not logged in to this New API provider"
     ready_pattern = DEFAULT_READY_PATTERN
 
+    def page_api_json_with_session_refresh(self, page, url: str) -> Any:
+        result = page.evaluate(
+            """
+            async (url) => {
+              const request = (headers = {}) => fetch(url, {
+                headers: { Accept: "application/json", ...headers },
+                credentials: "include",
+              });
+              const storageToken = globalThis.localStorage?.getItem("auth_token") || "";
+              const storageUserId = globalThis.localStorage?.getItem("uid") || "";
+              const initialHeaders = {};
+              if (storageToken) initialHeaders.Authorization = `Bearer ${storageToken}`;
+              if (storageUserId) initialHeaders["New-Api-User"] = storageUserId;
+              let response = await request(initialHeaders);
+              if (response.status === 401 || response.status === 403) {
+                const refreshUrl = new URL("/api/user/auth/refresh", url).href;
+                const refreshResponse = await fetch(refreshUrl, {
+                  method: "POST",
+                  headers: { Accept: "application/json" },
+                  credentials: "include",
+                });
+                let refreshPayload = null;
+                try { refreshPayload = await refreshResponse.json(); } catch {}
+                const session = refreshPayload?.data;
+                if (refreshResponse.ok && session?.access_token) {
+                  const headers = { Authorization: `Bearer ${session.access_token}` };
+                  const userId = session?.user?.id ?? storageUserId;
+                  if (userId !== "" && userId != null) headers["New-Api-User"] = String(userId);
+                  response = await request(headers);
+                }
+              }
+              let data = null;
+              try { data = await response.json(); } catch {}
+              return { ok: response.ok, status: response.status, data };
+            }
+            """,
+            url,
+        )
+        if result.get("status") in (401, 403):
+            raise NotLoggedInError(self.login_error)
+        if not result.get("ok"):
+            raise ProviderError(f"{self.config.name} API returned HTTP {result.get('status')}")
+        return result.get("data")
+
     def fetch(
         self,
         refresh_auth: bool = False,
@@ -2498,8 +2560,11 @@ class NewAPIProvider(BrowserJsonProvider):
         browser: BrowserSession | None = None,
     ) -> dict[str, Any]:
         with self.browser_page(browser) as page:
-            page_url, _, _ = self.goto_with_json(page, self.config.target_url, min_wait_ms=800)
-            payload = self.page_api_json(page, self.origin_url("/api/user/self"))
+            page_url, _, responses = self.goto_with_json(page, self.config.target_url, min_wait_ms=800)
+            self_url = self.origin_url("/api/user/self")
+            payload = self.captured_json_response(responses, self_url)
+            if payload is None:
+                payload = self.page_api_json_with_session_refresh(page, self_url)
             return newapi_snapshot(self.config, page_url, payload)
 
     def origin_url(self, path: str) -> str:

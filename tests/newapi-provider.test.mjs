@@ -22,6 +22,16 @@ function newApiSelfResponse(url) {
   };
 }
 
+function jsonResponse(url, payload, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    url,
+    headers: { get: () => "application/json" },
+    async json() { return payload; }
+  };
+}
+
 test("newapi provider collects quota from /api/user/self", async () => {
   const originalFetch = globalThis.fetch;
   const requestedUrls = [];
@@ -76,6 +86,67 @@ test("empty page provider auto-detects New API sites", async () => {
   assert.equal(snapshot.balances[0].value, "5.00");
 
   globalThis.fetch = originalFetch;
+});
+
+test("newapi auto-detection refreshes modern access-token sessions", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedPaths = [];
+  let refreshed = false;
+  let retryHeaders = null;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const parsed = new URL(String(url));
+    requestedPaths.push(parsed.pathname);
+    if (parsed.pathname === "/api/status") {
+      return jsonResponse(url, {
+        success: true,
+        data: { system_name: "New API", version: "sha-test" }
+      });
+    }
+    if (parsed.pathname === "/api/user/auth/refresh") {
+      assert.equal(options.method, "POST");
+      refreshed = true;
+      return jsonResponse(url, {
+        success: true,
+        data: { access_token: "temporary-token", user: { id: 42 } }
+      });
+    }
+    if (parsed.pathname === "/api/user/self" && !refreshed) {
+      return jsonResponse(url, { success: false, message: "unauthorized" }, 401);
+    }
+    if (parsed.pathname === "/api/user/self") {
+      retryHeaders = options.headers;
+      return newApiSelfResponse(url);
+    }
+    throw new Error(`unexpected URL: ${url}`);
+  };
+
+  try {
+    const { detectProvider } = await import(`../extension/src/providers/index.js?newapi-refresh=${Date.now()}`);
+    const detected = await detectProvider({
+      id: "modern-newapi",
+      name: "Modern New API",
+      type: "page",
+      targetUrl: "https://relay.example.test/dashboard/overview",
+      enabled: true,
+      secondaryUrls: [],
+      parserRules: { balances: [], quotas: [], textMetrics: [] }
+    });
+
+    assert.equal(detected.type, "newapi");
+    assert.equal(detected.snapshot.balances[0].value, "5.00");
+    assert.deepEqual(requestedPaths, [
+      "/api/user/self",
+      "/api/status",
+      "/api/user/auth/refresh",
+      "/api/user/self"
+    ]);
+    assert.equal(retryHeaders.Authorization, "Bearer temporary-token");
+    assert.equal(retryHeaders["New-Api-User"], "42");
+    assert.equal(JSON.stringify(detected).includes("temporary-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("newapi page fallback does not treat dashboard API-key text as login", async () => {
