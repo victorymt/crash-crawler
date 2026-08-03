@@ -40,7 +40,7 @@ test("parseEzaiclubAuthMe and subscriptions API map balance and weekly quota", a
   assert.match(weekly.value, /\$110\.22 \/ \$150\.00/);
 
   const snapshot = ezaiclubApiSnapshot(
-    { id: "ezaiclub", name: "EZAICLUB", type: "ezaiclub", targetUrl: "https://www.ezaiclub.com/dashboard" },
+    { id: "ezaiclub", name: "EZAICLUB", type: "ezaiclub", targetUrl: "https://www.ezaiclub.com/dashboard", rechargeRatio: 10 },
     { code: 0, data: { balance: 10 } },
     { code: 0, data: [{ status: "active", group: { name: "Pro", weekly_limit_usd: 100 }, weekly_usage_usd: 50 }] }
   );
@@ -88,6 +88,43 @@ test("EZAICLUB prefers API collection when auth_token is available", async () =>
         }
       };
     }
+    if (String(url).includes("/api/v1/channel-monitors")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            code: 0,
+            data: {
+              items: [{
+                id: 7,
+                name: "普通Grok号池",
+                provider: "grok",
+                primary_model: "grok-4.5",
+                primary_status: "operational",
+                primary_latency_ms: 2100,
+                availability_7d: 91.4
+              }]
+            }
+          };
+        }
+      };
+    }
+    if (String(url).includes("/api/v1/groups/available")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            code: 0,
+            data: [{ id: 47, name: "通用余额[Grok-普通Grok号池]", platform: "grok", rate_multiplier: 0.2 }]
+          };
+        }
+      };
+    }
+    if (String(url).includes("/api/v1/groups/rates")) {
+      return { ok: true, status: 200, async json() { return { code: 0, data: {} }; } };
+    }
     return { ok: true, status: 200, url, async text() { return "<html></html>"; } };
   };
 
@@ -120,6 +157,7 @@ test("EZAICLUB prefers API collection when auth_token is available", async () =>
     name: "EZAICLUB",
     type: "ezaiclub",
     targetUrl: "https://www.ezaiclub.com/dashboard",
+    rechargeRatio: 10,
     enabled: true,
     secondaryUrls: [{ label: "打开订阅页", url: "https://www.ezaiclub.com/subscriptions" }],
     mode: "page"
@@ -131,7 +169,61 @@ test("EZAICLUB prefers API collection when auth_token is available", async () =>
   assert.equal(snapshot.metrics.some((item) => item.label === "当前套餐" && item.value === "Pro Weekly"), true);
   assert.ok(fetchUrls.some((url) => url.includes("/api/v1/auth/me")));
   assert.ok(fetchUrls.some((url) => url.includes("/api/v1/subscriptions/active")));
+  assert.ok(fetchUrls.some((url) => url.includes("/api/v1/channel-monitors")));
+  assert.ok(fetchUrls.some((url) => url.includes("/api/v1/groups/available")));
+  assert.ok(fetchUrls.some((url) => url.includes("/api/v1/groups/rates")));
+  assert.equal(snapshot.channels.length, 1);
+  assert.equal(snapshot.channels[0].listedEffectiveMultiplier, 0.2);
+  assert.equal(snapshot.channels[0].effectiveMultiplier, 0.02);
+  assert.equal(snapshot.channels[0].rechargeRatio, 10);
 
   globalThis.chrome = originalChrome;
   globalThis.fetch = originalFetch;
+});
+
+test("EZAICLUB marks channels unavailable when one channel endpoint fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  globalThis.chrome = {
+    tabs: { async query() { return [{ id: 10, url: "https://www.ezaiclub.com/dashboard" }]; }, onUpdated: { addListener() {}, removeListener() {} } },
+    scripting: {
+      async executeScript({ args }) {
+        return [{ result: args?.[0] === "auth_token" ? "test-token" : null }];
+      }
+    }
+  };
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/api/v1/auth/me")) {
+      return { ok: true, status: 200, async json() { return { code: 0, data: { balance: 10 } }; } };
+    }
+    if (String(url).includes("/api/v1/subscriptions/active")) {
+      return { ok: true, status: 200, async json() { return { code: 0, data: [] }; } };
+    }
+    if (String(url).includes("/api/v1/channel-monitors")) {
+      return { ok: true, status: 200, async json() { return { code: 0, data: { items: [] } }; } };
+    }
+    if (String(url).includes("/api/v1/groups/available")) throw new Error("group request timeout");
+    if (String(url).includes("/api/v1/groups/rates")) {
+      return { ok: true, status: 200, async json() { return { code: 0, data: {} }; } };
+    }
+    throw new Error(`unexpected URL: ${url}`);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?ezaiclub-channel-error=${Date.now()}`);
+    const snapshot = await collectProvider({
+      id: "ezaiclub",
+      name: "EZAICLUB",
+      type: "ezaiclub",
+      targetUrl: "https://www.ezaiclub.com/dashboard",
+      rechargeRatio: 10,
+      enabled: true,
+      secondaryUrls: []
+    });
+    assert.equal(snapshot.channels, null);
+    assert.match(snapshot.channelError, /渠道分组.*group request timeout/);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
 });

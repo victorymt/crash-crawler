@@ -58,6 +58,7 @@ export function pageProviderTemplate(existingConfigs) {
     name: "新 Provider",
     type: "page",
     targetUrl: "",
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: false,
     secondaryUrls: [],
@@ -81,6 +82,7 @@ export function newApiProviderTemplate(existingConfigs) {
     name: "New API",
     type: "newapi",
     targetUrl: "",
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: false,
     secondaryUrls: [],
@@ -131,6 +133,7 @@ export function sub2ApiProviderTemplate(existingConfigs) {
     name: "AIHub/Sub2API",
     type: "sub2api",
     targetUrl: "",
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: false,
     secondaryUrls: [],
@@ -366,6 +369,7 @@ function renderEditor() {
   document.getElementById("source-refresh-on-visit").checked = draftConfig.refreshOnVisit === true;
   document.getElementById("source-type").value = draftConfig.type || "page";
   document.getElementById("source-target-url").value = draftConfig.targetUrl || "";
+  document.getElementById("source-recharge-ratio").value = draftConfig.rechargeRatio ?? 1;
   document.getElementById("secondary-pages").innerHTML = renderSecondaryPages(draftConfig);
   document.getElementById("metric-rules").innerHTML = renderMetricRules(draftConfig);
   document.getElementById("source-login-hints").value = (draftConfig.parserRules?.loginHints || []).join("\n");
@@ -459,6 +463,7 @@ function readEditorSource() {
     name: document.getElementById("source-name").value.trim(),
     type: document.getElementById("source-type").value || draftConfig?.type || "page",
     targetUrl: document.getElementById("source-target-url").value.trim(),
+    rechargeRatio: Number(document.getElementById("source-recharge-ratio").value),
     enabled: document.getElementById("source-enabled").checked,
     refreshOnVisit: document.getElementById("source-refresh-on-visit").checked,
     secondaryUrls,

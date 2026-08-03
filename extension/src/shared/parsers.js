@@ -1,4 +1,5 @@
 import { linksForConfig, NEWAPI_QUOTA_PER_UNIT } from "./config.js";
+import { parseEzaiclubChannels, parseSub2ApiChannels } from "./channels.js";
 import {
   balanceMetric,
   nowIso,
@@ -752,7 +753,7 @@ export function sub2ApiPageSnapshot(config, url, parsed) {
   };
 }
 
-export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null) {
+export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null, channelData = {}) {
   const user = sub2ApiData(authPayload);
   if (!user) throw new Error("Sub2API auth payload did not contain user fields");
   const stats = sub2ApiData(statsPayload) || {};
@@ -794,6 +795,16 @@ export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null) {
   if (totalTokens != null) textMetrics.push(textMetric("total_tokens", "累计 Token", String(totalTokens)));
 
   const metrics = [...balances, ...usage, ...textMetrics];
+  const monitorsPayload = channelData.monitorsPayload ?? null;
+  const channels = monitorsPayload == null
+    ? (channelData.channelError ? null : [])
+    : parseSub2ApiChannels(
+        config,
+        monitorsPayload,
+        channelData.availablePayload ?? null,
+        channelData.ratesPayload ?? null
+      );
+  const channelCheckedAt = monitorsPayload == null ? null : nowIso();
   return {
     id: config.id,
     name: config.name,
@@ -806,6 +817,10 @@ export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null) {
     balances,
     usage,
     metrics,
+    channels,
+    channelCheckedAt,
+    channelsStale: false,
+    channelError: channelData.channelError ? String(channelData.channelError).slice(0, 500) : null,
     links: linksForConfig(config),
     recommendation: usage.length ? recommendationFromUsage(usage) : recommendationFromBalances(balances),
     error: metrics.length ? null : "Sub2API returned an empty dashboard payload",
@@ -813,7 +828,8 @@ export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null) {
       source: "sub2api",
       balance: balance ?? null,
       today_requests: todayRequests ?? null,
-      total_requests: totalRequests ?? null
+      total_requests: totalRequests ?? null,
+      channel_count: channels?.length ?? null
     }
   };
 }
@@ -1401,6 +1417,7 @@ export function siliconflowApiSnapshot(config, profilePayload, balanceWalletsPay
 export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMetrics, options = {}) {
   const usage = (subscriptionMetrics || []).filter((item) => Number.isInteger(item?.percent));
   const metrics = [...balances, ...subscriptionMetrics];
+  const channels = Object.prototype.hasOwnProperty.call(options, "channels") ? options.channels : null;
   return {
     id: config.id,
     name: config.name,
@@ -1413,6 +1430,10 @@ export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMet
     balances,
     usage,
     metrics,
+    channels,
+    channelCheckedAt: options.channelCheckedAt ?? null,
+    channelsStale: options.channelsStale ?? false,
+    channelError: options.channelError ? String(options.channelError).slice(0, 500) : null,
     links: linksForConfig(config),
     recommendation: usage.length
       ? recommendationFromUsage(usage)
@@ -1421,6 +1442,7 @@ export function ezaiclubSnapshot(config, dashboardUrl, balances, subscriptionMet
     raw: {
       balance_count: balances.length,
       subscription_metric_count: subscriptionMetrics.length,
+      channel_count: channels?.length ?? null,
       source: options.source || "page"
     }
   };
@@ -1534,11 +1556,23 @@ export function parseEzaiclubSubscriptionsApi(payload) {
   return { metrics, subscribed: subscribed || metrics.some((item) => item.label === "当前套餐") };
 }
 
-export function ezaiclubApiSnapshot(config, authPayload, subscriptionPayload) {
+export function ezaiclubApiSnapshot(config, authPayload, subscriptionPayload, channelData = {}) {
   const balances = parseEzaiclubAuthMe(authPayload);
   const { metrics: subscriptionMetrics, subscribed } = parseEzaiclubSubscriptionsApi(subscriptionPayload);
+  const monitorsPayload = channelData.monitorsPayload ?? null;
+  const channels = monitorsPayload == null
+    ? (channelData.channelError ? null : [])
+    : parseEzaiclubChannels(
+        config,
+        monitorsPayload,
+        channelData.groupsPayload ?? null,
+        channelData.ratesPayload ?? null
+      );
   return ezaiclubSnapshot(config, config.targetUrl, balances, subscriptionMetrics, {
     subscribed,
+    channels,
+    channelCheckedAt: monitorsPayload == null ? null : nowIso(),
+    channelError: channelData.channelError || null,
     source: "api"
   });
 }

@@ -27,6 +27,7 @@ export const AUTO_REFRESH_MINUTES_OPTIONS = [0, 15, 30, 60, 120, 360];
 export const DEFAULT_EXTENSION_SETTINGS = {
   autoRefreshMinutes: 30,
   autoRefreshTabPolicy: TAB_POLICIES.REUSE_OPEN_TABS,
+  preferredChannelModel: "",
   lastAutoRefreshAt: null,
   lastAutoRefreshAttemptAt: null,
   lastAutoRefreshError: null
@@ -41,6 +42,9 @@ export function normalizeExtensionSettings(raw = {}) {
     autoRefreshTabPolicy: TAB_POLICY_VALUES.includes(raw?.autoRefreshTabPolicy)
       ? raw.autoRefreshTabPolicy
       : DEFAULT_EXTENSION_SETTINGS.autoRefreshTabPolicy,
+    preferredChannelModel: raw?.preferredChannelModel
+      ? String(raw.preferredChannelModel).slice(0, 160)
+      : "",
     lastAutoRefreshAt: raw?.lastAutoRefreshAt ? String(raw.lastAutoRefreshAt) : null,
     lastAutoRefreshAttemptAt: raw?.lastAutoRefreshAttemptAt ? String(raw.lastAutoRefreshAttemptAt) : null,
     lastAutoRefreshError: raw?.lastAutoRefreshError ? String(raw.lastAutoRefreshError).slice(0, 500) : null
@@ -71,6 +75,7 @@ export function mergeBuiltinConfig(defaultConfig, stored) {
     mode: defaultConfig.mode,
     enabled: stored.enabled ?? defaultConfig.enabled,
     refreshOnVisit: stored.refreshOnVisit ?? defaultConfig.refreshOnVisit,
+    rechargeRatio: stored.rechargeRatio ?? stored.recharge_ratio ?? defaultConfig.rechargeRatio,
     name,
     targetUrl,
     secondaryUrls

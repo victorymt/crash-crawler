@@ -1,5 +1,6 @@
 import { normalizeProviderConfig } from "../shared/config.js";
-import { badgeFromSnapshots, blankSnapshot, errorSnapshot } from "../shared/snapshots.js";
+import { summarizeChannelRefresh } from "../shared/channels.js";
+import { badgeFromSnapshots, blankSnapshot, errorSnapshot, preservePreviousChannels } from "../shared/snapshots.js";
 import {
   exportProviderConfig,
   deleteProviderConfig,
@@ -18,15 +19,15 @@ import {
   saveCurrentProviderSnapshot,
   setSecret
 } from "../shared/storage.js";
-import { collectProvider } from "../providers/index.js";
+import { channelProviderConfigs, collectProvider } from "../providers/index.js";
 import { clearProviderSessionHints } from "../providers/session_cache.js";
 import { recoverRefreshRun, runRefreshBatch } from "./refresh_runner.js";
 import { configsForObservedUrl, syncVisitObserver } from "./visit_observer.js";
 
 export const AUTO_REFRESH_ALARM = "providers:autoRefresh";
 
-/** Keep full refreshes serialized so they cannot overwrite one session job. */
-let refreshAllFlight = null;
+/** Keep refresh batches serialized so they cannot overwrite one session job. */
+let refreshBatchFlight = null;
 const providerRefreshes = new Map();
 const observedRefreshTimes = new Map();
 let configMutationChain = Promise.resolve();
@@ -65,7 +66,7 @@ async function listProviders() {
 
 async function collectOne(config, previousSnapshot, context = {}) {
   try {
-    return await collectProvider(config, context);
+    return preservePreviousChannels(await collectProvider(config, context), previousSnapshot);
   } catch (error) {
     return errorSnapshot(config, previousSnapshot, error);
   }
@@ -180,23 +181,47 @@ async function refreshAllProviders(context = {}) {
   return providers;
 }
 
-async function refreshAllProvidersExclusive(context = {}) {
+async function refreshChannelProviders(context = {}) {
+  const configs = channelProviderConfigs(await getProviderConfigs());
+  const previous = await getSnapshots();
+  const providers = await runRefreshBatch({
+    configs,
+    previousSnapshots: previous,
+    context,
+    collect: collectOneExclusive,
+    saveSnapshot: saveCurrentProviderSnapshot
+  });
+  await syncBadgeFromStorage();
+  return { providers, summary: summarizeChannelRefresh(providers) };
+}
+
+async function runExclusiveRefresh(scope, context, work) {
   const capability = contextCapability(context);
-  if (refreshAllFlight) {
-    if (refreshAllFlight.capability >= capability) return refreshAllFlight.promise;
-    try {
-      await refreshAllFlight.promise;
-    } catch {
-      // Continue with the more capable queued refresh.
+  if (refreshBatchFlight) {
+    if (refreshBatchFlight.scope === scope && refreshBatchFlight.capability >= capability) {
+      return refreshBatchFlight.promise;
     }
-    return refreshAllProvidersExclusive(context);
+    try {
+      await refreshBatchFlight.promise;
+    } catch {
+      // A queued refresh should still get its own attempt.
+    }
+    return runExclusiveRefresh(scope, context, work);
   }
-  const refresh = refreshAllProviders(context)
+  const refresh = work(context)
     .finally(() => {
-      if (refreshAllFlight?.promise === refresh) refreshAllFlight = null;
+      if (refreshBatchFlight?.promise === refresh) refreshBatchFlight = null;
     });
-  refreshAllFlight = { promise: refresh, capability };
+  refreshBatchFlight = { promise: refresh, capability, scope };
   return refresh;
+}
+
+async function refreshAllProvidersExclusive(context = {}) {
+  return runExclusiveRefresh("all", context, refreshAllProviders);
+}
+
+async function refreshChannelProvidersExclusive(context = {}) {
+  return runExclusiveRefresh("channels", context, refreshChannelProviders);
 }
 
 export async function syncAutoRefreshAlarm(settingsInput) {
@@ -267,6 +292,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           trigger: "manual",
           tabPolicy: "allow-hidden-tabs"
         }) };
+      case "providers:refreshChannels":
+        return refreshChannelProvidersExclusive({
+          trigger: "manual-channels",
+          tabPolicy: "allow-hidden-tabs"
+        });
       case "settings:get":
         return { settings: await getExtensionSettings() };
       case "settings:save": {
@@ -337,6 +367,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // A Manifest V3 worker can stop between provider steps. Session-backed progress
 // lets a fresh worker continue a recent run without repeating completed sources.
-recoverRefreshRun((context) => context.trigger === "auto"
-  ? runAutoRefresh(context)
-  : refreshAllProvidersExclusive(context)).catch(() => undefined);
+recoverRefreshRun((context) => {
+  if (context.trigger === "auto") return runAutoRefresh(context);
+  if (context.trigger === "manual-channels") return refreshChannelProvidersExclusive(context);
+  return refreshAllProvidersExclusive(context);
+}).catch(() => undefined);

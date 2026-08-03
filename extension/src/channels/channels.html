@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>渠道倍率 · Provider Usage Hub</title>
+  <link rel="stylesheet" href="./channels.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <div>
+        <div class="product-name">Provider Usage Hub</div>
+        <h1>渠道倍率</h1>
+      </div>
+      <div class="toolbar">
+        <button id="refresh-channels" class="primary">刷新渠道</button>
+        <button id="options">设置</button>
+      </div>
+      <div id="message" class="message" aria-live="polite"></div>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="filters" aria-label="渠道筛选">
+      <label class="model-filter">
+        <span>模型</span>
+        <select id="channel-model"></select>
+      </label>
+      <label class="degraded-filter">
+        <input id="include-degraded" type="checkbox">
+        <span>包含降级</span>
+      </label>
+      <div id="channel-meta" class="channel-meta"></div>
+    </section>
+
+    <section class="results" aria-labelledby="results-title">
+      <div class="results-head">
+        <h2 id="results-title">最低倍率可用渠道</h2>
+        <span id="updated-at"></span>
+      </div>
+      <div class="column-headings" aria-hidden="true">
+        <span>排名</span>
+        <span>Provider / 渠道</span>
+        <span>监控状态</span>
+        <span>倍率</span>
+      </div>
+      <div id="channel-results" class="channel-list"></div>
+    </section>
+  </main>
+
+  <script type="module" src="./channels.js"></script>
+</body>
+</html>

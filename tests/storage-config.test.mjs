@@ -45,7 +45,8 @@ test("storage imports and exports single provider sources", async () => {
   });
 
   assert.equal(imported.id, "two");
-  assert.equal(imported.schemaVersion, 2);
+  assert.equal(imported.schemaVersion, 3);
+  assert.equal(imported.rechargeRatio, 1);
   assert.equal((await getProviderConfigs()).length, 6);
   assert.equal((await exportProviderConfig("two")).parserRules.balances[0].label, "余额");
 
@@ -82,6 +83,7 @@ test("storage imports and exports single provider sources", async () => {
   assert.equal(protectedConfigs.find((item) => item.id === "deepseek").enabled, false);
   assert.equal(protectedConfigs.find((item) => item.id === "opencode-go").refreshOnVisit, true);
   assert.equal(protectedConfigs.some((item) => item.id === "ezaiclub"), true);
+  assert.equal(protectedConfigs.find((item) => item.id === "ezaiclub").rechargeRatio, 10);
 
   globalThis.chrome = originalChrome;
 });
@@ -128,6 +130,30 @@ test("Sub2API provider configs apply the built-in template", async () => {
   assert.equal(config.targetUrl, "https://aihub.top/dashboard");
   assert.equal(config.secondaryUrls[0].url, "https://aihub.top/subscriptions");
   assert.equal(config.parserRules.balances[0].id, "sub2api-balance");
+});
+
+test("provider configs migrate and validate recharge ratios", async () => {
+  const { normalizeProviderConfig } = await import(`../extension/src/shared/config.js?recharge=${Date.now()}`);
+  const ezai = normalizeProviderConfig({
+    id: "ezaiclub-old",
+    name: "EZAIClub old config",
+    type: "ezaiclub",
+    targetUrl: "https://www.ezaiclub.com/dashboard"
+  });
+  const generic = normalizeProviderConfig({
+    id: "generic",
+    name: "Generic",
+    type: "page",
+    targetUrl: "https://example.test"
+  });
+  const custom = normalizeProviderConfig({ ...generic, rechargeRatio: "12.5" });
+
+  assert.equal(ezai.schemaVersion, 3);
+  assert.equal(ezai.rechargeRatio, 10);
+  assert.equal(generic.rechargeRatio, 1);
+  assert.equal(custom.rechargeRatio, 12.5);
+  assert.throws(() => normalizeProviderConfig({ ...generic, rechargeRatio: 0 }), /rechargeRatio/);
+  assert.throws(() => normalizeProviderConfig({ ...generic, rechargeRatio: 1001 }), /rechargeRatio/);
 });
 
 test("storage preserves builtin OpenCode workspace URL customizations", async () => {
@@ -194,6 +220,7 @@ test("extension settings normalize auto-refresh intervals", async () => {
   assert.equal(normalizeExtensionSettings({}).autoRefreshTabPolicy, "reuse-open-tabs");
   assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "api-only" }).autoRefreshTabPolicy, "api-only");
   assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "invalid" }).autoRefreshTabPolicy, "reuse-open-tabs");
+  assert.equal(normalizeExtensionSettings({ preferredChannelModel: "gpt-5.6-sol" }).preferredChannelModel, "gpt-5.6-sol");
   assert.equal((await getExtensionSettings()).autoRefreshMinutes, 30);
 
   const saved = await saveExtensionSettings({ autoRefreshMinutes: 60, autoRefreshTabPolicy: "allow-hidden-tabs" });

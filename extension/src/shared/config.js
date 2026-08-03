@@ -12,6 +12,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     name: "OpenCode Go",
     type: "opencode",
     targetUrl: DEFAULT_OPENCODE_URL,
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: true,
     secondaryUrls: [],
@@ -22,6 +23,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     name: "DeepSeek",
     type: "deepseek",
     targetUrl: DEFAULT_DEEPSEEK_URL,
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: true,
     secondaryUrls: [],
@@ -32,6 +34,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     name: "EZAICLUB",
     type: "ezaiclub",
     targetUrl: DEFAULT_EZAICLUB_DASHBOARD_URL,
+    rechargeRatio: 10,
     enabled: true,
     refreshOnVisit: true,
     secondaryUrls: [
@@ -47,6 +50,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
     name: "SiliconFlow",
     type: "siliconflow",
     targetUrl: DEFAULT_SILICONFLOW_COUPON_URL,
+    rechargeRatio: 1,
     enabled: true,
     refreshOnVisit: true,
     secondaryUrls: [],
@@ -54,7 +58,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
   }
 ];
 
-export const PROVIDER_SCHEMA_VERSION = 2;
+export const PROVIDER_SCHEMA_VERSION = 3;
 export const SUPPORTED_PROVIDER_TYPES = ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"];
 export const BUILTIN_PROVIDER_IDS = DEFAULT_PROVIDER_CONFIGS.map((config) => config.id);
 
@@ -69,6 +73,7 @@ const MAX_ID_LENGTH = 128;
 const MAX_LABEL_LENGTH = 200;
 const MAX_LOGIN_HINTS = 20;
 const MAX_LOGIN_HINT_LENGTH = 100;
+const RECHARGE_RATIO_LIMITS = [0.01, 1000];
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9._-]+$/;
 const ALLOWED_RULE_ATTRIBUTES = new Set(["textContent", "innerText", "value", "href", "title", "aria-label"]);
 const ALLOWED_REGEX_FLAGS = new Set(["i", "m", "s", "u"]);
@@ -106,6 +111,12 @@ function isNewApiTemplateRequest(raw) {
 
 function isSub2ApiTemplateRequest(raw) {
   return ["sub2api", "sub-2-api", "aihub"].includes(String(raw?.template || raw?.sourceTemplate || raw?.adapter || "").toLowerCase());
+}
+
+function normalizeRechargeRatio(raw, providerType) {
+  const value = raw.rechargeRatio ?? raw.recharge_ratio;
+  if (value == null || value === "") return providerType === "ezaiclub" ? 10 : 1;
+  return Number(value);
 }
 
 function newApiParserRules() {
@@ -464,6 +475,12 @@ export function validateProviderConfig(config, existingConfigs = []) {
     throw new Error(`Unsupported provider type: ${config.type}`);
   }
   validateUrl(config.targetUrl, `Provider ${config.id} targetUrl`);
+  const [minRechargeRatio, maxRechargeRatio] = RECHARGE_RATIO_LIMITS;
+  if (!Number.isFinite(config.rechargeRatio)
+      || config.rechargeRatio < minRechargeRatio
+      || config.rechargeRatio > maxRechargeRatio) {
+    throw new Error(`Provider ${config.id} rechargeRatio must be between ${minRechargeRatio} and ${maxRechargeRatio}`);
+  }
   if ((config.secondaryUrls || []).length > MAX_SECONDARY_PAGES) throw new Error(`Provider ${config.id} has too many secondary pages`);
   const pageIds = new Set();
   for (const page of config.secondaryUrls || []) {
@@ -494,6 +511,7 @@ export function normalizeProviderConfig(raw) {
     name: raw.name == null ? String(raw.id || "") : String(raw.name),
     type: requestedType,
     targetUrl: raw.targetUrl || raw.target_url ? String(raw.targetUrl || raw.target_url) : "",
+    rechargeRatio: normalizeRechargeRatio(raw, requestedType),
     enabled: raw.enabled !== false,
     refreshOnVisit: raw.refreshOnVisit === true,
     secondaryUrls: normalizeSecondaryUrls(raw),

@@ -15,6 +15,19 @@ test("provider registry validates adapters and preserves registration order", as
 });
 
 test("built-in provider adapters are registered through the public facade", async () => {
-  const { providerAdapterTypes } = await import(`../extension/src/providers/index.js?adapter-types=${Date.now()}`);
+  const {
+    channelProviderConfigs,
+    providerAdapterTypes,
+    providerSupportsChannels
+  } = await import(`../extension/src/providers/index.js?adapter-types=${Date.now()}`);
   assert.deepEqual(providerAdapterTypes(), ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"]);
+  assert.equal(providerSupportsChannels("ezaiclub"), true);
+  assert.equal(providerSupportsChannels("sub2api"), true);
+  assert.equal(providerSupportsChannels("deepseek"), false);
+  assert.deepEqual(channelProviderConfigs([
+    { id: "ezai", type: "ezaiclub", enabled: true },
+    { id: "fast", type: "sub2api", enabled: true },
+    { id: "disabled", type: "sub2api", enabled: false },
+    { id: "deepseek", type: "deepseek", enabled: true }
+  ]).map((config) => config.id), ["ezai", "fast"]);
 });

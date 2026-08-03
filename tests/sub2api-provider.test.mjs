@@ -83,6 +83,35 @@ test("sub2api provider collects dashboard data with localStorage bearer token", 
         }
       });
     }
+    if (String(url).includes("/api/v1/channel-monitors")) {
+      return jsonResponse(url, {
+        data: {
+          items: [{
+            id: 6,
+            name: "【限时】[0.06x]OpenAI 福利分组",
+            provider: "openai",
+            primary_model: "gpt-5.5",
+            primary_status: "operational",
+            primary_latency_ms: 1628,
+            availability_7d: 68.73,
+            extra_models: [{ model: "gpt-5.6-sol", status: "operational", latency_ms: 2590 }]
+          }]
+        }
+      });
+    }
+    if (String(url).includes("/api/v1/channels/available")) {
+      return jsonResponse(url, {
+        data: [{
+          name: "OpenAI Chatgpt",
+          platforms: [{
+            platform: "openai",
+            groups: [{ id: 21, name: "【限时】[0.06x]OpenAI 福利分组", platform: "openai", rate_multiplier: 0.06 }],
+            supported_models: [{ name: "gpt-5.5" }, { name: "gpt-5.6-sol" }]
+          }]
+        }]
+      });
+    }
+    if (String(url).includes("/api/v1/groups/rates")) return jsonResponse(url, { data: {} });
     throw new Error(`unexpected URL: ${url}`);
   };
 
@@ -99,7 +128,10 @@ test("sub2api provider collects dashboard data with localStorage bearer token", 
 
     assert.deepEqual(requested.map((item) => item.url), [
       "https://aihub.example.test/api/v1/auth/me?timezone=Asia%2FShanghai",
-      "https://aihub.example.test/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai"
+      "https://aihub.example.test/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai",
+      "https://aihub.example.test/api/v1/channel-monitors",
+      "https://aihub.example.test/api/v1/channels/available",
+      "https://aihub.example.test/api/v1/groups/rates"
     ]);
     assert.equal(requested.every((item) => item.auth === "Bearer test-token"), true);
     assert.equal(snapshot.status, "ok");
@@ -109,6 +141,9 @@ test("sub2api provider collects dashboard data with localStorage bearer token", 
     assert.equal(snapshot.metrics.some((item) => item.label === "今日请求" && item.value === "199"), true);
     assert.equal(snapshot.usage.some((item) => item.label === "累计消费"), true);
     assert.equal(snapshot.raw.source, "sub2api");
+    assert.equal(snapshot.channels.length, 1);
+    assert.equal(snapshot.channels[0].groupId, 21);
+    assert.equal(snapshot.channels[0].effectiveMultiplier, 0.06);
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;
@@ -130,6 +165,11 @@ test("empty page provider auto-detects Sub2API after New API probe misses", asyn
     if (String(url).includes("/api/v1/usage/dashboard/stats")) {
       return jsonResponse(url, { data: { total_requests: 3 } });
     }
+    if (
+      String(url).includes("/api/v1/channel-monitors")
+      || String(url).includes("/api/v1/channels/available")
+      || String(url).includes("/api/v1/groups/rates")
+    ) return jsonResponse(url, { message: "not found" }, 404);
     throw new Error(`unexpected URL: ${url}`);
   };
 
@@ -148,11 +188,15 @@ test("empty page provider auto-detects Sub2API after New API probe misses", asyn
     assert.deepEqual(requestedUrls, [
       "https://aihub.example.test/api/user/self",
       "https://aihub.example.test/api/v1/auth/me?timezone=Asia%2FShanghai",
-      "https://aihub.example.test/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai"
+      "https://aihub.example.test/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai",
+      "https://aihub.example.test/api/v1/channel-monitors",
+      "https://aihub.example.test/api/v1/channels/available",
+      "https://aihub.example.test/api/v1/groups/rates"
     ]);
     assert.equal(snapshot.status, "ok");
     assert.equal(snapshot.balances[0].value, "12.30");
     assert.equal(snapshot.raw.source, "sub2api");
+    assert.deepEqual(snapshot.channels, []);
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;

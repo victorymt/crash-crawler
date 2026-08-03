@@ -680,16 +680,32 @@ async function collectEzaiclubViaApi(config, context) {
     if (me?.code != null && Number(me.code) !== 0) {
       throw new Error(me.message || `EZAICLUB auth/me failed with code ${me.code}`);
     }
-    let subscriptions = { code: 0, data: [] };
-    try {
-      subscriptions = await fetchEzaiclubJson(
-        `${origin}/api/v1/subscriptions/active?timezone=${timezone}`,
-        token
-      );
-    } catch (error) {
-      if (error instanceof NotLoggedInError) throw error;
+    const [subscriptionsResult, monitorsResult, groupsResult, ratesResult] = await Promise.allSettled([
+      fetchEzaiclubJson(`${origin}/api/v1/subscriptions/active?timezone=${timezone}`, token),
+      fetchEzaiclubJson(`${origin}/api/v1/channel-monitors?timezone=${timezone}`, token),
+      fetchEzaiclubJson(`${origin}/api/v1/groups/available`, token),
+      fetchEzaiclubJson(`${origin}/api/v1/groups/rates`, token)
+    ]);
+    for (const result of [subscriptionsResult, monitorsResult, groupsResult, ratesResult]) {
+      if (result.status === "rejected" && result.reason instanceof NotLoggedInError) throw result.reason;
     }
-    const snapshot = ezaiclubApiSnapshot(config, me, subscriptions);
+    const subscriptions = subscriptionsResult.status === "fulfilled"
+      ? subscriptionsResult.value
+      : { code: 0, data: [] };
+    const channelErrors = [
+      ["渠道状态", monitorsResult],
+      ["渠道分组", groupsResult],
+      ["用户倍率", ratesResult]
+    ].filter(([, result]) => result.status === "rejected");
+    const channelCollectionFailed = channelErrors.length > 0;
+    const snapshot = ezaiclubApiSnapshot(config, me, subscriptions, {
+      monitorsPayload: !channelCollectionFailed && monitorsResult.status === "fulfilled" ? monitorsResult.value : null,
+      groupsPayload: !channelCollectionFailed && groupsResult.status === "fulfilled" ? groupsResult.value : null,
+      ratesPayload: !channelCollectionFailed && ratesResult.status === "fulfilled" ? ratesResult.value : null,
+      channelError: channelErrors.length
+        ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
+        : null
+    });
     if (!snapshot.balances.length && !snapshot.metrics.length) return null;
     return snapshot;
   } catch (error) {
@@ -1064,15 +1080,40 @@ async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
     const origin = new URL(config.targetUrl).origin;
     const authUrl = `${origin}/api/v1/auth/me?timezone=${timezone}`;
     const statsUrl = `${origin}/api/v1/usage/dashboard/stats?timezone=${timezone}`;
+    const monitorsUrl = `${origin}/api/v1/channel-monitors`;
+    const availableUrl = `${origin}/api/v1/channels/available`;
+    const ratesUrl = `${origin}/api/v1/groups/rates`;
     const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
     if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
-    let statsPayload = null;
-    try {
-      statsPayload = await fetchSub2ApiJson(statsUrl, token, config.name);
-    } catch (error) {
-      if (error instanceof NotLoggedInError) throw error;
+    const [statsResult, monitorsResult, availableResult, ratesResult] = await Promise.allSettled([
+      fetchSub2ApiJson(statsUrl, token, config.name),
+      fetchSub2ApiJson(monitorsUrl, token, config.name),
+      fetchSub2ApiJson(availableUrl, token, config.name),
+      fetchSub2ApiJson(ratesUrl, token, config.name)
+    ]);
+    for (const result of [statsResult, monitorsResult, availableResult, ratesResult]) {
+      if (result.status === "rejected" && result.reason instanceof NotLoggedInError) throw result.reason;
     }
-    return sub2ApiSnapshot(config, sameOriginUrl(config, "/dashboard"), authPayload, statsPayload);
+    const channelErrors = [
+      ["渠道状态", monitorsResult],
+      ["渠道分组", availableResult],
+      ["用户倍率", ratesResult]
+    ].filter(([, result]) => result.status === "rejected");
+    const channelCollectionFailed = channelErrors.length > 0;
+    return sub2ApiSnapshot(
+      config,
+      sameOriginUrl(config, "/dashboard"),
+      authPayload,
+      statsResult.status === "fulfilled" ? statsResult.value : null,
+      {
+        monitorsPayload: !channelCollectionFailed && monitorsResult.status === "fulfilled" ? monitorsResult.value : null,
+        availablePayload: !channelCollectionFailed && availableResult.status === "fulfilled" ? availableResult.value : null,
+        ratesPayload: !channelCollectionFailed && ratesResult.status === "fulfilled" ? ratesResult.value : null,
+        channelError: channelErrors.length
+          ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
+          : null
+      }
+    );
   } catch (error) {
     if (error instanceof NotLoggedInError) {
       await deleteSessionHint(config.id, scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl));
@@ -1252,14 +1293,23 @@ const providerAdapters = createProviderRegistry([
       () => collectDeepSeek(config)
     )
   }],
-  ["ezaiclub", { collect: collectEzaiclub }],
+  ["ezaiclub", { collect: collectEzaiclub, supportsChannels: true }],
   ["siliconflow", { collect: collectSiliconFlow }],
   ["newapi", { collect: collectNewApi }],
-  ["sub2api", { collect: collectSub2Api }]
+  ["sub2api", { collect: collectSub2Api, supportsChannels: true }]
 ]);
 
 export function providerAdapterTypes() {
   return providerAdapters.types();
+}
+
+export function providerSupportsChannels(type) {
+  return providerAdapters.get(type)?.supportsChannels === true;
+}
+
+export function channelProviderConfigs(configs) {
+  return (Array.isArray(configs) ? configs : [])
+    .filter((config) => config?.enabled !== false && providerSupportsChannels(config?.type));
 }
 
 export async function collectProvider(config, contextInput = {}) {

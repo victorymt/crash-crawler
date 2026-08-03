@@ -72,6 +72,10 @@ export function blankSnapshot(config, status = "idle", error = null) {
     balances: [],
     usage: [],
     metrics: [],
+    channels: [],
+    channelCheckedAt: null,
+    channelsStale: false,
+    channelError: null,
     links: linksForConfig(config),
     recommendation: ["error", "unconfigured", "needs_visit"].includes(status) ? "watch" : "ok",
     error
@@ -96,6 +100,10 @@ export function errorSnapshot(config, previous, error) {
     balances: staleBalances,
     usage: staleUsage,
     metrics: staleMetrics,
+    channels: previous?.channels || [],
+    channelCheckedAt: previous?.channelCheckedAt || null,
+    channelsStale: Boolean(previous?.channels?.length),
+    channelError: previous?.channelError || null,
     links: previous?.links || linksForConfig(config),
     recommendation: previous?.recommendation || "watch",
     error: sanitizeDiagnosticMessage(error?.message || error),
@@ -106,6 +114,19 @@ export function errorSnapshot(config, previous, error) {
         collection: error.collection
       }
     } : {})
+  };
+}
+
+export function preservePreviousChannels(snapshot, previous) {
+  if (snapshot?.channels !== null) return snapshot;
+  if (!Array.isArray(previous?.channels)) {
+    return { ...snapshot, channels: [], channelsStale: false };
+  }
+  return {
+    ...snapshot,
+    channels: previous.channels,
+    channelCheckedAt: previous.channelCheckedAt || null,
+    channelsStale: true
   };
 }
 

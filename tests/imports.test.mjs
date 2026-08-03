@@ -4,6 +4,7 @@ import test from "node:test";
 
 test("extension modules import without syntax errors", async () => {
   await import("../extension/src/shared/config.js");
+  await import("../extension/src/shared/channels.js");
   await import("../extension/src/shared/snapshots.js");
   await import("../extension/src/shared/parsers.js");
 });
@@ -50,7 +51,8 @@ test("page provider template generates a unique id", async () => {
   assert.equal(template.id, "page-provider-3");
   assert.equal(template.type, "page");
   assert.equal(template.refreshOnVisit, false);
-  assert.equal(template.schemaVersion, 2);
+  assert.equal(template.schemaVersion, 3);
+  assert.equal(template.rechargeRatio, 1);
   assert.deepEqual(template.parserRules.quotas, []);
   const newApiTemplate = newApiProviderTemplate([{ id: "newapi-1" }]);
   assert.equal(newApiTemplate.id, "newapi-2");
@@ -80,6 +82,7 @@ test("options page uses a structured provider editor", async () => {
   const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
   assert.match(html, /id="source-target-url"/);
   assert.match(html, /id="source-refresh-on-visit"/);
+  assert.match(html, /id="source-recharge-ratio"/);
   assert.match(html, /data-editor-action="add-balance"/);
   assert.match(html, /data-editor-action="add-quota"/);
   assert.doesNotMatch(html, /id="source-json"/);
@@ -105,6 +108,24 @@ test("options page exposes auto-refresh interval control", async () => {
   const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
   assert.match(html, /id="auto-refresh-minutes"/);
   assert.match(html, /value="30"/);
+});
+
+test("channel ranking lives on a dedicated extension page", async () => {
+  const popupHtml = await readFile(new URL("../extension/src/popup/popup.html", import.meta.url), "utf8");
+  const popupScript = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
+  const channelsHtml = await readFile(new URL("../extension/src/channels/channels.html", import.meta.url), "utf8");
+  const channelsScript = await readFile(new URL("../extension/src/channels/channels.js", import.meta.url), "utf8");
+
+  assert.match(popupHtml, /id="channels"/);
+  assert.doesNotMatch(popupHtml, /id="channel-results"/);
+  assert.match(popupScript, /src\/channels\/channels\.html/);
+  assert.match(channelsHtml, /id="channel-model"/);
+  assert.match(channelsHtml, /id="include-degraded"/);
+  assert.match(channelsHtml, /id="channel-results"/);
+  assert.match(channelsScript, /rankAvailableChannels/);
+  assert.match(channelsScript, /statusTimelineHtml/);
+  assert.match(channelsScript, /settings:save/);
+  assert.match(channelsScript, /providers:refreshChannels/);
 });
 
 test("options page exposes export all sources control", async () => {
@@ -136,7 +157,9 @@ test("badgeFromSnapshots prioritizes errors then recharge", async () => {
 
 test("popup quota summary preserves prefix and suffix currencies", async () => {
   const source = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
-  const moduleSource = source.slice(0, source.indexOf("function metricHtml"));
+  const moduleSource = source
+    .slice(0, source.indexOf("function metricHtml"))
+    .replace(/^import[^\n]+\n/, "");
   const moduleUrl = `data:text/javascript,${encodeURIComponent(moduleSource)}`;
   const { quotaSummary } = await import(moduleUrl);
   assert.equal(quotaSummary("$50.15 / $50.00"), "$50.15 / $50.00 · 超出 $0.15");

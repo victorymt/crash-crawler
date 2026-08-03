@@ -234,6 +234,9 @@ document.getElementById("refresh-all").addEventListener("click", refreshAll);
 document.getElementById("open-all").addEventListener("click", () => {
   configs.forEach((config) => chrome.tabs.create({ url: config.targetUrl, active: false }));
 });
+document.getElementById("channels").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/channels/channels.html") });
+});
 document.getElementById("options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
 loadStatus().catch((error) => setMessage(error.message, true));
