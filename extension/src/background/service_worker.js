@@ -221,6 +221,7 @@ async function addDetectedProvider(page) {
     const provider = normalizeProviderConfig({
       id: duplicate?.id || uniqueProviderId(current, parsed.hostname),
       name: previous.name,
+      group: previous.group || "",
       type: detected.type,
       targetUrl: new URL("/dashboard", origin).href,
       enabled: previous.enabled !== false,

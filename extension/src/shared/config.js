@@ -58,7 +58,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
   }
 ];
 
-export const PROVIDER_SCHEMA_VERSION = 3;
+export const PROVIDER_SCHEMA_VERSION = 4;
 export const SUPPORTED_PROVIDER_TYPES = ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"];
 export const BUILTIN_PROVIDER_IDS = DEFAULT_PROVIDER_CONFIGS.map((config) => config.id);
 
@@ -471,6 +471,7 @@ export function validateProviderConfig(config, existingConfigs = []) {
   validateIdentifier(config.id, "Provider id");
   if (!config.name || !String(config.name).trim()) throw new Error(`Provider ${config.id} name is required`);
   validateShortText(config.name, `Provider ${config.id} name`);
+  validateShortText(config.group, `Provider ${config.id} group`);
   if (!SUPPORTED_PROVIDER_TYPES.includes(config.type)) {
     throw new Error(`Unsupported provider type: ${config.type}`);
   }
@@ -509,6 +510,7 @@ export function normalizeProviderConfig(raw) {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id: raw.id == null ? "" : String(raw.id),
     name: raw.name == null ? String(raw.id || "") : String(raw.name),
+    group: raw.group == null ? "" : String(raw.group).trim(),
     type: requestedType,
     targetUrl: raw.targetUrl || raw.target_url ? String(raw.targetUrl || raw.target_url) : "",
     rechargeRatio: normalizeRechargeRatio(raw, requestedType),

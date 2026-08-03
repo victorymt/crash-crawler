@@ -1,8 +1,11 @@
+import { groupProviderConfigs } from "../shared/provider_groups.js";
+
 let configs = [];
 let snapshots = [];
 let activeOperation = false;
 let providersLoaded = false;
 let currentPage = null;
+const collapsedGroups = new Set();
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -116,17 +119,15 @@ function balanceHtml(balance) {
   </div>`;
 }
 
-function render() {
-  const root = document.getElementById("provider-list");
-  root.innerHTML = configs.map((config) => {
-    const snapshot = snapshots.find((item) => item.id === config.id) || {};
-    const balances = snapshot.balances || [];
-    const balanceKeys = new Set(balances.map((item) => `${item.key}|${item.label}|${item.value}`));
-    const usage = snapshot.usage?.length
-      ? snapshot.usage
-      : (snapshot.metrics || []).filter((item) => !balanceKeys.has(`${item.key}|${item.label}|${item.value}`));
-    const links = snapshot.links || config.links || [{ label: "打开官方页面", url: config.targetUrl }];
-    return `<article class="provider-card">
+function providerCardHtml(config) {
+  const snapshot = snapshots.find((item) => item.id === config.id) || {};
+  const balances = snapshot.balances || [];
+  const balanceKeys = new Set(balances.map((item) => `${item.key}|${item.label}|${item.value}`));
+  const usage = snapshot.usage?.length
+    ? snapshot.usage
+    : (snapshot.metrics || []).filter((item) => !balanceKeys.has(`${item.key}|${item.label}|${item.value}`));
+  const links = snapshot.links || config.links || [{ label: "打开官方页面", url: config.targetUrl }];
+  return `<article class="provider-card">
       <div class="card-head">
         <div>
           <div class="provider-name">${escapeHtml(config.name)}</div>
@@ -146,7 +147,29 @@ function render() {
         <button data-copy="${escapeHtml(config.id)}">复制 URL</button>
       </div>
     </article>`;
+}
+
+function render() {
+  const root = document.getElementById("provider-list");
+  root.innerHTML = groupProviderConfigs(configs).map((group) => {
+    const collapsed = collapsedGroups.has(group.name);
+    return `<section class="provider-group ${collapsed ? "collapsed" : ""}" data-provider-group="${escapeHtml(group.name)}">
+      <button class="provider-group-toggle" type="button" data-toggle-provider-group="${escapeHtml(group.name)}" aria-expanded="${!collapsed}">
+        <span class="group-chevron" aria-hidden="true">${collapsed ? "▸" : "▾"}</span>
+        <span class="provider-group-name">${escapeHtml(group.label)}</span>
+        <span class="provider-group-count">${group.providers.length}</span>
+      </button>
+      <div class="provider-grid">${group.providers.map(providerCardHtml).join("")}</div>
+    </section>`;
   }).join("");
+  root.querySelectorAll("[data-toggle-provider-group]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const groupName = button.dataset.toggleProviderGroup;
+      if (collapsedGroups.has(groupName)) collapsedGroups.delete(groupName);
+      else collapsedGroups.add(groupName);
+      render();
+    });
+  });
   root.querySelectorAll("[data-refresh-provider]").forEach((button) => {
     button.addEventListener("click", () => refreshProvider(button.dataset.refreshProvider));
   });

@@ -135,19 +135,87 @@ button:disabled {
 .section-actions,
 .editor-actions,
 .provider-actions,
+.layout-actions,
 .source-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
+.provider-group {
+  padding: 14px 0 6px;
+  border-top: 1px solid var(--line);
+}
+
+.provider-group:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.provider-group-head {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 38px;
+  padding-bottom: 6px;
+}
+
+.provider-group-head h3 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-count {
+  min-width: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
 .provider-row {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) auto;
-  gap: 14px;
+  grid-template-columns: 34px 68px minmax(140px, 1fr) auto auto;
+  gap: 10px;
   align-items: center;
   padding: 12px 0;
   border-top: 1px solid var(--line);
+}
+
+.drag-handle,
+.icon-button {
+  display: inline-grid;
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+  place-items: center;
+  color: var(--muted);
+}
+
+.drag-handle {
+  cursor: grab;
+  font-size: 17px;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+.layout-actions {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.provider-group.dragging,
+.provider-row.dragging {
+  opacity: .45;
+}
+
+.provider-group.drop-target > .provider-group-head,
+.provider-row.drop-target {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .provider-summary {
@@ -394,7 +462,18 @@ h3 {
 @media (max-width: 720px) {
   main { padding: 12px; }
   .section-head { align-items: stretch; flex-direction: column; }
-  .provider-row { grid-template-columns: 1fr; }
+  .provider-row {
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+  }
+  .provider-row .checkbox-label,
+  .provider-row .provider-summary,
+  .provider-row .provider-actions {
+    grid-column: 2 / -1;
+  }
+  .provider-row .provider-layout-actions {
+    grid-column: 3;
+    grid-row: 1;
+  }
   .provider-actions { justify-content: flex-start; }
   .form-grid,
   .basic-fields,

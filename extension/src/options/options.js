@@ -4,6 +4,11 @@ import {
   normalizeProviderConfig,
   originsForConfig
 } from "../shared/config.js";
+import {
+  groupProviderConfigs,
+  moveProvider,
+  moveProviderGroup
+} from "../shared/provider_groups.js";
 
 let configs = [];
 let draftConfig = null;
@@ -11,6 +16,7 @@ let draftOriginalId = "";
 let editorReadOnly = false;
 let editorDirty = false;
 let activeOperation = false;
+let dragState = null;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -56,6 +62,7 @@ export function pageProviderTemplate(existingConfigs) {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id,
     name: "新 Provider",
+    group: "",
     type: "page",
     targetUrl: "",
     rechargeRatio: 1,
@@ -80,6 +87,7 @@ export function newApiProviderTemplate(existingConfigs) {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id,
     name: "New API",
+    group: "",
     type: "newapi",
     targetUrl: "",
     rechargeRatio: 1,
@@ -131,6 +139,7 @@ export function sub2ApiProviderTemplate(existingConfigs) {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id,
     name: "AIHub/Sub2API",
+    group: "",
     type: "sub2api",
     targetUrl: "",
     rechargeRatio: 1,
@@ -189,7 +198,9 @@ export function metricRuleTemplate(kind, existingRules = []) {
 
 function setOperationLocked(locked) {
   activeOperation = locked;
-  document.querySelectorAll("button").forEach((button) => { button.disabled = locked; });
+  document.querySelectorAll("button").forEach((button) => {
+    button.disabled = locked || button.dataset.layoutDisabled === "true";
+  });
 }
 
 async function withOperationLock(operation) {
@@ -210,32 +221,188 @@ function providerTypeLabel(config) {
   return isBuiltinProviderId(config.id) ? "内置" : "自定义";
 }
 
+function layoutButton(action, label, symbol, disabled = false) {
+  const safeLabel = escapeHtml(label);
+  return `<button type="button" class="icon-button" data-layout-action="${action}" data-layout-disabled="${disabled}" ${disabled ? "disabled" : ""} title="${safeLabel}" aria-label="${safeLabel}">${symbol}</button>`;
+}
+
 function renderProviderList() {
   const root = document.getElementById("providers");
-  root.innerHTML = configs.map((config) => {
-    const builtin = isBuiltinProviderId(config.id);
-    return `<div class="provider-row" data-provider="${escapeHtml(config.id)}">
-      <label class="checkbox-label">
-        <input type="checkbox" data-provider-toggle ${config.enabled ? "checked" : ""}>
-        启用
-      </label>
-      <div class="provider-summary">
-        <div class="provider-title">
-          <strong>${escapeHtml(config.name)}</strong>
-          <span class="source-badge">${providerTypeLabel(config)}</span>
+  const groups = groupProviderConfigs(configs);
+  root.innerHTML = groups.map((group, groupIndex) => `
+    <div class="provider-group" data-provider-group="${escapeHtml(group.name)}">
+      <div class="provider-group-head">
+        <button type="button" class="drag-handle" draggable="true" data-drag-group title="拖动分组" aria-label="拖动 ${escapeHtml(group.label)} 分组">≡</button>
+        <h3>${escapeHtml(group.label)}</h3>
+        <span class="provider-count">${group.providers.length}</span>
+        <div class="layout-actions">
+          ${layoutButton("group-up", `上移 ${group.label} 分组`, "↑", groupIndex === 0)}
+          ${layoutButton("group-down", `下移 ${group.label} 分组`, "↓", groupIndex === groups.length - 1)}
         </div>
-        <div class="provider-url" title="${escapeHtml(config.targetUrl)}">${escapeHtml(config.targetUrl)}</div>
       </div>
-      <div class="provider-actions">
-        <button type="button" data-provider-action="edit">编辑</button>
-        ${builtin ? '<button type="button" data-provider-action="duplicate">复制</button>' : ""}
-        <button type="button" data-provider-action="test">测试</button>
-        <button type="button" data-provider-action="export">导出</button>
-        ${builtin ? "" : '<button type="button" data-provider-action="delete">删除</button>'}
+      <div class="provider-group-list">
+        ${group.providers.map((config, providerIndex) => {
+          const builtin = isBuiltinProviderId(config.id);
+          return `<div class="provider-row" data-provider="${escapeHtml(config.id)}">
+            <button type="button" class="drag-handle" draggable="true" data-provider-drag title="拖动排序" aria-label="拖动 ${escapeHtml(config.name)}">≡</button>
+            <label class="checkbox-label">
+              <input type="checkbox" data-provider-toggle ${config.enabled ? "checked" : ""}>
+              启用
+            </label>
+            <div class="provider-summary">
+              <div class="provider-title">
+                <strong>${escapeHtml(config.name)}</strong>
+                <span class="source-badge">${providerTypeLabel(config)}</span>
+              </div>
+              <div class="provider-url" title="${escapeHtml(config.targetUrl)}">${escapeHtml(config.targetUrl)}</div>
+            </div>
+            <div class="layout-actions provider-layout-actions">
+              ${layoutButton("provider-up", `上移 ${config.name}`, "↑", providerIndex === 0)}
+              ${layoutButton("provider-down", `下移 ${config.name}`, "↓", providerIndex === group.providers.length - 1)}
+            </div>
+            <div class="provider-actions">
+              <button type="button" data-provider-action="edit">编辑</button>
+              ${builtin ? '<button type="button" data-provider-action="duplicate">复制</button>' : ""}
+              <button type="button" data-provider-action="test">测试</button>
+              <button type="button" data-provider-action="export">导出</button>
+              ${builtin ? "" : '<button type="button" data-provider-action="delete">删除</button>'}
+            </div>
+          </div>`;
+        }).join("")}
       </div>
-    </div>`;
-  }).join("");
-  root.querySelectorAll("button").forEach((button) => { button.disabled = activeOperation; });
+    </div>`).join("");
+  root.querySelectorAll("button").forEach((button) => {
+    button.disabled = activeOperation || button.dataset.layoutDisabled === "true";
+  });
+}
+
+function configsWithCurrentToggles() {
+  const toggles = new Map([...document.querySelectorAll(".provider-row")].map((row) => [
+    row.dataset.provider,
+    row.querySelector("[data-provider-toggle]")?.checked
+  ]));
+  return configs.map((config) => ({
+    ...config,
+    enabled: toggles.has(config.id) ? toggles.get(config.id) : config.enabled
+  }));
+}
+
+async function persistProviderLayout(nextConfigs, message = "Provider 排序已保存。") {
+  return withOperationLock(async () => {
+    try {
+      const response = await sendMessage({ type: "config:save", configs: nextConfigs });
+      configs = response.configs;
+      renderProviderList();
+      setMessage(message);
+    } catch (error) {
+      renderProviderList();
+      setMessage(error.message || "保存 Provider 排序失败", true);
+    }
+  });
+}
+
+function applyLayoutAction(button) {
+  const action = button.dataset.layoutAction;
+  const sourceConfigs = configsWithCurrentToggles();
+  const groupNode = button.closest("[data-provider-group]");
+  const groupName = groupNode?.dataset.providerGroup ?? "";
+  const groups = groupProviderConfigs(sourceConfigs);
+  const groupIndex = groups.findIndex((group) => group.name === groupName);
+  let nextConfigs = sourceConfigs;
+
+  if (action === "group-up" || action === "group-down") {
+    const offset = action === "group-up" ? -1 : 1;
+    const target = groups[groupIndex + offset];
+    if (!target) return;
+    nextConfigs = moveProviderGroup(sourceConfigs, groupName, target.name, offset > 0);
+  } else {
+    const providerId = button.closest("[data-provider]")?.dataset.provider;
+    const providers = groups[groupIndex]?.providers || [];
+    const providerIndex = providers.findIndex((provider) => provider.id === providerId);
+    const offset = action === "provider-up" ? -1 : 1;
+    const target = providers[providerIndex + offset];
+    if (!providerId || !target) return;
+    nextConfigs = moveProvider(sourceConfigs, providerId, groupName, target.id, offset > 0);
+  }
+  persistProviderLayout(nextConfigs);
+}
+
+function clearDragState() {
+  dragState = null;
+  document.querySelectorAll(".dragging, .drop-target").forEach((node) => {
+    node.classList.remove("dragging", "drop-target");
+  });
+}
+
+function dragPlacement(event, target) {
+  const bounds = target.getBoundingClientRect();
+  return event.clientY > bounds.top + bounds.height / 2;
+}
+
+function handleLayoutDragStart(event) {
+  const groupHandle = event.target.closest("[data-drag-group]");
+  const providerHandle = event.target.closest("[data-provider-drag]");
+  if (!groupHandle && !providerHandle) return;
+  if (groupHandle) {
+    const group = groupHandle.closest("[data-provider-group]");
+    dragState = { kind: "group", groupName: group.dataset.providerGroup };
+    group.classList.add("dragging");
+  } else {
+    const row = providerHandle.closest("[data-provider]");
+    dragState = { kind: "provider", providerId: row.dataset.provider };
+    row.classList.add("dragging");
+  }
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", dragState.kind);
+}
+
+function handleLayoutDragOver(event) {
+  if (!dragState) return;
+  const target = dragState.kind === "provider"
+    ? event.target.closest("[data-provider], [data-provider-group]")
+    : event.target.closest("[data-provider-group]");
+  if (!target) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".drop-target").forEach((node) => node.classList.remove("drop-target"));
+  target.classList.add("drop-target");
+}
+
+function handleLayoutDrop(event) {
+  if (!dragState) return;
+  event.preventDefault();
+  const sourceConfigs = configsWithCurrentToggles();
+  let nextConfigs = sourceConfigs;
+  if (dragState.kind === "provider") {
+    const targetRow = event.target.closest("[data-provider]");
+    if (targetRow?.dataset.provider === dragState.providerId) {
+      clearDragState();
+      return;
+    }
+    const targetGroup = event.target.closest("[data-provider-group]");
+    if (!targetGroup) return;
+    nextConfigs = moveProvider(
+      sourceConfigs,
+      dragState.providerId,
+      targetGroup.dataset.providerGroup,
+      targetRow?.dataset.provider || null,
+      targetRow ? dragPlacement(event, targetRow) : false
+    );
+  } else {
+    const targetGroup = event.target.closest("[data-provider-group]");
+    if (!targetGroup || targetGroup.dataset.providerGroup === dragState.groupName) {
+      clearDragState();
+      return;
+    }
+    nextConfigs = moveProviderGroup(
+      sourceConfigs,
+      dragState.groupName,
+      targetGroup.dataset.providerGroup,
+      dragPlacement(event, targetGroup)
+    );
+  }
+  clearDragState();
+  persistProviderLayout(nextConfigs);
 }
 
 function pageOptions(config, selectedPageId) {
@@ -365,6 +532,11 @@ function renderEditor() {
       : "新增来源";
   document.getElementById("source-name").value = draftConfig.name || "";
   document.getElementById("source-id").value = draftConfig.id || "";
+  document.getElementById("source-group").value = draftConfig.group || "";
+  document.getElementById("provider-groups").innerHTML = groupProviderConfigs(configs)
+    .filter((group) => group.name)
+    .map((group) => `<option value="${escapeHtml(group.name)}"></option>`)
+    .join("");
   document.getElementById("source-enabled").checked = draftConfig.enabled !== false;
   document.getElementById("source-refresh-on-visit").checked = draftConfig.refreshOnVisit === true;
   document.getElementById("source-type").value = draftConfig.type || "page";
@@ -461,6 +633,7 @@ function readEditorSource() {
     schemaVersion: PROVIDER_SCHEMA_VERSION,
     id: document.getElementById("source-id").value.trim(),
     name: document.getElementById("source-name").value.trim(),
+    group: document.getElementById("source-group").value.trim(),
     type: document.getElementById("source-type").value || draftConfig?.type || "page",
     targetUrl: document.getElementById("source-target-url").value.trim(),
     rechargeRatio: Number(document.getElementById("source-recharge-ratio").value),
@@ -822,11 +995,8 @@ function applySettingsToForm(settings) {
 async function saveGlobal() {
   return withOperationLock(async () => {
     try {
-    const updatedConfigs = configs.map((config) => {
-      const row = [...document.querySelectorAll(".provider-row")].find((item) => item.dataset.provider === config.id);
-      return { ...config, enabled: row?.querySelector("[data-provider-toggle]").checked ?? config.enabled };
-    });
-    await sendMessage({ type: "config:save", configs: updatedConfigs });
+    const updatedConfigs = configsWithCurrentToggles();
+    const configResponse = await sendMessage({ type: "config:save", configs: updatedConfigs });
     await sendMessage({
       type: "secret:setDeepSeekKey",
       value: document.getElementById("deepseek-key").value.trim()
@@ -838,7 +1008,7 @@ async function saveGlobal() {
         autoRefreshTabPolicy: document.getElementById("auto-refresh-tab-policy").value
       }
     });
-    configs = updatedConfigs;
+    configs = configResponse.configs;
     renderProviderList();
     applySettingsToForm(settingsResponse.settings);
     const interval = settingsResponse.settings?.autoRefreshMinutes || 0;
@@ -900,9 +1070,18 @@ if (typeof document !== "undefined") {
   document.getElementById("source-form").addEventListener("submit", saveEditor);
   document.getElementById("delete-source").addEventListener("click", () => deleteProvider(draftOriginalId));
   document.getElementById("providers").addEventListener("click", (event) => {
+    const layoutButton = event.target.closest("[data-layout-action]");
+    if (layoutButton) {
+      applyLayoutAction(layoutButton);
+      return;
+    }
     const button = event.target.closest("[data-provider-action]");
     if (button) handleProviderAction(button.closest("[data-provider]").dataset.provider, button.dataset.providerAction);
   });
+  document.getElementById("providers").addEventListener("dragstart", handleLayoutDragStart);
+  document.getElementById("providers").addEventListener("dragover", handleLayoutDragOver);
+  document.getElementById("providers").addEventListener("drop", handleLayoutDrop);
+  document.getElementById("providers").addEventListener("dragend", clearDragState);
   document.getElementById("source-form").addEventListener("click", (event) => {
     const button = event.target.closest("[data-editor-action]");
     if (button) handleEditorAction(button);

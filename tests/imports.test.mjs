@@ -4,6 +4,7 @@ import test from "node:test";
 
 test("extension modules import without syntax errors", async () => {
   await import("../extension/src/shared/config.js");
+  await import("../extension/src/shared/provider_groups.js");
   await import("../extension/src/shared/channels.js");
   await import("../extension/src/shared/snapshots.js");
   await import("../extension/src/shared/parsers.js");
@@ -51,7 +52,8 @@ test("page provider template generates a unique id", async () => {
   assert.equal(template.id, "page-provider-3");
   assert.equal(template.type, "page");
   assert.equal(template.refreshOnVisit, false);
-  assert.equal(template.schemaVersion, 3);
+  assert.equal(template.schemaVersion, 4);
+  assert.equal(template.group, "");
   assert.equal(template.rechargeRatio, 1);
   assert.deepEqual(template.parserRules.quotas, []);
   const newApiTemplate = newApiProviderTemplate([{ id: "newapi-1" }]);
@@ -83,6 +85,8 @@ test("options page uses a structured provider editor", async () => {
   assert.match(html, /id="source-target-url"/);
   assert.match(html, /id="source-refresh-on-visit"/);
   assert.match(html, /id="source-recharge-ratio"/);
+  assert.match(html, /id="source-group"/);
+  assert.match(html, /id="provider-groups"/);
   assert.match(html, /data-editor-action="add-balance"/);
   assert.match(html, /data-editor-action="add-quota"/);
   assert.doesNotMatch(html, /id="source-json"/);
@@ -137,6 +141,18 @@ test("popup can detect and add the current relay site", async () => {
   assert.match(script, /chrome\.tabs\.query\(\{ active: true, currentWindow: true \}\)/);
   assert.match(script, /chrome\.permissions\.request/);
   assert.match(script, /providers:addCurrentPage/);
+});
+
+test("provider grouping is exposed in settings and the popup", async () => {
+  const optionsScript = await readFile(new URL("../extension/src/options/options.js", import.meta.url), "utf8");
+  const popupScript = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
+
+  assert.match(optionsScript, /data-layout-action/);
+  assert.match(optionsScript, /data-drag-group/);
+  assert.match(optionsScript, /data-provider-drag/);
+  assert.match(optionsScript, /config:save/);
+  assert.match(popupScript, /groupProviderConfigs/);
+  assert.match(popupScript, /data-toggle-provider-group/);
 });
 
 test("options page exposes export all sources control", async () => {

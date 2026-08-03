@@ -45,7 +45,7 @@ test("storage imports and exports single provider sources", async () => {
   });
 
   assert.equal(imported.id, "two");
-  assert.equal(imported.schemaVersion, 3);
+  assert.equal(imported.schemaVersion, 4);
   assert.equal(imported.rechargeRatio, 1);
   assert.equal((await getProviderConfigs()).length, 6);
   assert.equal((await exportProviderConfig("two")).parserRules.balances[0].label, "余额");
@@ -148,7 +148,7 @@ test("provider configs migrate and validate recharge ratios", async () => {
   });
   const custom = normalizeProviderConfig({ ...generic, rechargeRatio: "12.5" });
 
-  assert.equal(ezai.schemaVersion, 3);
+  assert.equal(ezai.schemaVersion, 4);
   assert.equal(ezai.rechargeRatio, 10);
   assert.equal(generic.rechargeRatio, 1);
   assert.equal(custom.rechargeRatio, 12.5);
@@ -190,6 +190,37 @@ test("storage preserves builtin OpenCode workspace URL customizations", async ()
   assert.equal(reloaded.targetUrl, workspace);
   assert.equal(reloaded.type, "opencode");
 
+  globalThis.chrome = originalChrome;
+});
+
+test("storage preserves provider groups and the complete provider order", async () => {
+  const originalChrome = globalThis.chrome;
+  const store = {};
+  globalThis.chrome = {
+    storage: { local: {
+      async get(key) {
+        if (Array.isArray(key)) return Object.fromEntries(key.map((item) => [item, store[item]]));
+        return { [key]: store[key] };
+      },
+      async set(value) { Object.assign(store, value); }
+    } }
+  };
+  const { getProviderConfigs, saveProviderConfigs } = await import(`../extension/src/shared/storage.js?order=${Date.now()}`);
+  const defaults = await getProviderConfigs();
+  const custom = {
+    id: "relay",
+    name: "Relay",
+    group: "低倍率",
+    type: "page",
+    targetUrl: "https://relay.example.test"
+  };
+  const requested = [custom, ...defaults.slice().reverse()];
+  await saveProviderConfigs(requested);
+  const saved = await getProviderConfigs();
+
+  assert.deepEqual(saved.map((provider) => provider.id), requested.map((provider) => provider.id));
+  assert.equal(saved[0].group, "低倍率");
+  assert.equal(saved.find((provider) => provider.id === "deepseek").group, "");
   globalThis.chrome = originalChrome;
 });
 

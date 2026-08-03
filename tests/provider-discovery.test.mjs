@@ -118,6 +118,7 @@ test("popup discovery adds a logged-in Sub2API site once and stores its first sn
     storedProvider.type = "page";
     storedProvider.targetUrl = "https://relay.example.test/providers";
     storedProvider.rechargeRatio = 7;
+    storedProvider.group = "低倍率";
     const upgraded = await send({ type: "providers:addCurrentPage", page });
     assert.equal(upgraded.ok, true);
     assert.equal(upgraded.added, false);
@@ -126,6 +127,7 @@ test("popup discovery adds a logged-in Sub2API site once and stores its first sn
     assert.equal(upgraded.provider.type, "sub2api");
     assert.equal(upgraded.provider.targetUrl, "https://relay.example.test/dashboard");
     assert.equal(upgraded.provider.rechargeRatio, 7);
+    assert.equal(upgraded.provider.group, "低倍率");
 
     const unsupported = await send({
       type: "providers:addCurrentPage",

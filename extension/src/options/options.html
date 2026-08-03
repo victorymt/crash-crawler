@@ -72,6 +72,11 @@
             <input id="source-id" required pattern="[a-zA-Z0-9._\-]+">
           </label>
           <label>
+            分组
+            <input id="source-group" list="provider-groups" maxlength="200" placeholder="未分组">
+            <datalist id="provider-groups"></datalist>
+          </label>
+          <label>
             充值比例（1:N）
             <input id="source-recharge-ratio" type="number" min="0.01" max="1000" step="0.01" required>
           </label>

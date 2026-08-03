@@ -53,7 +53,7 @@ export function normalizeExtensionSettings(raw = {}) {
 
 /**
  * Built-ins keep type/mode/id fixed, but users may customize
- * name, targetUrl, secondaryUrls, and enabled (e.g. OpenCode workspace).
+ * name, group, targetUrl, secondaryUrls, and enabled (e.g. OpenCode workspace).
  */
 export function mergeBuiltinConfig(defaultConfig, stored) {
   if (!stored || typeof stored !== "object") {
@@ -76,6 +76,7 @@ export function mergeBuiltinConfig(defaultConfig, stored) {
     enabled: stored.enabled ?? defaultConfig.enabled,
     refreshOnVisit: stored.refreshOnVisit ?? defaultConfig.refreshOnVisit,
     rechargeRatio: stored.rechargeRatio ?? stored.recharge_ratio ?? defaultConfig.rechargeRatio,
+    group: stored.group ?? defaultConfig.group ?? "",
     name,
     targetUrl,
     secondaryUrls
@@ -84,12 +85,24 @@ export function mergeBuiltinConfig(defaultConfig, stored) {
 
 function normalizeStoredConfigs(configs) {
   const rawConfigs = Array.isArray(configs) ? configs : [];
-  const builtins = DEFAULT_PROVIDER_CONFIGS.map((defaultConfig) => {
-    const stored = rawConfigs.find((item) => item?.id === defaultConfig.id);
-    return mergeBuiltinConfig(defaultConfig, stored);
-  });
-  const custom = rawConfigs.filter((item) => item && !isBuiltinProviderId(item.id));
-  return normalizeProviderConfigs([...builtins, ...custom]);
+  const builtinDefaults = new Map(DEFAULT_PROVIDER_CONFIGS.map((config) => [config.id, config]));
+  const seenBuiltins = new Set();
+  const ordered = [];
+  for (const rawConfig of rawConfigs) {
+    if (!rawConfig || typeof rawConfig !== "object") continue;
+    const defaultConfig = builtinDefaults.get(rawConfig.id);
+    if (!defaultConfig) {
+      ordered.push(rawConfig);
+      continue;
+    }
+    if (seenBuiltins.has(defaultConfig.id)) continue;
+    seenBuiltins.add(defaultConfig.id);
+    ordered.push(mergeBuiltinConfig(defaultConfig, rawConfig));
+  }
+  for (const defaultConfig of DEFAULT_PROVIDER_CONFIGS) {
+    if (!seenBuiltins.has(defaultConfig.id)) ordered.push(mergeBuiltinConfig(defaultConfig, null));
+  }
+  return normalizeProviderConfigs(ordered);
 }
 
 function storageGet(keys) {
