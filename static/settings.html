@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设置 · Provider Usage Hub</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="/">
+        <span>Provider Usage Hub</span>
+        <strong>设置</strong>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="/">Providers</a>
+        <a href="/channels">渠道</a>
+        <a class="active" href="/settings">设置</a>
+      </nav>
+      <div class="toolbar">
+        <button id="import-config" type="button">导入</button>
+        <button id="export-config" type="button">导出</button>
+        <button id="add-provider" type="button" class="primary">新增 Provider</button>
+        <input id="import-file" class="file-input" type="file" accept="application/json,.json">
+      </div>
+      <div id="message" class="message" aria-live="polite"></div>
+    </div>
+  </header>
+  <main class="page-shell">
+    <section class="settings-section" aria-labelledby="provider-title">
+      <div class="section-heading">
+        <div>
+          <h1 id="provider-title">Provider 管理</h1>
+          <p>列表顺序会同步到主页面；可跨分组调整顺序。</p>
+        </div>
+      </div>
+      <div class="bulk-bar">
+        <label class="check-field"><input id="select-all" type="checkbox"><span>全选</span></label>
+        <input id="bulk-group" type="text" list="group-options" placeholder="分组名称；留空为未分组" maxlength="200">
+        <button id="move-selected" type="button">移动所选</button>
+        <small id="selection-meta">未选择 Provider</small>
+        <datalist id="group-options"></datalist>
+      </div>
+      <div id="provider-list" class="provider-config-list" aria-live="polite"></div>
+    </section>
+    <section class="settings-section" aria-labelledby="refresh-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="refresh-title">自动刷新</h2>
+          <p>本地服务运行时按间隔刷新全部已启用 Provider。</p>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <div class="inline-setting">
+          <label class="field">
+            <span>刷新间隔</span>
+            <select id="auto-refresh">
+              <option value="0">关闭</option>
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 1 小时</option>
+              <option value="120">每 2 小时</option>
+              <option value="360">每 6 小时</option>
+            </select>
+          </label>
+          <button id="save-settings" type="button" class="primary">保存</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="provider-dialog">
+    <form id="provider-form" class="dialog-form">
+      <div class="dialog-head">
+        <h2 id="editor-title">新增 Provider</h2>
+        <button id="close-editor" type="button" class="compact" aria-label="关闭">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <div class="form-grid">
+          <label class="field"><span>ID</span><input id="provider-id" required maxlength="100" pattern="[A-Za-z0-9._-]+"></label>
+          <label class="field"><span>名称</span><input id="provider-name" required maxlength="200"></label>
+          <label class="field"><span>类型</span>
+            <select id="provider-type">
+              <option value="page">通用页面</option>
+              <option value="newapi">NewAPI</option>
+              <option value="sub2api">Sub2API</option>
+              <option value="opencode">OpenCode</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="ezaiclub">EZAICLUB</option>
+              <option value="siliconflow">SiliconFlow</option>
+            </select>
+          </label>
+          <label class="field"><span>分组</span><input id="provider-group" list="group-options" maxlength="200"></label>
+          <label class="field wide"><span>主页 URL</span><input id="provider-url" type="url" required></label>
+          <label class="field"><span>充值比例 1:N</span><input id="provider-ratio" type="number" min="0.01" max="1000" step="0.01" value="1" required></label>
+          <label class="check-field"><input id="provider-enabled" type="checkbox" checked><span>启用 Provider</span></label>
+        </div>
+        <div id="newapi-panel" class="conditional-panel" hidden>
+          <label class="field"><span>每美元额度单位</span><input id="quota-per-unit" type="number" min="1" step="1" value="500000"></label>
+        </div>
+        <div id="page-panel" class="conditional-panel" hidden>
+          <label class="field"><span>附加页面 JSON</span><textarea id="secondary-urls" spellcheck="false" placeholder='[{"id":"subscriptions","label":"订阅页","url":"https://example.com/subscriptions"}]'></textarea></label>
+          <label class="field"><span>解析规则 JSON</span><textarea id="parser-rules" spellcheck="false" placeholder='{"balances":[{"id":"balance-1","label":"余额","selector":".balance","currency":"USD"}]}'></textarea></label>
+        </div>
+        <div id="deepseek-panel" class="conditional-panel" hidden>
+          <label class="field"><span>DeepSeek API Key</span><input id="deepseek-key" type="password" autocomplete="off" placeholder="留空则保持不变"></label>
+          <div class="inline-setting">
+            <span id="deepseek-key-status" class="secret-status">尚未保存本地密钥</span>
+            <button id="clear-deepseek-key" type="button" class="danger compact">清除密钥</button>
+          </div>
+        </div>
+        <div id="delete-zone" class="danger-zone" hidden>
+          <p>删除后会同时清理该 Provider 的本地快照。</p>
+          <button id="delete-provider" type="button" class="danger">删除 Provider</button>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="cancel-editor" type="button">取消</button>
+        <button id="save-provider" type="submit" class="primary">保存 Provider</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/static/settings.js"></script>
+</body>
+</html>

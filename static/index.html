@@ -3,27 +3,37 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Provider Usage Hub</title>
-  <link rel="stylesheet" href="/static/dashboard.css">
+  <title>Providers · Provider Usage Hub</title>
+  <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header>
-    <h1>Provider Usage Hub</h1>
-    <div class="toolbar-wrap">
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="/">
+        <span>Provider Usage Hub</span>
+        <strong>Providers</strong>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a class="active" href="/">Providers</a>
+        <a href="/channels">渠道</a>
+        <a href="/settings">设置</a>
+      </nav>
       <div class="toolbar">
-        <button id="sync-auth">同步登录态</button>
-        <button id="refresh-all">刷新解析</button>
-        <button id="open-all">打开全部</button>
+        <button id="sync-auth" type="button">同步登录态</button>
+        <button id="open-all" type="button">打开全部</button>
+        <button id="refresh-all" type="button" class="primary">刷新全部</button>
       </div>
-      <div id="refresh-message" class="refresh-message" aria-live="polite"></div>
+      <div id="message" class="message" aria-live="polite"></div>
     </div>
   </header>
-  <main>
-    <aside>
-      <div class="status-header">状态</div>
-      <div id="provider-list"></div>
-    </aside>
-    <section class="launchers" id="launchers"></section>
+  <main class="page-shell">
+    <section class="summary-band" aria-label="Provider 摘要">
+      <div><strong id="provider-count">0</strong><span>已启用</span></div>
+      <div><strong id="healthy-count">0</strong><span>状态正常</span></div>
+      <div><strong id="attention-count">0</strong><span>需要处理</span></div>
+      <p id="refresh-meta">正在读取本地快照...</p>
+    </section>
+    <section id="provider-groups" class="provider-groups" aria-live="polite"></section>
   </main>
   <script src="/static/dashboard.js"></script>
 </body>

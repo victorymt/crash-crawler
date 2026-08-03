@@ -12,16 +12,11 @@
 
 ## 运行 Web 看板
 
-安装 Playwright：
+首次运行时创建项目虚拟环境并安装 Python 依赖：
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv pip install playwright
-```
-
-DeepSeek 余额使用官方 API，需要配置 API Key：
-
-```bash
-export DEEPSEEK_API_KEY=sk-...
+UV_CACHE_DIR=/tmp/uv-cache uv venv .venv
+UV_CACHE_DIR=/tmp/uv-cache uv pip install -r requirements.txt
 ```
 
 启动服务：
@@ -30,19 +25,40 @@ export DEEPSEEK_API_KEY=sk-...
 uv run python server.py 19765
 ```
 
-打开：
+如果刷新时提示 Playwright 未安装，先确认 `uv run` 使用的是项目虚拟环境：
 
-```text
-http://127.0.0.1:19765
+```bash
+uv run python -c 'import sys, playwright; print(sys.executable); print(playwright.__file__)'
 ```
 
-页面包含：
+输出的解释器路径应位于项目的 `.venv/`。如果依赖已经安装但页面仍显示旧错误，请停止此前由 `python3 server.py 19765` 启动的进程，再使用上面的 `uv run python server.py 19765` 重新启动服务。Provider 的旧错误状态会在下一次刷新成功后被覆盖。
+
+打开后可使用三个页面：
+
+```text
+http://127.0.0.1:19765/          Provider 看板
+http://127.0.0.1:19765/channels  最低倍率可用渠道
+http://127.0.0.1:19765/settings  Provider 与刷新设置
+```
+
+Provider 看板包含：
 
 - “同步登录态”：把 BrowserOS 登录态同步到后端抓取 profile。
-- “刷新解析”：一次并行刷新（API 并行，同 profile 的浏览器抓取复用同一 BrowserOS 实例）。
+- “刷新全部”：一次并行刷新（API 并行，同 profile 的浏览器抓取复用同一 BrowserOS 实例）。
 - Provider 卡片上的“刷新”：只刷新当前 provider。
 - “打开全部”：一次打开所有 provider 主页面。
-- 官方页面按钮和“复制 URL”按钮。
+- 按用户配置的分组和顺序展示余额、额度、订阅指标及错误状态。
+
+渠道页汇总 Sub2API 类渠道监控数据，按模型筛选当前可用渠道，并按实际倍率从低到高排序。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率，可选择包含降级渠道。
+
+设置页支持：
+
+- 新增、编辑、启用、停用和删除 Provider。
+- 设置分组、批量移动 Provider，并用上下按钮调整整体顺序。
+- 导入、导出 Provider JSON；密钥不会进入导出文件。
+- 配置本地服务的自动刷新间隔，默认关闭。
+- 在 DeepSeek Provider 编辑器内保存或清除本地 API Key。也可继续使用 `DEEPSEEK_API_KEY` 环境变量，环境变量优先。
+- 添加通用页面 Provider，以插件兼容的 `secondaryUrls` 和 `parserRules` JSON 配置多页面 CSS/正则解析。
 
 ## BrowserOS 登录态
 
@@ -55,11 +71,11 @@ cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
 rm -f /home/cv/.browseros-crawler-profile/Singleton*
 ```
 
-BrowserOS 关闭时同步最干净。官方页面按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
+BrowserOS 关闭时同步最干净。“打开主页”按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
 
 ## 配置
 
-默认不需要配置即可运行。需要改 URL、profile 或禁用 provider 时：
+默认不需要配置即可运行。推荐直接通过设置页管理。也可以从示例文件开始手工配置：
 
 ```bash
 cp providers.example.json providers.local.json
@@ -71,8 +87,11 @@ cp providers.example.json providers.local.json
 
 - `providers.local.json`
 - `.provider-cache.json`
+- `.provider-secrets.json`
 - `result.json`
 - `dumps/`
+
+本地 Web 支持官方 API、浏览器采集、Sub2API 类渠道和通用 `page` Provider。插件导出的通用页面 Provider 可以直接导入；当前网页自动识别、访问页面触发刷新、工具栏角标属于扩展运行时能力，不适用于本地服务。
 
 ## CLI
 
@@ -233,8 +252,9 @@ Popup 主页面仍以 Provider 为主；点击“渠道”会打开独立的渠�
 - 渲染等待依赖 ready 文本/选择器与稳定采样，不再叠加大段固定 sleep。
 - 快照的 `raw.collection` 会记录各采集策略的成功/失败、耗时和 fallback 原因，并对 Token、Cookie、API Key 做脱敏。
 
-本地回归测试：
+回归测试：
 
 ```bash
 npm test
+uv run python -m unittest discover -p 'test_*.py'
 ```

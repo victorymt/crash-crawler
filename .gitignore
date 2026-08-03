@@ -1,5 +1,6 @@
 providers.local.json
 .provider-cache.json
+.provider-secrets.json
 page_dump.txt
 result.json
 dumps/

@@ -35,7 +35,8 @@
           "url": "https://www.ezaiclub.com/subscriptions"
         }
       ],
-      "mode": "browser"
+      "mode": "browser",
+      "recharge_ratio": 10
     },
     {
       "id": "siliconflow",
@@ -46,6 +47,29 @@
       "profile_dir": "~/.browseros-crawler-profile",
       "cookie_cache": "~/.cache/provider-dashboard/siliconflow/cookies.json",
       "mode": "browser"
+    },
+    {
+      "id": "example-newapi",
+      "name": "Example NewAPI",
+      "type": "newapi",
+      "target_url": "https://newapi.example.com/dashboard",
+      "enabled": false,
+      "profile_dir": "~/.browseros-crawler-profile",
+      "quota_per_unit": 500000,
+      "mode": "browser"
+    },
+    {
+      "id": "example-sub2api",
+      "name": "Example Sub2API",
+      "type": "sub2api",
+      "target_url": "https://sub2api.example.com/dashboard",
+      "enabled": false,
+      "profile_dir": "~/.browseros-crawler-profile",
+      "recharge_ratio": 1,
+      "mode": "browser"
     }
-  ]
+  ],
+  "settings": {
+    "auto_refresh_minutes": 0
+  }
 }

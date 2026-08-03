@@ -6,12 +6,23 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from providers import ProviderError, ProviderManager, links_for_config, load_config, sync_browseros_profile
+from channels import available_channel_models, rank_available_channels, summarize_channel_refresh
+from providers import (
+    ProviderError,
+    ProviderManager,
+    delete_local_secret,
+    links_for_config,
+    load_local_secret,
+    set_local_secret,
+    sync_browseros_profile,
+)
+from web_store import ConfigStore
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -22,24 +33,60 @@ def json_bytes(data: object) -> bytes:
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def public_configs() -> list[dict[str, object]]:
+def public_configs(configs, enabled_only: bool = False) -> list[dict[str, object]]:
     return [
         {
-            "id": config.id,
-            "name": config.name,
-            "type": config.type,
-            "target_url": config.target_url,
-            "enabled": config.enabled,
-            "mode": config.mode,
+            **config.to_dict(),
             "links": links_for_config(config),
         }
-        for config in load_config()
-        if config.enabled
+        for config in configs
+        if config.enabled or not enabled_only
     ]
 
 
+class AutoRefreshScheduler:
+    def __init__(self, manager: ProviderManager) -> None:
+        self.manager = manager
+        self.minutes = 0
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="provider-auto-refresh", daemon=True)
+
+    def start(self, minutes: int = 0) -> None:
+        self.minutes = minutes
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def configure(self, minutes: int) -> None:
+        self.minutes = minutes
+        self._wake.set()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            interval = max(0, self.minutes) * 60
+            if not interval:
+                self._wake.wait()
+                self._wake.clear()
+                continue
+            if self._wake.wait(interval):
+                self._wake.clear()
+                continue
+            try:
+                self.manager.refresh_all()
+            except Exception as exc:
+                print(f"[server] automatic refresh failed: {exc}")
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
-    manager = ProviderManager()
+    store = ConfigStore()
+    manager = ProviderManager(configs=store.snapshot()[0])
+    scheduler: AutoRefreshScheduler | None = None
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[server] {self.address_string()} - {fmt % args}")
@@ -53,22 +100,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(content)
 
     def send_json(self, data: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json_bytes(data), "application/json; charset=utf-8", status)
 
+    def read_json(self, max_bytes: int = 1024 * 1024) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length <= 0 or length > max_bytes:
+            raise ValueError("request body must be between 1 byte and 1 MiB")
+        data = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
+
+    def send_api_error(self, exc: Exception) -> None:
+        if isinstance(exc, KeyError):
+            self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+        elif isinstance(exc, (ValueError, ProviderError, json.JSONDecodeError)):
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        else:
+            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def apply_configs(self, configs) -> list[dict[str, object]]:
+        self.manager.replace_configs(configs)
+        return public_configs(configs)
+
     def serve_static(self, path: str) -> None:
         relative = path[len("/static/") :] if path.startswith("/static/") else path.lstrip("/")
-        if path == "/":
-            file_path = STATIC_DIR / "index.html"
-        else:
+        aliases = {
+            "/": "index.html",
+            "/channels": "channels.html",
+            "/settings": "settings.html",
+        }
+        if path in aliases:
+            file_path = STATIC_DIR / aliases[path]
+        elif path.startswith("/static/"):
             file_path = (STATIC_DIR / relative).resolve()
             static_root = STATIC_DIR.resolve()
             if static_root not in file_path.parents and file_path != static_root:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
                 return
+        else:
+            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            return
         if not file_path.is_file():
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return
@@ -81,12 +162,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_bytes(file_path.read_bytes(), content_type)
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/" or path.startswith("/static/"):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in {"/", "/channels", "/settings"} or path.startswith("/static/"):
             self.serve_static(path)
             return
         if path == "/api/providers":
-            self.send_json({"providers": self.manager.list_snapshots(), "configs": public_configs()})
+            configs, settings = self.store.snapshot()
+            self.send_json({
+                "providers": self.manager.list_snapshots(),
+                "configs": public_configs(configs, enabled_only=True),
+                "settings": settings,
+            })
+            return
+        if path == "/api/config":
+            configs, settings = self.store.snapshot()
+            self.send_json({
+                "configs": public_configs(configs),
+                "settings": settings,
+                "has_deepseek_key": bool(load_local_secret("deepseek_api_key")),
+            })
+            return
+        if path == "/api/channels":
+            query = parse_qs(parsed.query)
+            selected_model = str(query.get("model", [""])[0])
+            include_degraded = str(query.get("include_degraded", [""])[0]).lower() in {"1", "true", "yes"}
+            snapshots = self.manager.list_snapshots()
+            candidates = rank_available_channels(
+                snapshots,
+                selected_model,
+                statuses=("operational", "degraded") if include_degraded else ("operational",),
+            )
+            self.send_json({
+                "channels": candidates,
+                "models": available_channel_models(snapshots),
+                "summary": summarize_channel_refresh(snapshots),
+            })
             return
         if path.startswith("/dumps/"):
             self.serve_dump(path)
@@ -95,9 +206,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         path = urlparse(self.path).path
-        if path == "/" or path.startswith("/static/"):
+        if path in {"/", "/channels", "/settings"} or path.startswith("/static/"):
             self.send_response(HTTPStatus.OK)
-            if path == "/" or path.endswith(".html"):
+            if path in {"/", "/channels", "/settings"} or path.endswith(".html"):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
             elif path.endswith(".css"):
                 self.send_header("Content-Type", "text/css; charset=utf-8")
@@ -129,6 +240,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
+        if path == "/api/refresh-channels":
+            try:
+                providers = self.manager.refresh_channels()
+                self.send_json({"providers": providers, "summary": summarize_channel_refresh(providers)})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/config/provider":
+            try:
+                provider = self.store.upsert(self.read_json().get("provider"))
+                configs, _ = self.store.snapshot()
+                self.apply_configs(configs)
+                self.send_json({"provider": public_configs([provider])[0], "configs": public_configs(configs)})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/config/providers":
+            try:
+                payload = self.read_json()
+                if not isinstance(payload.get("providers"), list):
+                    raise ValueError("providers must be an array")
+                configs = self.store.replace(payload["providers"])
+                self.send_json({"configs": self.apply_configs(configs)})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/config/settings":
+            try:
+                settings = self.store.save_settings(self.read_json().get("settings"))
+                if self.scheduler:
+                    self.scheduler.configure(settings["auto_refresh_minutes"])
+                self.send_json({"settings": settings})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/secrets/deepseek":
+            try:
+                value = str(self.read_json().get("value") or "").strip()
+                if not value:
+                    raise ValueError("DeepSeek API key cannot be empty")
+                set_local_secret("deepseek_api_key", value)
+                self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
         prefix = "/api/providers/"
         suffix = "/refresh"
         if path.startswith(prefix) and path.endswith(suffix):
@@ -139,6 +295,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/secrets/deepseek":
+            delete_local_secret("deepseek_api_key")
+            self.send_json({"ok": True})
+            return
+        prefix = "/api/config/providers/"
+        if path.startswith(prefix):
+            try:
+                provider_id = unquote(path[len(prefix):].strip("/"))
+                configs = self.store.delete(provider_id)
+                self.send_json({"configs": self.apply_configs(configs)})
+            except Exception as exc:
+                self.send_api_error(exc)
             return
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -158,12 +331,16 @@ def main() -> None:
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
+    scheduler = AutoRefreshScheduler(DashboardHandler.manager)
+    DashboardHandler.scheduler = scheduler
+    scheduler.start(DashboardHandler.store.snapshot()[1]["auto_refresh_minutes"])
     print(f"[server] http://127.0.0.1:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        scheduler.close()
         server.server_close()
 
 

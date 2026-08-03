@@ -5,13 +5,18 @@ from pathlib import Path
 from providers import (
     DeepSeekProvider,
     EZAICLUBProvider,
+    GenericPageProvider,
+    NewAPIProvider,
     ProviderConfig,
     ProviderManager,
     SiliconFlowProvider,
+    Sub2APIProvider,
     is_api_provider,
     parse_deepseek_balance,
     parse_ezaiclub_balance_tokens,
     parse_ezaiclub_subscription_tokens,
+    parse_generic_page_tokens,
+    parse_generic_selector_results,
     parse_opencode_legacy,
     parse_percent,
     parse_siliconflow_balance_tokens,
@@ -193,6 +198,13 @@ class ProviderParserTests(unittest.TestCase):
     def test_provider_manager_registry(self):
         configs = [
             ProviderConfig(
+                id="page",
+                name="Page",
+                type="page",
+                target_url="https://page.example/dashboard",
+                parser_rules={"balances": [{"id": "balance-1", "selector": ".balance"}]},
+            ),
+            ProviderConfig(
                 id="deepseek",
                 name="DeepSeek",
                 type="deepseek",
@@ -210,12 +222,72 @@ class ProviderParserTests(unittest.TestCase):
                 type="siliconflow",
                 target_url="https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
             ),
+            ProviderConfig(
+                id="newapi",
+                name="New API",
+                type="newapi",
+                target_url="https://newapi.example/dashboard",
+            ),
+            ProviderConfig(
+                id="sub2api",
+                name="Sub2API",
+                type="sub2api",
+                target_url="https://sub2api.example/dashboard",
+            ),
         ]
         manager = ProviderManager(configs=configs)
 
+        self.assertIsInstance(manager.get_provider("page"), GenericPageProvider)
         self.assertIsInstance(manager.get_provider("deepseek"), DeepSeekProvider)
         self.assertIsInstance(manager.get_provider("ezaiclub"), EZAICLUBProvider)
         self.assertIsInstance(manager.get_provider("siliconflow"), SiliconFlowProvider)
+        self.assertIsInstance(manager.get_provider("newapi"), NewAPIProvider)
+        self.assertIsInstance(manager.get_provider("sub2api"), Sub2APIProvider)
+
+    def test_provider_config_accepts_extension_field_names(self):
+        config = ProviderConfig.from_dict({
+            "id": "fastaitoken",
+            "name": "FastAIToken",
+            "type": "sub2api",
+            "targetUrl": "https://www.fastaitoken.com/dashboard",
+            "group": "常用",
+            "rechargeRatio": 2,
+            "secondaryUrls": [{"label": "监控", "url": "https://www.fastaitoken.com/monitor"}],
+        })
+        self.assertEqual(config.target_url, "https://www.fastaitoken.com/dashboard")
+        self.assertEqual(config.group, "常用")
+        self.assertEqual(config.recharge_ratio, 2)
+        self.assertEqual(config.secondary_urls[0]["label"], "监控")
+
+    def test_generic_page_rules_parse_tokens_and_selectors(self):
+        token_result = parse_generic_page_tokens([
+            "$74.84",
+            "$50.15 / $50.00",
+            "剩余 6天13小时 (2026/07/29 00:17)",
+            "6天13小时 后重置",
+        ], {
+            "balances": [{"id": "balance", "label": "余额", "pattern": r"^[$](\d+(?:\.\d+)?)$", "currency": "USD"}],
+            "quotas": [{
+                "id": "quota", "label": "每周用量",
+                "pattern": r"^[$](\d+(?:\.\d+)?)\s*/\s*[$](\d+(?:\.\d+)?)$",
+                "currency": "USD", "resetPattern": r"(.+?)\s*后重置",
+            }],
+            "textMetrics": [{"id": "expires", "label": "到期时间", "pattern": r"剩余\s*[^()]*\(([^)]+)\)"}],
+        })
+        self.assertEqual(token_result["balances"][0]["value"], "74.84")
+        self.assertEqual(token_result["usage"][0]["value"], "$50.15 / $50.00")
+        self.assertEqual(token_result["usage"][0]["reset_in"], "6天13小时")
+        self.assertEqual(token_result["textMetrics"][0]["value"], "2026/07/29 00:17")
+
+        selector_result = parse_generic_selector_results({
+            "balance-1": {"values": ["$12.34"], "matchCount": 1},
+            "quota-1": {"values": ["$5 / $20"], "resetValues": ["3 天"], "matchCount": 1},
+        }, {
+            "balances": [{"id": "balance-1", "label": "余额", "selector": ".balance", "currency": "USD"}],
+            "quotas": [{"id": "quota-1", "label": "额度", "selector": ".quota", "currency": "USD"}],
+        })
+        self.assertEqual(selector_result["balances"][0]["value"], "12.34")
+        self.assertEqual(selector_result["usage"][0]["percent"], 25)
 
     def test_provider_manager_rejects_unknown_type(self):
         manager = ProviderManager(

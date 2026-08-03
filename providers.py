@@ -18,8 +18,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+
+from channels import parse_ezaiclub_channels, parse_sub2api_channels
 
 BROWSEROS_BIN = os.environ.get("BROWSEROS_BIN", "/usr/bin/browseros")
 DEFAULT_PROFILE_DIR = os.environ.get(
@@ -40,6 +42,7 @@ DEFAULT_SILICONFLOW_COUPON_URL = "https://cloud.siliconflow.cn/me/expensebill?ta
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("PROVIDER_CONFIG", ROOT / "providers.local.json"))
 CACHE_FILE = Path(os.environ.get("PROVIDER_CACHE", ROOT / ".provider-cache.json"))
+SECRET_FILE = Path(os.environ.get("PROVIDER_SECRETS", ROOT / ".provider-secrets.json"))
 DEFAULT_DUMP_DIR = Path(os.environ.get("PROVIDER_DUMP_DIR", ROOT / "dumps"))
 
 REQUEST_HEADERS = {
@@ -77,6 +80,13 @@ EZAICLUB_LOGIN_HINTS = (
     "Sign up",
     "登录",
 )
+NEWAPI_LOGIN_HINTS = (
+    "login",
+    "sign in",
+    "登录",
+    "注册",
+)
+SUB2API_LOGIN_HINTS = NEWAPI_LOGIN_HINTS
 SILICONFLOW_LOGIN_HINTS = (
     "account.siliconflow.cn/login",
     "硅基流动统一登录",
@@ -123,6 +133,7 @@ PROFILE_SYNC_IGNORE = (
     "*.log",
 )
 PROFILE_SYNC_MARKER = ".provider-sync-meta.json"
+SECRET_LOCK = threading.RLock()
 
 
 class ProviderError(RuntimeError):
@@ -164,34 +175,83 @@ class ProviderConfig:
     api_key_env: str | None = None
     secondary_urls: list[dict[str, str]] | None = None
     mode: str = "browser"
+    group: str = ""
+    recharge_ratio: float = 1.0
+    parser_rules: dict[str, Any] | None = None
+    quota_per_unit: float = 500000.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProviderConfig":
+        if not isinstance(data, dict):
+            raise ValueError("Provider config must be an object")
+        provider_id = str(data.get("id") or "").strip()
+        provider_type = str(data.get("type") or "").strip()
+        target_url = str(data.get("target_url") or data.get("targetUrl") or "").strip()
+        if not provider_id:
+            raise ValueError("Provider id is required")
+        if not provider_type:
+            raise ValueError(f"Provider {provider_id} type is required")
+        if not target_url:
+            raise ValueError(f"Provider {provider_id} target URL is required")
         profile_dir = str(data.get("profile_dir") or DEFAULT_PROFILE_DIR)
-        cookie_cache = data.get("cookie_cache")
+        cookie_cache = data.get("cookie_cache", data.get("cookieCache"))
         secondary_urls = []
-        for item in data.get("secondary_urls", []):
+        raw_secondary_urls = data.get("secondary_urls", data.get("secondaryUrls", []))
+        if not isinstance(raw_secondary_urls, list):
+            raise ValueError(f"Provider {provider_id} secondary URLs must be an array")
+        for index, item in enumerate(raw_secondary_urls):
             if isinstance(item, str):
-                secondary_urls.append({"label": "打开详情页", "url": item})
+                secondary_urls.append({"id": f"page-{index + 1}", "label": "打开详情页", "url": item})
             elif isinstance(item, dict) and item.get("url"):
                 secondary_urls.append(
                     {
+                        "id": str(item.get("id") or f"page-{index + 1}"),
                         "label": str(item.get("label") or "打开详情页"),
                         "url": str(item["url"]),
                     }
                 )
         return cls(
-            id=str(data["id"]),
-            name=str(data.get("name") or data["id"]),
-            type=str(data["type"]),
-            target_url=str(data["target_url"]),
+            id=provider_id,
+            name=str(data.get("name") or provider_id),
+            type=provider_type,
+            target_url=target_url,
             enabled=bool(data.get("enabled", True)),
             profile_dir=os.path.expanduser(profile_dir),
             cookie_cache=os.path.expanduser(str(cookie_cache)) if cookie_cache else None,
-            api_key_env=str(data.get("api_key_env")) if data.get("api_key_env") else None,
+            api_key_env=str(data.get("api_key_env", data.get("apiKeyEnv"))) if data.get("api_key_env", data.get("apiKeyEnv")) else None,
             secondary_urls=secondary_urls,
             mode=str(data.get("mode") or "browser"),
+            group=str(data.get("group") or "").strip(),
+            recharge_ratio=float(data.get("recharge_ratio", data.get("rechargeRatio", 1)) or 1),
+            parser_rules=data.get("parser_rules", data.get("parserRules")) if isinstance(
+                data.get("parser_rules", data.get("parserRules")), dict
+            ) else None,
+            quota_per_unit=float(data.get("quota_per_unit", data.get("quotaPerUnit", 500000)) or 500000),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "name": self.name,
+            "type": self.type,
+            "target_url": self.target_url,
+            "enabled": self.enabled,
+            "profile_dir": self.profile_dir,
+            "mode": self.mode,
+            "group": self.group,
+            "recharge_ratio": self.recharge_ratio,
+        }
+        if self.cookie_cache:
+            data["cookie_cache"] = self.cookie_cache
+        if self.api_key_env:
+            data["api_key_env"] = self.api_key_env
+        if self.secondary_urls:
+            data["secondary_urls"] = self.secondary_urls
+        if self.parser_rules:
+            data["parser_rules"] = self.parser_rules
+        if self.type == "newapi" or self.quota_per_unit != 500000:
+            data["quota_per_unit"] = self.quota_per_unit
+        return data
 
 
 def now_iso() -> str:
@@ -224,6 +284,8 @@ def default_config() -> dict[str, Any]:
                 "profile_dir": DEFAULT_PROFILE_DIR,
                 "cookie_cache": default_cookie_cache("opencode-go"),
                 "mode": "http_then_browser",
+                "group": "",
+                "recharge_ratio": 1,
             },
             {
                 "id": "deepseek",
@@ -235,6 +297,8 @@ def default_config() -> dict[str, Any]:
                 "cookie_cache": default_cookie_cache("deepseek"),
                 "api_key_env": "DEEPSEEK_API_KEY",
                 "mode": "api",
+                "group": "",
+                "recharge_ratio": 1,
             },
             {
                 "id": "ezaiclub",
@@ -251,6 +315,8 @@ def default_config() -> dict[str, Any]:
                     }
                 ],
                 "mode": "browser",
+                "group": "",
+                "recharge_ratio": 10,
             },
             {
                 "id": "siliconflow",
@@ -261,6 +327,8 @@ def default_config() -> dict[str, Any]:
                 "profile_dir": DEFAULT_PROFILE_DIR,
                 "cookie_cache": default_cookie_cache("siliconflow"),
                 "mode": "browser",
+                "group": "",
+                "recharge_ratio": 1,
             },
         ]
     }
@@ -276,14 +344,51 @@ def load_config(path: Path = CONFIG_FILE) -> list[ProviderConfig]:
     return [ProviderConfig.from_dict(item) for item in data["providers"]]
 
 
+def load_local_secret(name: str, path: Path = SECRET_FILE) -> str:
+    with SECRET_LOCK:
+        if not path.exists():
+            return ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(data.get(name) or "") if isinstance(data, dict) else ""
+
+
+def set_local_secret(name: str, value: str, path: Path = SECRET_FILE) -> None:
+    with SECRET_LOCK:
+        data: dict[str, str] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = {str(key): str(item) for key, item in loaded.items() if item}
+            except (OSError, json.JSONDecodeError):
+                data = {}
+        normalized = str(value or "").strip()
+        if normalized:
+            data[name] = normalized
+        else:
+            data.pop(name, None)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f"{path.suffix}.tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+
+
+def delete_local_secret(name: str, path: Path = SECRET_FILE) -> None:
+    set_local_secret(name, "", path)
+
+
 def build_browser(profile_dir: str):
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError as exc:
         raise ProviderError(
-            "Playwright is not installed in this uv environment. "
-            "Run `UV_CACHE_DIR=/tmp/uv-cache uv pip install playwright`, "
-            "then retry with `uv run python ...`."
+            "Playwright is not installed in the project virtual environment. "
+            "Create `.venv`, run `UV_CACHE_DIR=/tmp/uv-cache uv pip install -r requirements.txt`, "
+            "then start the service with `uv run python server.py 19765`."
         ) from exc
 
     profile_path = Path(profile_dir).expanduser()
@@ -634,9 +739,256 @@ def text_metric(key: str, label: str, value: str | None) -> dict[str, Any]:
     }
 
 
+def _rule_regex(rule: dict[str, Any], pattern_key: str = "pattern", flags_key: str = "flags") -> re.Pattern[str] | None:
+    pattern = str(rule.get(pattern_key) or "")
+    if not pattern:
+        return None
+    flag_value = str(rule.get(flags_key) or "")
+    flags = 0
+    for character, option in (("i", re.I), ("m", re.M), ("s", re.S)):
+        if character in flag_value:
+            flags |= option
+    return re.compile(pattern, flags)
+
+
+def _match_group(match: re.Match[str] | None, index: Any, default: int = 1) -> str:
+    if match is None:
+        return ""
+    try:
+        value = match.group(int(index if index is not None else default))
+    except (IndexError, TypeError, ValueError):
+        return ""
+    return str(value or "").strip()
+
+
+def _numeric_values(value: Any) -> list[str]:
+    return [match.replace(",", "") for match in re.findall(r"-?\d+(?:[.,]\d+)?", str(value or ""))]
+
+
+def _selector_value(value: Any, rule: dict[str, Any], group: Any = 1, fallback_text: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    pattern = _rule_regex(rule)
+    if pattern:
+        match = pattern.search(text)
+        return _match_group(match, group) or (_numeric_values(match.group(0))[0] if match and _numeric_values(match.group(0)) else "")
+    if fallback_text:
+        return text
+    numbers = _numeric_values(text)
+    return numbers[0] if numbers else ""
+
+
+def _format_currency_amount(value: Any, currency: Any = None, symbol: Any = "") -> str:
+    amount = normalize_amount(str(value))
+    if symbol:
+        return f"{symbol}{amount}"
+    if currency == "USD":
+        return f"${amount}"
+    if currency == "CNY":
+        return f"¥{amount}"
+    return f"{amount} {currency}" if currency else amount
+
+
+def _format_quota_value(used: Any, limit: Any, currency: Any = None, symbol: Any = "") -> str:
+    effective_symbol = symbol or ("$" if not currency else "")
+    return (
+        f"{_format_currency_amount(used, currency, effective_symbol)} / "
+        f"{_format_currency_amount(limit, currency, effective_symbol)}"
+    )
+
+
+def parse_generic_page_tokens(tokens: list[str], parser_rules: dict[str, Any]) -> dict[str, Any]:
+    balances: list[dict[str, Any]] = []
+    usage: list[dict[str, Any]] = []
+    text_metrics: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def matches(rule: dict[str, Any]) -> Iterator[tuple[re.Match[str], int]]:
+        pattern = _rule_regex(rule)
+        if pattern:
+            for index, token in enumerate(tokens):
+                match = pattern.search(str(token or "").strip())
+                if match:
+                    yield match, index
+
+    for rule in parser_rules.get("balances", []):
+        if rule.get("selector"):
+            continue
+        for match, _ in matches(rule):
+            label = str(rule.get("label") or _match_group(match, rule.get("labelGroup")) or "余额")
+            amount = _match_group(match, rule.get("valueGroup"), 1)
+            key = ("balance", label, amount)
+            if not amount or key in seen:
+                continue
+            seen.add(key)
+            balances.append(balance_metric(str(rule.get("key") or rule.get("id") or "balance"), label, normalize_amount(amount), rule.get("currency")))
+            if rule.get("limit") and len(balances) >= int(rule["limit"]):
+                break
+
+    for rule in parser_rules.get("quotas", []):
+        if rule.get("selector") or rule.get("usedSelector") or rule.get("limitSelector"):
+            continue
+        for match, token_index in matches(rule):
+            used_raw = _match_group(match, rule.get("usedGroup"), 1)
+            limit_raw = _match_group(match, rule.get("limitGroup"), 2)
+            try:
+                used, limit = float(used_raw), float(limit_raw)
+            except ValueError:
+                continue
+            if limit <= 0:
+                continue
+            label = str(rule.get("label") or _match_group(match, rule.get("labelGroup")) or "用量")
+            value = _format_quota_value(used_raw, limit_raw, rule.get("currency"), rule.get("symbol"))
+            key = ("usage", label, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            reset_in = None
+            reset_pattern = _rule_regex(rule, "resetPattern", "resetFlags")
+            if reset_pattern:
+                lookahead = int(rule.get("resetLookahead") or 6)
+                for token in tokens[token_index:token_index + lookahead] + tokens:
+                    reset_match = reset_pattern.search(token)
+                    if reset_match:
+                        reset_in = _match_group(reset_match, rule.get("resetGroup"), 1)
+                        break
+            usage.append(usage_metric(str(rule.get("key") or rule.get("id") or "usage"), label, round(used / limit * 100), value, reset_in))
+            if rule.get("limit") and len(usage) >= int(rule["limit"]):
+                break
+
+    for rule in parser_rules.get("textMetrics", []):
+        if rule.get("selector"):
+            continue
+        for match, _ in matches(rule):
+            value = str(rule.get("staticValue")) if rule.get("staticValue") is not None else _match_group(match, rule.get("valueGroup"), 1)
+            label = str(rule.get("label") or _match_group(match, rule.get("labelGroup")) or "指标")
+            key = ("text", label, value)
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            text_metrics.append(text_metric(str(rule.get("key") or rule.get("id") or f"metric_{len(text_metrics) + 1}"), label, value))
+            if rule.get("limit") and len(text_metrics) >= int(rule["limit"]):
+                break
+
+    return {"balances": balances, "usage": usage, "textMetrics": text_metrics, "metrics": balances + usage + text_metrics}
+
+
+def parse_generic_selector_results(selector_results: dict[str, Any], parser_rules: dict[str, Any]) -> dict[str, Any]:
+    balances: list[dict[str, Any]] = []
+    usage: list[dict[str, Any]] = []
+    text_metrics: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+
+    def first(values: Any) -> str:
+        return next((str(value).strip() for value in values or [] if str(value).strip()), "")
+
+    def diagnostic(rule: dict[str, Any], result: dict[str, Any], status: str, error: str | None = None) -> None:
+        diagnostics.append({
+            "ruleId": rule.get("id"),
+            "label": rule.get("label") or rule.get("id"),
+            "pageId": rule.get("pageId") or "main",
+            "status": status,
+            "matchCount": result.get("matchCount", 0),
+            "samples": (result.get("values") or [])[:3],
+            "error": error,
+        })
+
+    for rule in parser_rules.get("balances", []):
+        if not rule.get("selector"):
+            continue
+        result = selector_results.get(rule.get("id"), {})
+        amount = _selector_value(first(result.get("values")), rule, rule.get("valueGroup", 1))
+        if not amount:
+            diagnostic(rule, result, "not_found")
+            continue
+        balances.append(balance_metric(str(rule.get("key") or rule.get("id") or "balance"), str(rule.get("label") or "余额"), normalize_amount(amount), rule.get("currency")))
+        diagnostic(rule, result, "matched")
+
+    for rule in parser_rules.get("quotas", []):
+        if not (rule.get("selector") or rule.get("usedSelector") or rule.get("limitSelector")):
+            continue
+        result = selector_results.get(rule.get("id"), {})
+        separate = rule.get("mode") == "separate" or rule.get("usedSelector") or rule.get("limitSelector")
+        if separate:
+            used_rule = {**rule, "pattern": rule.get("usedPattern") or rule.get("pattern"), "flags": rule.get("usedFlags") or rule.get("flags")}
+            limit_rule = {**rule, "pattern": rule.get("limitPattern") or rule.get("pattern"), "flags": rule.get("limitFlags") or rule.get("flags")}
+            used_raw = _selector_value(first(result.get("usedValues")), used_rule, rule.get("usedGroup", 1))
+            limit_raw = _selector_value(first(result.get("limitValues")), limit_rule, rule.get("limitGroup", 1))
+        else:
+            raw = first(result.get("values"))
+            pattern = _rule_regex(rule)
+            match = pattern.search(raw) if pattern else None
+            numbers = _numeric_values(raw)
+            used_raw = _match_group(match, rule.get("usedGroup"), 1) if match else (numbers[0] if numbers else "")
+            limit_raw = _match_group(match, rule.get("limitGroup"), 2) if match else (numbers[1] if len(numbers) > 1 else "")
+        try:
+            used, limit = float(used_raw), float(limit_raw)
+        except ValueError:
+            diagnostic(rule, result, "parse_failed", "Selected text did not contain a valid used/limit pair")
+            continue
+        if limit <= 0:
+            diagnostic(rule, result, "parse_failed", "Selected text did not contain a positive limit")
+            continue
+        reset_rule = {**rule, "pattern": rule.get("resetPattern"), "flags": rule.get("resetFlags") or rule.get("flags")}
+        reset_in = _selector_value(first(result.get("resetValues")), reset_rule, rule.get("resetGroup", 1), fallback_text=True)
+        usage.append(usage_metric(
+            str(rule.get("key") or rule.get("id") or "usage"),
+            str(rule.get("label") or "用量"),
+            round(used / limit * 100),
+            _format_quota_value(used_raw, limit_raw, rule.get("currency"), rule.get("symbol")),
+            reset_in or None,
+        ))
+        diagnostic(rule, result, "matched")
+
+    for rule in parser_rules.get("textMetrics", []):
+        if not rule.get("selector"):
+            continue
+        result = selector_results.get(rule.get("id"), {})
+        value = _selector_value(first(result.get("values")), rule, rule.get("valueGroup", 1), fallback_text=True)
+        if not value:
+            diagnostic(rule, result, "not_found")
+            continue
+        text_metrics.append(text_metric(str(rule.get("key") or rule.get("id") or f"metric_{len(text_metrics) + 1}"), str(rule.get("label") or "指标"), value))
+        diagnostic(rule, result, "matched")
+
+    return {
+        "balances": balances,
+        "usage": usage,
+        "textMetrics": text_metrics,
+        "metrics": balances + usage + text_metrics,
+        "diagnostics": diagnostics,
+    }
+
+
+def generic_page_snapshot(config: ProviderConfig, url: str, parsed: dict[str, Any]) -> dict[str, Any]:
+    balances = parsed.get("balances", [])
+    usage = parsed.get("usage", [])
+    text_metrics = parsed.get("textMetrics", [])
+    metrics = balances + usage + text_metrics
+    return {
+        "id": config.id,
+        "name": config.name,
+        "type": config.type,
+        "status": "ok",
+        "url": url,
+        "updated_at": now_iso(),
+        "checked_at": now_iso(),
+        "subscribed": None,
+        "balances": balances,
+        "usage": usage,
+        "metrics": metrics,
+        "links": links_for_config(config),
+        "recommendation": recommendation_from_usage(usage) if usage else recommendation_from_balances(balances),
+        "error": None if metrics else "Page loaded, but no configured provider rules matched",
+        "diagnostics": parsed.get("diagnostics", []),
+        "raw": {"balance_count": len(balances), "usage_count": len(usage), "metric_count": len(metrics)},
+    }
+
+
 def links_for_config(config: ProviderConfig) -> list[dict[str, str]]:
     return [
-        {"label": "打开官方页面", "url": config.target_url},
+        {"label": "打开主页", "url": config.target_url},
         *(config.secondary_urls or []),
     ]
 
@@ -707,8 +1059,12 @@ def blank_snapshot(
         "balances": [],
         "usage": [],
         "metrics": [],
+        "channels": [],
+        "channelCheckedAt": None,
+        "channelsStale": False,
+        "channelError": None,
         "links": links_for_config(config),
-        "recommendation": "watch" if status in ("error", "unconfigured") else "ok",
+        "recommendation": "ok" if status == "ok" else "watch",
         "error": error,
     }
 
@@ -1557,6 +1913,8 @@ def ezaiclub_snapshot(
     dashboard_url: str,
     balances: list[dict[str, Any]],
     subscription_metrics: list[dict[str, Any]],
+    channels: list[dict[str, Any]] | None = None,
+    channel_error: str | None = None,
 ) -> dict[str, Any]:
     metrics = balances + subscription_metrics
     return {
@@ -1570,6 +1928,10 @@ def ezaiclub_snapshot(
         "balances": balances,
         "usage": [],
         "metrics": metrics,
+        "channels": channels,
+        "channelCheckedAt": now_iso() if channels is not None else None,
+        "channelsStale": False,
+        "channelError": channel_error,
         "links": links_for_config(config),
         "recommendation": recommendation_from_balances(balances),
         "error": None if metrics else "EZAICLUB pages loaded, but no balance or subscription fields were recognized",
@@ -1577,6 +1939,136 @@ def ezaiclub_snapshot(
             "balance_count": len(balances),
             "subscription_metric_count": len(subscription_metrics),
         },
+    }
+
+
+def _payload_data(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or payload.get("code") in {401, "UNAUTHORIZED"}:
+        return None
+    data = payload.get("data", payload)
+    return data if isinstance(data, dict) else None
+
+
+def _first_present(data: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
+    if not isinstance(data, dict):
+        return None
+    return next((data[key] for key in keys if data.get(key) not in (None, "")), None)
+
+
+def _find_present_deep(data: Any, keys: tuple[str, ...], depth: int = 0) -> Any:
+    if depth > 4:
+        return None
+    if isinstance(data, dict):
+        direct = _first_present(data, keys)
+        if direct is not None:
+            return direct
+        values = data.values()
+    elif isinstance(data, list):
+        values = data
+    else:
+        return None
+    for value in values:
+        found = _find_present_deep(value, keys, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def newapi_snapshot(config: ProviderConfig, url: str, payload: Any) -> dict[str, Any]:
+    data = _payload_data(payload)
+    if not data or data.get("quota") is None and data.get("used_quota") is None:
+        raise ProviderError("New API self payload did not contain quota fields")
+    quota_per_unit = config.quota_per_unit or 500000
+    remaining = float(data["quota"]) / quota_per_unit if data.get("quota") is not None else None
+    used = float(data.get("used_quota") or 0) / quota_per_unit
+    total = remaining + used if remaining is not None else None
+    balances = [balance_metric("balance", "剩余额度", f"{remaining:.2f}", "USD")] if remaining is not None else []
+    usage = []
+    if total and total > 0:
+        usage.append(usage_metric("quota_usage", "额度用量", round(used / total * 100), f"${used:.2f} / ${total:.2f}"))
+    text_metrics = []
+    if data.get("request_count") is not None:
+        text_metrics.append(text_metric("request_count", "请求次数", str(data["request_count"])))
+    account = data.get("display_name") or data.get("username")
+    if account:
+        text_metrics.append(text_metric("account", "账号", str(account)))
+    metrics = balances + usage + text_metrics
+    return {
+        "id": config.id,
+        "name": config.name,
+        "type": config.type,
+        "status": "ok",
+        "url": url,
+        "updated_at": now_iso(),
+        "subscribed": None,
+        "balances": balances,
+        "usage": usage,
+        "metrics": metrics,
+        "links": links_for_config(config),
+        "recommendation": recommendation_from_balances(balances),
+        "error": None if metrics else "New API returned an empty user quota payload",
+    }
+
+
+def sub2api_snapshot(
+    config: ProviderConfig,
+    url: str,
+    auth_payload: Any,
+    stats_payload: Any = None,
+    channels: list[dict[str, Any]] | None = None,
+    channel_error: str | None = None,
+) -> dict[str, Any]:
+    user = _payload_data(auth_payload)
+    if not user:
+        raise ProviderError("Sub2API auth payload did not contain user fields")
+    stats = _payload_data(stats_payload) or {}
+    balance = _first_present(user, ("balance", "remaining_balance", "available_balance"))
+    frozen = _first_present(user, ("frozen_balance", "frozenBalance"))
+    balances = [balance_metric("balance", "余额", f"{float(balance):.2f}", "USD")] if balance is not None else []
+    if frozen is not None and float(frozen) > 0:
+        balances.append(balance_metric("frozen_balance", "冻结余额", f"{float(frozen):.2f}", "USD"))
+    text_metrics = []
+    account = _first_present(user, ("display_name", "displayName", "username", "name", "email"))
+    if account:
+        text_metrics.append(text_metric("account", "账号", str(account)))
+    today_requests = _find_present_deep(stats, ("today_requests", "todayRequests", "today_request_count", "todayRequestCount"))
+    total_requests = _find_present_deep(stats, ("total_requests", "totalRequests", "request_count", "requestCount"))
+    if today_requests is not None:
+        text_metrics.append(text_metric("today_requests", "今日请求", str(today_requests)))
+    if total_requests is not None:
+        text_metrics.append(text_metric("total_requests", "总请求", str(total_requests)))
+    usage = []
+    for key, label, used_keys, limit_keys in (
+        ("today_cost", "今日消费", ("today_actual_cost", "todayActualCost", "today_cost", "todayCost"), ("today_standard_cost", "todayStandardCost", "today_quota_cost", "todayQuotaCost")),
+        ("total_cost", "累计消费", ("total_actual_cost", "totalActualCost", "total_cost", "totalCost"), ("total_standard_cost", "totalStandardCost", "total_quota_cost", "totalQuotaCost")),
+    ):
+        used_raw = _find_present_deep(stats, used_keys)
+        limit_raw = _find_present_deep(stats, limit_keys)
+        try:
+            used, limit = float(used_raw), float(limit_raw)
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            usage.append(usage_metric(key, label, round(used / limit * 100), f"${used:.2f} / ${limit:.2f}"))
+    metrics = balances + usage + text_metrics
+    return {
+        "id": config.id,
+        "name": config.name,
+        "type": config.type,
+        "status": "ok",
+        "url": url,
+        "updated_at": now_iso(),
+        "subscribed": None,
+        "balances": balances,
+        "usage": usage,
+        "metrics": metrics,
+        "channels": channels,
+        "channelCheckedAt": now_iso() if channels is not None else None,
+        "channelsStale": False,
+        "channelError": channel_error,
+        "links": links_for_config(config),
+        "recommendation": recommendation_from_usage(usage) if usage else recommendation_from_balances(balances),
+        "error": None if metrics else "Sub2API returned an empty dashboard payload",
     }
 
 
@@ -1644,6 +2136,27 @@ class BrowserJsonProvider(Provider):
     default_host = ""
     ready_pattern: re.Pattern[str] = DEFAULT_READY_PATTERN
 
+    def page_api_json(self, page, url: str) -> Any:
+        result = page.evaluate(
+            """
+            async (url) => {
+              const token = globalThis.localStorage?.getItem("auth_token") || "";
+              const headers = { Accept: "application/json" };
+              if (token) headers.Authorization = `Bearer ${token}`;
+              const response = await fetch(url, { headers, credentials: "include" });
+              let data = null;
+              try { data = await response.json(); } catch { data = null; }
+              return { ok: response.ok, status: response.status, data, hasToken: Boolean(token) };
+            }
+            """,
+            url,
+        )
+        if result.get("status") in (401, 403):
+            raise NotLoggedInError(self.login_error)
+        if not result.get("ok"):
+            raise ProviderError(f"{self.config.name} API returned HTTP {result.get('status')}")
+        return result.get("data")
+
     def capture_json_responses(
         self,
         page,
@@ -1689,6 +2202,123 @@ class BrowserJsonProvider(Provider):
         tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
         tokens.extend(extract_json_payloads(responses))
         return page.url, tokens, responses
+
+
+class GenericPageProvider(Provider):
+    def _read_values(self, page, selector: Any, attribute: Any = "textContent", index: Any = None) -> dict[str, Any]:
+        if not selector:
+            return {"values": [], "matchCount": 0}
+        locator = page.locator(str(selector))
+        count = min(locator.count(), 50)
+        indexes = [max(0, int(index))] if index not in (None, "") else list(range(count))
+        values = []
+        for item_index in indexes:
+            if item_index >= count:
+                continue
+            node = locator.nth(item_index)
+            name = str(attribute or "textContent")
+            if name == "innerText":
+                value = node.inner_text()
+            elif name == "textContent":
+                value = node.text_content()
+            elif name == "value":
+                value = node.input_value()
+            else:
+                value = node.get_attribute(name)
+            text = str(value or "").strip()[:10000]
+            if text:
+                values.append(text)
+        return {"values": values, "matchCount": count}
+
+    def _selector_results(self, page, rules: list[dict[str, Any]]) -> dict[str, Any]:
+        results = {}
+        for rule in rules:
+            result = self._read_values(page, rule.get("selector"), rule.get("attribute"), rule.get("index"))
+            used = self._read_values(page, rule.get("usedSelector"), rule.get("usedAttribute") or rule.get("attribute"), rule.get("usedIndex", rule.get("index")))
+            limit = self._read_values(page, rule.get("limitSelector"), rule.get("limitAttribute") or rule.get("attribute"), rule.get("limitIndex", rule.get("index")))
+            reset = self._read_values(page, rule.get("resetSelector"), rule.get("resetAttribute") or "textContent", rule.get("resetIndex"))
+            results[str(rule.get("id"))] = {
+                **result,
+                "usedValues": used["values"],
+                "limitValues": limit["values"],
+                "resetValues": reset["values"],
+                "usedMatchCount": used["matchCount"],
+                "limitMatchCount": limit["matchCount"],
+                "resetMatchCount": reset["matchCount"],
+            }
+        return results
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        parser_rules = self.config.parser_rules or {}
+        rule_lists = [parser_rules.get(name, []) for name in ("balances", "quotas", "textMetrics")]
+        if not any(rule_lists):
+            raise ProviderError("Generic page provider has no parser rules")
+        login_hints = tuple(str(item) for item in parser_rules.get("loginHints", []) if item)
+        ready_pattern = _rule_regex({"pattern": parser_rules.get("readyPattern"), "flags": "i"})
+        wait_options = parser_rules.get("waitOptions") if isinstance(parser_rules.get("waitOptions"), dict) else {}
+        pages = [
+            {"id": "main", "url": self.config.target_url, "required": True},
+            *[{"id": item.get("id") or f"page-{index + 1}", "url": item["url"], "required": False}
+              for index, item in enumerate(self.config.secondary_urls or [])],
+        ]
+        tokens: list[str] = []
+        selector_results: dict[str, Any] = {}
+        snapshot_url = self.config.target_url
+        with self.browser_page(browser) as page:
+            for page_config in pages:
+                page_rules = [
+                    rule
+                    for rules in rule_lists
+                    for rule in rules
+                    if str(rule.get("pageId") or "main") == page_config["id"]
+                    and any(rule.get(name) for name in ("selector", "usedSelector", "limitSelector"))
+                ]
+                try:
+                    page.goto(page_config["url"], wait_until="domcontentloaded", timeout=60000)
+                    ready_selector = parser_rules.get("readySelector")
+                    if ready_selector:
+                        try:
+                            page.wait_for_selector(str(ready_selector), timeout=12000)
+                        except Exception:
+                            pass
+                    after_load_delay = int(parser_rules.get("afterLoadDelayMs") or 0)
+                    if after_load_delay:
+                        page.wait_for_timeout(after_load_delay)
+                    body_text = wait_for_page_ready(
+                        page,
+                        ready_pattern or DEFAULT_READY_PATTERN,
+                        timeout_ms=int(wait_options.get("waitMs") or 18000),
+                        min_wait_ms=int(wait_options.get("minWaitMs") or 800),
+                        stable_samples=int(wait_options.get("stableSamples") or 3),
+                        poll_ms=int(wait_options.get("pollMs") or 400),
+                    )
+                    login_probe = f"{page.url}\n{page.title()}\n{body_text}"
+                    if login_hints and is_login_html(page.url, login_probe, login_hints):
+                        raise NotLoggedInError(f"BrowserOS profile is not logged in to {self.config.name}")
+                    if page_config["required"]:
+                        snapshot_url = page.url
+                    tokens.extend(line.strip() for line in body_text.splitlines() if line.strip())
+                    selector_results.update(self._selector_results(page, page_rules))
+                except NotLoggedInError:
+                    raise
+                except Exception:
+                    if page_config["required"] or page_rules:
+                        raise
+
+        token_parsed = parse_generic_page_tokens(tokens, parser_rules)
+        selector_parsed = parse_generic_selector_results(selector_results, parser_rules)
+        parsed = {
+            "balances": token_parsed["balances"] + selector_parsed["balances"],
+            "usage": token_parsed["usage"] + selector_parsed["usage"],
+            "textMetrics": token_parsed["textMetrics"] + selector_parsed["textMetrics"],
+            "diagnostics": selector_parsed["diagnostics"],
+        }
+        return generic_page_snapshot(self.config, snapshot_url, parsed)
 
 
 class OpenCodeProvider(Provider):
@@ -1800,7 +2430,7 @@ class DeepSeekProvider(Provider):
         browser: BrowserSession | None = None,
     ) -> dict[str, Any]:
         api_key_env = self.config.api_key_env or "DEEPSEEK_API_KEY"
-        api_key = os.environ.get(api_key_env)
+        api_key = os.environ.get(api_key_env) or load_local_secret("deepseek_api_key")
         if not api_key:
             return blank_snapshot(
                 self.config,
@@ -1824,7 +2454,97 @@ class DeepSeekProvider(Provider):
             raise ProviderError(deepseek_http_error_message(exc)) from exc
 
 
-class EZAICLUBProvider(BrowserJsonProvider):
+class ChannelApiProvider(BrowserJsonProvider):
+    def origin_url(self, path: str) -> str:
+        parsed = urlparse(self.config.target_url)
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+    def fetch_channel_payloads(
+        self,
+        page,
+        available_path: str,
+        timezone_name: str | None = None,
+    ) -> tuple[Any, Any, Any, str | None]:
+        suffix = f"?timezone={quote(timezone_name, safe='')}" if timezone_name else ""
+        requests = (
+            ("渠道状态", f"/api/v1/channel-monitors{suffix}"),
+            ("渠道分组", available_path),
+            ("用户倍率", "/api/v1/groups/rates"),
+        )
+        payloads = []
+        errors = []
+        for label, path in requests:
+            try:
+                payloads.append(self.page_api_json(page, self.origin_url(path)))
+            except NotLoggedInError:
+                raise
+            except Exception as exc:
+                payloads.append(None)
+                errors.append(f"{label}: {exc}")
+        if errors:
+            return None, None, None, "; ".join(errors)[:500]
+        return payloads[0], payloads[1], payloads[2], None
+
+
+class NewAPIProvider(BrowserJsonProvider):
+    login_hints = NEWAPI_LOGIN_HINTS
+    login_error = "BrowserOS profile is not logged in to this New API provider"
+    ready_pattern = DEFAULT_READY_PATTERN
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        with self.browser_page(browser) as page:
+            page_url, _, _ = self.goto_with_json(page, self.config.target_url, min_wait_ms=800)
+            payload = self.page_api_json(page, self.origin_url("/api/user/self"))
+            return newapi_snapshot(self.config, page_url, payload)
+
+    def origin_url(self, path: str) -> str:
+        parsed = urlparse(self.config.target_url)
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+class Sub2APIProvider(ChannelApiProvider):
+    login_hints = SUB2API_LOGIN_HINTS
+    login_error = "BrowserOS profile is not logged in to this Sub2API provider"
+    ready_pattern = DEFAULT_READY_PATTERN
+
+    def fetch(
+        self,
+        refresh_auth: bool = False,
+        browser_fallback: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        with self.browser_page(browser) as page:
+            page_url, _, _ = self.goto_with_json(page, self.config.target_url, min_wait_ms=1000)
+            timezone_query = quote("Asia/Shanghai", safe="")
+            auth_payload = self.page_api_json(page, self.origin_url(f"/api/v1/auth/me?timezone={timezone_query}"))
+            try:
+                stats_payload = self.page_api_json(
+                    page,
+                    self.origin_url(f"/api/v1/usage/dashboard/stats?timezone={timezone_query}"),
+                )
+            except Exception:
+                stats_payload = None
+            monitors, groups, rates, channel_error = self.fetch_channel_payloads(
+                page,
+                "/api/v1/channels/available",
+            )
+            channels = None if channel_error else parse_sub2api_channels(self.config, monitors, groups, rates)
+            return sub2api_snapshot(
+                self.config,
+                page_url,
+                auth_payload,
+                stats_payload,
+                channels=channels,
+                channel_error=channel_error,
+            )
+
+
+class EZAICLUBProvider(ChannelApiProvider):
     login_hints = EZAICLUB_LOGIN_HINTS
     login_error = "BrowserOS profile is not logged in to EZAICLUB"
     default_host = "www.ezaiclub.com"
@@ -1854,11 +2574,19 @@ class EZAICLUBProvider(BrowserJsonProvider):
                 )
 
             subscription_metrics = self.fetch_subscription_metrics(page)
+            monitors, groups, rates, channel_error = self.fetch_channel_payloads(
+                page,
+                "/api/v1/groups/available",
+                timezone_name="Asia/Shanghai",
+            )
+            channels = None if channel_error else parse_ezaiclub_channels(self.config, monitors, groups, rates)
             return ezaiclub_snapshot(
                 self.config,
                 dashboard_url=dashboard_url if "/subscriptions" not in dashboard_url else self.config.target_url,
                 balances=balances,
                 subscription_metrics=subscription_metrics,
+                channels=channels,
+                channel_error=channel_error,
             )
 
     def fetch_subscription_metrics(self, page) -> list[dict[str, Any]]:
@@ -1927,10 +2655,13 @@ class SiliconFlowProvider(BrowserJsonProvider):
 
 
 PROVIDER_TYPES: dict[str, type[Provider]] = {
+    "page": GenericPageProvider,
     "opencode": OpenCodeProvider,
     "deepseek": DeepSeekProvider,
     "ezaiclub": EZAICLUBProvider,
     "siliconflow": SiliconFlowProvider,
+    "newapi": NewAPIProvider,
+    "sub2api": Sub2APIProvider,
 }
 
 
@@ -1950,7 +2681,21 @@ class ProviderManager:
         self._lock = threading.RLock()
 
     def enabled_configs(self) -> list[ProviderConfig]:
-        return [config for config in self.configs if config.enabled]
+        with self._lock:
+            return [config for config in self.configs if config.enabled]
+
+    def replace_configs(self, configs: list[ProviderConfig]) -> list[ProviderConfig]:
+        with self._lock:
+            self.configs = list(configs)
+            valid_ids = {config.id for config in configs}
+            cached = self.cache.setdefault("providers", {})
+            self.cache["providers"] = {
+                provider_id: snapshot
+                for provider_id, snapshot in cached.items()
+                if provider_id in valid_ids
+            }
+            self.save_cache()
+            return list(self.configs)
 
     def get_provider(self, provider_id: str) -> Provider:
         config = next((item for item in self.configs if item.id == provider_id), None)
@@ -2022,6 +2767,11 @@ class ProviderManager:
                 "recommendation": previous.get("recommendation", "watch") if previous else "watch",
                 "error": str(exc),
             }
+        if snapshot.get("channels") is None:
+            previous_channels = previous.get("channels", []) if previous else []
+            snapshot["channels"] = previous_channels
+            snapshot["channelCheckedAt"] = previous.get("channelCheckedAt") if previous else None
+            snapshot["channelsStale"] = bool(previous_channels)
         with self._lock:
             self.cache.setdefault("providers", {})[provider_id] = snapshot
             self.save_cache()
@@ -2050,6 +2800,21 @@ class ProviderManager:
                 results[provider_id] = future.result()
 
         return [results[config.id] for config in enabled]
+
+    def refresh_channels(self) -> list[dict[str, Any]]:
+        channel_configs = [
+            config for config in self.enabled_configs()
+            if config.type in {"ezaiclub", "sub2api"}
+        ]
+        results = []
+        browser_groups: dict[str, list[str]] = {}
+        for config in channel_configs:
+            browser_groups.setdefault(config.profile_dir, []).append(config.id)
+        for profile_dir, provider_ids in browser_groups.items():
+            with BrowserSession(profile_dir) as session:
+                for provider_id in provider_ids:
+                    results.append(self.refresh(provider_id, browser=session))
+        return results
 
     def explore(self, provider_id: str) -> Path:
         return self.get_provider(provider_id).explore()

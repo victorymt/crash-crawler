@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>渠道 · Provider Usage Hub</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="/">
+        <span>Provider Usage Hub</span>
+        <strong>渠道</strong>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="/">Providers</a>
+        <a class="active" href="/channels">渠道</a>
+        <a href="/settings">设置</a>
+      </nav>
+      <div class="toolbar">
+        <button id="refresh-channels" type="button" class="primary">刷新渠道</button>
+      </div>
+      <div id="message" class="message" aria-live="polite"></div>
+    </div>
+  </header>
+  <main class="page-shell">
+    <section class="filters" aria-label="渠道筛选">
+      <label class="model-filter">
+        <span>模型</span>
+        <select id="channel-model"><option value="">全部模型</option></select>
+      </label>
+      <label class="degraded-filter">
+        <input id="include-degraded" type="checkbox">
+        <span>包含降级</span>
+      </label>
+      <div id="channel-meta" class="channel-meta">正在读取渠道快照...</div>
+    </section>
+    <section class="results" aria-labelledby="results-title">
+      <div class="results-head">
+        <h1 id="results-title">最低倍率可用渠道</h1>
+        <span id="updated-at">--</span>
+      </div>
+      <div class="column-headings" aria-hidden="true">
+        <span>排名</span><span>Provider / 渠道</span><span>监控状态</span><span>实际倍率</span>
+      </div>
+      <div id="channel-results" class="channel-list" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="/static/channels.js"></script>
+</body>
+</html>
