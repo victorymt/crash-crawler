@@ -5,9 +5,13 @@ import {
   originsForConfig
 } from "../shared/config.js";
 import {
+  UNGROUPED_PROVIDER_LABEL,
+  deleteProviderGroup,
   groupProviderConfigs,
   moveProvider,
-  moveProviderGroup
+  moveProvidersToGroup,
+  moveProviderGroup,
+  renameProviderGroup
 } from "../shared/provider_groups.js";
 
 let configs = [];
@@ -17,6 +21,8 @@ let editorReadOnly = false;
 let editorDirty = false;
 let activeOperation = false;
 let dragState = null;
+const selectedProviderIds = new Set();
+let bulkTargetGroup = "";
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -201,6 +207,11 @@ function setOperationLocked(locked) {
   document.querySelectorAll("button").forEach((button) => {
     button.disabled = locked || button.dataset.layoutDisabled === "true";
   });
+  document.querySelectorAll("[data-provider-select], [data-group-select]").forEach((input) => {
+    input.disabled = locked;
+  });
+  const bulkSelect = document.getElementById("bulk-provider-group");
+  if (bulkSelect) bulkSelect.disabled = locked;
 }
 
 async function withOperationLock(operation) {
@@ -226,24 +237,74 @@ function layoutButton(action, label, symbol, disabled = false) {
   return `<button type="button" class="icon-button" data-layout-action="${action}" data-layout-disabled="${disabled}" ${disabled ? "disabled" : ""} title="${safeLabel}" aria-label="${safeLabel}">${symbol}</button>`;
 }
 
+function selectedProviderCount() {
+  const availableIds = new Set(configs.map((config) => config.id));
+  for (const providerId of selectedProviderIds) {
+    if (!availableIds.has(providerId)) selectedProviderIds.delete(providerId);
+  }
+  return selectedProviderIds.size;
+}
+
+function renderBulkActions() {
+  const root = document.getElementById("provider-bulk-actions");
+  const count = selectedProviderCount();
+  root.classList.toggle("hidden", count === 0);
+  document.getElementById("selected-provider-count").textContent = `已选择 ${count} 个`;
+
+  const select = document.getElementById("bulk-provider-group");
+  const groups = groupProviderConfigs(configs).filter((group) => group.name);
+  select.innerHTML = [
+    `<option value="">${UNGROUPED_PROVIDER_LABEL}</option>`,
+    ...groups.map((group) => `<option value="${escapeHtml(group.name)}">${escapeHtml(group.label)}</option>`)
+  ].join("");
+  const availableGroups = new Set(["", ...groups.map((group) => group.name)]);
+  if (!availableGroups.has(bulkTargetGroup)) bulkTargetGroup = "";
+  select.value = bulkTargetGroup;
+  select.disabled = activeOperation;
+}
+
+function updateGroupSelectionState(groupNode) {
+  if (!groupNode) return;
+  const providerInputs = [...groupNode.querySelectorAll("[data-provider-select]")];
+  const selectedCount = providerInputs.filter((input) => input.checked).length;
+  const groupInput = groupNode.querySelector("[data-group-select]");
+  groupInput.checked = providerInputs.length > 0 && selectedCount === providerInputs.length;
+  groupInput.indeterminate = selectedCount > 0 && selectedCount < providerInputs.length;
+}
+
 function renderProviderList() {
   const root = document.getElementById("providers");
   const groups = groupProviderConfigs(configs);
   root.innerHTML = groups.map((group, groupIndex) => `
     <div class="provider-group" data-provider-group="${escapeHtml(group.name)}">
       <div class="provider-group-head">
-        <button type="button" class="drag-handle" draggable="true" data-drag-group title="拖动分组" aria-label="拖动 ${escapeHtml(group.label)} 分组">≡</button>
+        <label class="selection-control group-selection">
+          <input type="checkbox" data-group-select aria-label="选择 ${escapeHtml(group.label)} 分组中的所有 Provider">
+          <span class="visually-hidden">选择 ${escapeHtml(group.label)} 分组</span>
+        </label>
+        <button type="button" class="drag-handle group-drag" draggable="true" data-drag-group title="拖动分组" aria-label="拖动 ${escapeHtml(group.label)} 分组">≡</button>
         <h3>${escapeHtml(group.label)}</h3>
         <span class="provider-count">${group.providers.length}</span>
-        <div class="layout-actions">
-          ${layoutButton("group-up", `上移 ${group.label} 分组`, "↑", groupIndex === 0)}
-          ${layoutButton("group-down", `下移 ${group.label} 分组`, "↓", groupIndex === groups.length - 1)}
+        <div class="group-tools">
+          ${group.name ? `<div class="group-actions">
+            <button type="button" data-group-action="rename">重命名</button>
+            <button type="button" data-group-action="delete">删除分组</button>
+          </div>` : ""}
+          <div class="layout-actions group-layout-actions">
+            ${layoutButton("group-up", `上移 ${group.label} 分组`, "↑", groupIndex === 0)}
+            ${layoutButton("group-down", `下移 ${group.label} 分组`, "↓", groupIndex === groups.length - 1)}
+          </div>
         </div>
       </div>
       <div class="provider-group-list">
         ${group.providers.map((config, providerIndex) => {
           const builtin = isBuiltinProviderId(config.id);
-          return `<div class="provider-row" data-provider="${escapeHtml(config.id)}">
+          const selected = selectedProviderIds.has(config.id);
+          return `<div class="provider-row ${selected ? "selected" : ""}" data-provider="${escapeHtml(config.id)}">
+            <label class="selection-control provider-selection">
+              <input type="checkbox" data-provider-select ${selected ? "checked" : ""} aria-label="选择 ${escapeHtml(config.name)}">
+              <span class="visually-hidden">选择 ${escapeHtml(config.name)}</span>
+            </label>
             <button type="button" class="drag-handle" draggable="true" data-provider-drag title="拖动排序" aria-label="拖动 ${escapeHtml(config.name)}">≡</button>
             <label class="checkbox-label">
               <input type="checkbox" data-provider-toggle ${config.enabled ? "checked" : ""}>
@@ -271,9 +332,14 @@ function renderProviderList() {
         }).join("")}
       </div>
     </div>`).join("");
+  root.querySelectorAll("[data-provider-group]").forEach(updateGroupSelectionState);
   root.querySelectorAll("button").forEach((button) => {
     button.disabled = activeOperation || button.dataset.layoutDisabled === "true";
   });
+  root.querySelectorAll("[data-provider-select], [data-group-select]").forEach((input) => {
+    input.disabled = activeOperation;
+  });
+  renderBulkActions();
 }
 
 function configsWithCurrentToggles() {
@@ -287,11 +353,12 @@ function configsWithCurrentToggles() {
   }));
 }
 
-async function persistProviderLayout(nextConfigs, message = "Provider 排序已保存。") {
+async function persistProviderLayout(nextConfigs, message = "Provider 排序已保存。", { clearSelection = false } = {}) {
   return withOperationLock(async () => {
     try {
       const response = await sendMessage({ type: "config:save", configs: nextConfigs });
       configs = response.configs;
+      if (clearSelection) selectedProviderIds.clear();
       renderProviderList();
       setMessage(message);
     } catch (error) {
@@ -299,6 +366,121 @@ async function persistProviderLayout(nextConfigs, message = "Provider 排序已�
       setMessage(error.message || "保存 Provider 排序失败", true);
     }
   });
+}
+
+function validateGroupName(value, currentGroupName = "") {
+  const name = String(value || "").trim();
+  if (!name) {
+    setMessage("分组名称不能为空。", true);
+    return null;
+  }
+  if (name.length > 200) {
+    setMessage("分组名称不能超过 200 个字符。", true);
+    return null;
+  }
+  if (name === UNGROUPED_PROVIDER_LABEL) {
+    setMessage(`“${UNGROUPED_PROVIDER_LABEL}”是保留名称。`, true);
+    return null;
+  }
+  const duplicate = groupProviderConfigs(configs).some((group) => (
+    group.name === name && group.name !== currentGroupName
+  ));
+  if (duplicate) {
+    setMessage(`分组“${name}”已存在。`, true);
+    return null;
+  }
+  return name;
+}
+
+function prepareForGroupManagement() {
+  if (!confirmDiscardChanges()) return false;
+  if (draftConfig) closeEditor(true);
+  return true;
+}
+
+async function handleGroupAction(groupName, action) {
+  if (!groupName) return;
+  if (action === "rename") {
+    const entered = prompt("新的分组名称", groupName);
+    if (entered == null) return;
+    const nextName = validateGroupName(entered, groupName);
+    if (!nextName || nextName === groupName) return;
+    if (!prepareForGroupManagement()) return;
+    const sourceConfigs = configsWithCurrentToggles();
+    await persistProviderLayout(
+      renameProviderGroup(sourceConfigs, groupName, nextName),
+      `分组“${groupName}”已重命名为“${nextName}”。`
+    );
+  }
+  if (action === "delete") {
+    if (!confirm(`删除分组“${groupName}”？其中的 Provider 将移至“${UNGROUPED_PROVIDER_LABEL}”。`)) return;
+    if (!prepareForGroupManagement()) return;
+    const sourceConfigs = configsWithCurrentToggles();
+    await persistProviderLayout(
+      deleteProviderGroup(sourceConfigs, groupName),
+      `分组“${groupName}”已删除，其中的 Provider 已移至“${UNGROUPED_PROVIDER_LABEL}”。`
+    );
+  }
+}
+
+async function moveSelectedProviders() {
+  if (!selectedProviderCount()) return;
+  if (!prepareForGroupManagement()) return;
+  const sourceConfigs = configsWithCurrentToggles();
+  await persistProviderLayout(
+    moveProvidersToGroup(sourceConfigs, selectedProviderIds, bulkTargetGroup),
+    `${selectedProviderIds.size} 个 Provider 已移至“${bulkTargetGroup || UNGROUPED_PROVIDER_LABEL}”。`,
+    { clearSelection: true }
+  );
+}
+
+async function createGroupFromSelection() {
+  if (!selectedProviderCount()) {
+    setMessage("请先选择至少一个 Provider。", true);
+    return;
+  }
+  const entered = prompt("新分组名称", "");
+  if (entered == null) return;
+  const groupName = validateGroupName(entered);
+  if (!groupName) return;
+  if (!prepareForGroupManagement()) return;
+  const sourceConfigs = configsWithCurrentToggles();
+  await persistProviderLayout(
+    moveProvidersToGroup(sourceConfigs, selectedProviderIds, groupName),
+    `已创建分组“${groupName}”，并移动 ${selectedProviderIds.size} 个 Provider。`,
+    { clearSelection: true }
+  );
+}
+
+function clearProviderSelection() {
+  selectedProviderIds.clear();
+  document.querySelectorAll("[data-provider-select], [data-group-select]").forEach((input) => {
+    input.checked = false;
+    input.indeterminate = false;
+  });
+  document.querySelectorAll(".provider-row.selected").forEach((row) => row.classList.remove("selected"));
+  renderBulkActions();
+}
+
+function handleProviderSelectionChange(input) {
+  const groupNode = input.closest("[data-provider-group]");
+  if (input.matches("[data-group-select]")) {
+    groupNode.querySelectorAll("[data-provider]").forEach((row) => {
+      const providerId = row.dataset.provider;
+      const providerInput = row.querySelector("[data-provider-select]");
+      providerInput.checked = input.checked;
+      row.classList.toggle("selected", input.checked);
+      if (input.checked) selectedProviderIds.add(providerId);
+      else selectedProviderIds.delete(providerId);
+    });
+  } else {
+    const row = input.closest("[data-provider]");
+    row.classList.toggle("selected", input.checked);
+    if (input.checked) selectedProviderIds.add(row.dataset.provider);
+    else selectedProviderIds.delete(row.dataset.provider);
+  }
+  updateGroupSelectionState(groupNode);
+  renderBulkActions();
 }
 
 function applyLayoutAction(button) {
@@ -887,10 +1069,10 @@ async function exportSource(providerId) {
     const json = JSON.stringify(response.provider, null, 2);
     try {
       await navigator.clipboard.writeText(json);
-      setMessage(`${response.provider.name} 书源已复制。`);
+      setMessage(`${response.provider.name} Provider 配置已复制。`);
     } catch {
       downloadJson(response.provider, `${response.provider.id}.provider.json`);
-      setMessage(`${response.provider.name} 书源已下载。`);
+      setMessage(`${response.provider.name} Provider 配置已下载。`);
     }
     } catch (error) {
       setMessage(error.message || "导出失败", true);
@@ -938,7 +1120,7 @@ async function importSources() {
     try {
     const parsed = JSON.parse(document.getElementById("import-json").value);
     const sources = Array.isArray(parsed) ? parsed : [parsed];
-    if (!sources.length) throw new Error("书源文件为空。");
+    if (!sources.length) throw new Error("Provider 配置文件为空。");
     const normalizedSources = sources.map((raw) => {
       const source = formStateToProvider(raw);
       validateSelectors(source);
@@ -1075,8 +1257,18 @@ if (typeof document !== "undefined") {
       applyLayoutAction(layoutButton);
       return;
     }
+    const groupButton = event.target.closest("[data-group-action]");
+    if (groupButton) {
+      handleGroupAction(groupButton.closest("[data-provider-group]").dataset.providerGroup, groupButton.dataset.groupAction);
+      return;
+    }
     const button = event.target.closest("[data-provider-action]");
     if (button) handleProviderAction(button.closest("[data-provider]").dataset.provider, button.dataset.providerAction);
+  });
+  document.getElementById("providers").addEventListener("change", (event) => {
+    if (event.target.matches("[data-provider-select], [data-group-select]")) {
+      handleProviderSelectionChange(event.target);
+    }
   });
   document.getElementById("providers").addEventListener("dragstart", handleLayoutDragStart);
   document.getElementById("providers").addEventListener("dragover", handleLayoutDragOver);
@@ -1099,6 +1291,12 @@ if (typeof document !== "undefined") {
     document.getElementById("import-panel").classList.remove("hidden");
   });
   document.getElementById("export-all-sources").addEventListener("click", exportAllSources);
+  document.getElementById("bulk-provider-group").addEventListener("change", (event) => {
+    bulkTargetGroup = event.target.value;
+  });
+  document.getElementById("move-selected-providers").addEventListener("click", moveSelectedProviders);
+  document.getElementById("create-provider-group").addEventListener("click", createGroupFromSelection);
+  document.getElementById("clear-provider-selection").addEventListener("click", clearProviderSelection);
   document.getElementById("close-import").addEventListener("click", () => document.getElementById("import-panel").classList.add("hidden"));
   document.getElementById("choose-import-file").addEventListener("click", () => document.getElementById("import-file").click());
   document.getElementById("import-file").addEventListener("change", async (event) => {

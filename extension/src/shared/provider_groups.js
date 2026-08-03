@@ -56,6 +56,50 @@ export function moveProvider(configs, providerId, targetGroupName, targetProvide
   return flattenProviderGroups(groups.filter((group) => group.providers.length));
 }
 
+export function moveProvidersToGroup(configs, providerIds, targetGroupName) {
+  const selectedIds = new Set(providerIds || []);
+  const normalizedTarget = String(targetGroupName || "").trim();
+  const moving = (configs || []).filter((provider) => (
+    selectedIds.has(provider.id) && providerGroupName(provider) !== normalizedTarget
+  ));
+  if (!moving.length) return [...(configs || [])];
+
+  const movingIds = new Set(moving.map((provider) => provider.id));
+  const groups = groupProviderConfigs(configs).map((group) => ({
+    ...group,
+    providers: group.providers.filter((provider) => !movingIds.has(provider.id))
+  }));
+  let targetGroup = groups.find((group) => group.name === normalizedTarget);
+  if (!targetGroup) {
+    targetGroup = {
+      name: normalizedTarget,
+      label: providerGroupLabel(normalizedTarget),
+      providers: []
+    };
+    groups.push(targetGroup);
+  }
+  targetGroup.providers.push(...moving.map((provider) => ({ ...provider, group: normalizedTarget })));
+  return flattenProviderGroups(groups.filter((group) => group.providers.length));
+}
+
+export function renameProviderGroup(configs, groupName, nextGroupName) {
+  const sourceName = String(groupName || "").trim();
+  const targetName = String(nextGroupName || "").trim();
+  if (sourceName === targetName) return [...(configs || [])];
+  return (configs || []).map((provider) => (
+    providerGroupName(provider) === sourceName ? { ...provider, group: targetName } : provider
+  ));
+}
+
+export function deleteProviderGroup(configs, groupName) {
+  const sourceName = String(groupName || "").trim();
+  if (!sourceName) return [...(configs || [])];
+  const providerIds = (configs || [])
+    .filter((provider) => providerGroupName(provider) === sourceName)
+    .map((provider) => provider.id);
+  return moveProvidersToGroup(configs, providerIds, "");
+}
+
 export function moveProviderGroup(configs, groupName, targetGroupName, after = false) {
   const groups = groupProviderConfigs(configs);
   const sourceIndex = groups.findIndex((group) => group.name === groupName);

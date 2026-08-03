@@ -210,13 +210,15 @@ button.primary:hover {
 }
 
 button.danger,
-button[data-provider-action="delete"] {
+button[data-provider-action="delete"],
+button[data-group-action="delete"] {
   border-color: color-mix(in srgb, var(--bad) 46%, var(--line));
   color: var(--bad);
 }
 
 button.danger:hover,
-button[data-provider-action="delete"]:hover {
+button[data-provider-action="delete"]:hover,
+button[data-group-action="delete"]:hover {
   border-color: var(--bad);
   background: var(--bad-soft);
   color: var(--bad);
@@ -229,6 +231,16 @@ button:disabled {
 
 .hidden { display: none !important; }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .section-actions,
 .editor-actions,
 .provider-actions,
@@ -240,6 +252,38 @@ button:disabled {
 }
 
 .provider-section .section-actions { justify-content: flex-end; }
+
+.bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  border-radius: 6px;
+  background: var(--accent-soft);
+}
+
+.bulk-actions > strong {
+  margin-right: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.bulk-target {
+  display: flex;
+  flex-direction: row;
+  gap: 7px;
+  align-items: center;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.bulk-target select {
+  width: 190px;
+  min-height: 34px;
+}
 
 #providers {
   display: grid;
@@ -257,13 +301,59 @@ button:disabled {
 
 .provider-group-head {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto auto;
+  grid-template-columns: 22px 34px minmax(0, 1fr) auto auto;
   gap: 9px;
   align-items: center;
   min-height: 48px;
   padding: 6px 11px;
   border-bottom: 1px solid var(--line);
   background: var(--panel-soft);
+}
+
+.selection-control {
+  display: inline-flex;
+  width: 22px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+}
+
+.selection-control input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.group-tools,
+.group-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 3px;
+  align-items: center;
+}
+
+.group-actions button {
+  min-height: 30px;
+  padding: 0 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.group-actions button:hover {
+  border-color: var(--line-strong);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.group-actions button[data-group-action="delete"] { color: var(--bad); }
+
+.group-actions button[data-group-action="delete"]:hover {
+  border-color: var(--bad);
+  background: var(--bad-soft);
+  color: var(--bad);
 }
 
 .provider-group-head h3 {
@@ -287,7 +377,7 @@ button:disabled {
 
 .provider-row {
   display: grid;
-  grid-template-columns: 34px 68px minmax(150px, 1fr) auto auto;
+  grid-template-columns: 22px 34px 68px minmax(150px, 1fr) auto auto;
   gap: 10px;
   align-items: center;
   min-height: 66px;
@@ -297,6 +387,7 @@ button:disabled {
 
 .provider-row:first-child { border-top: 0; }
 .provider-row:hover { background: color-mix(in srgb, var(--panel-soft) 70%, transparent); }
+.provider-row.selected { background: var(--accent-soft); }
 
 .drag-handle,
 .icon-button {
@@ -596,11 +687,11 @@ button:disabled {
   .basic-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .provider-row {
-    grid-template-columns: 34px 68px minmax(140px, 1fr) auto;
+    grid-template-columns: 22px 34px 68px minmax(140px, 1fr) auto;
   }
 
   .provider-actions {
-    grid-column: 3 / -1;
+    grid-column: 4 / -1;
     justify-content: flex-start;
   }
 }
@@ -628,23 +719,28 @@ button:disabled {
   .secret-row button { justify-self: start; }
 
   .provider-group-head {
-    grid-template-columns: 34px minmax(0, 1fr) auto auto;
+    grid-template-columns: 22px 34px minmax(0, 1fr) auto;
     padding-inline: 8px;
+  }
+
+  .provider-group-head .group-tools {
+    grid-column: 3 / -1;
+    justify-content: space-between;
   }
 
   .provider-row {
-    grid-template-columns: 34px minmax(0, 1fr) auto;
+    grid-template-columns: 22px 34px minmax(0, 1fr) auto;
     padding-inline: 8px;
   }
 
-  .provider-row .checkbox-label,
-  .provider-row .provider-summary,
-  .provider-row .provider-actions {
-    grid-column: 2 / -1;
-  }
+  .provider-row > .provider-selection { grid-column: 1; grid-row: 1; }
+  .provider-row > .drag-handle { grid-column: 2; grid-row: 1; }
+  .provider-row > .checkbox-label { grid-column: 3; grid-row: 1; }
+  .provider-row .provider-summary { grid-column: 3 / -1; grid-row: 2; }
+  .provider-row .provider-actions { grid-column: 3 / -1; grid-row: 3; }
 
   .provider-row .provider-layout-actions {
-    grid-column: 3;
+    grid-column: 4;
     grid-row: 1;
   }
 
@@ -678,6 +774,12 @@ button:disabled {
 
   .section-actions { gap: 6px; }
   .section-actions button { flex: 1 1 auto; }
+  .bulk-actions > strong { width: 100%; }
+  .bulk-target { width: 100%; }
+  .bulk-target select { width: auto; min-width: 0; flex: 1; }
+  .bulk-actions > button { flex: 1 1 auto; }
   .provider-group-head { gap: 5px; }
+  .provider-group-head .group-tools { flex-wrap: wrap; }
+  .group-actions { flex-wrap: wrap; }
   .provider-count { min-width: 22px; padding-inline: 5px; }
 }

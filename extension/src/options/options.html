@@ -54,12 +54,22 @@
       <div class="section-head">
         <h2>Providers</h2>
         <div class="section-actions">
-          <button id="import-source" type="button">导入书源</button>
+          <button id="import-source" type="button">导入 Provider 配置</button>
           <button id="export-all-sources" type="button">导出全部</button>
           <button id="add-sub2api-provider" type="button">新增 AIHub/Sub2API</button>
           <button id="add-newapi-provider" type="button">新增 New API</button>
           <button id="add-page-provider" type="button" class="primary">新增来源</button>
         </div>
+      </div>
+      <div id="provider-bulk-actions" class="bulk-actions hidden" aria-live="polite">
+        <strong id="selected-provider-count">已选择 0 个</strong>
+        <label class="bulk-target">
+          移动到
+          <select id="bulk-provider-group"></select>
+        </label>
+        <button id="move-selected-providers" type="button" class="primary">移动</button>
+        <button id="create-provider-group" type="button">新建分组</button>
+        <button id="clear-provider-selection" type="button">取消选择</button>
       </div>
       <div id="providers"></div>
     </section>
@@ -155,11 +165,11 @@
 
     <section id="import-panel" class="hidden">
       <div class="section-head">
-        <h2>导入书源</h2>
+        <h2>导入 Provider 配置</h2>
         <button id="close-import" type="button">关闭</button>
       </div>
       <label>
-        书源 JSON
+        Provider 配置 JSON
         <textarea id="import-json" rows="8" spellcheck="false"></textarea>
       </label>
       <div class="source-actions">
