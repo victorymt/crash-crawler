@@ -116,7 +116,7 @@ main > section:last-of-type { border-bottom: 0; }
   gap: 14px;
 }
 
-.secret-row {
+.credential-row {
   display: grid;
   max-width: 820px;
   grid-template-columns: minmax(260px, 1fr) auto;
@@ -714,9 +714,9 @@ button:disabled {
   .provider-section .section-actions { justify-content: flex-start; }
 
   .settings-grid,
-  .secret-row { grid-template-columns: 1fr; }
+  .credential-row { grid-template-columns: 1fr; }
 
-  .secret-row button { justify-self: start; }
+  .credential-row button { justify-self: start; }
 
   .provider-group-head {
     grid-template-columns: 22px 34px minmax(0, 1fr) auto;

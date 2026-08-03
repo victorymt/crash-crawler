@@ -121,7 +121,7 @@ uv run python crawler.py --provider PROVIDER_ID --explore
 3. 点击“加载已解压的扩展程序”，选择上面的 `extension/` 目录。
 4. 更新代码后，在扩展管理页点击“重新加载”。
 
-插件版不需要启动 `server.py`，也不需要同步 BrowserOS profile。它会直接使用当前浏览器的登录态访问 provider 页面；DeepSeek API Key 在扩展设置页中保存到 `chrome.storage.local`。
+插件版不需要启动 `server.py`，也不需要同步 BrowserOS profile。它会直接使用当前浏览器的登录态访问 provider 页面；DeepSeek API Key 在编辑内置 DeepSeek Provider 时配置，并独立保存到 `chrome.storage.local`。
 
 ### Provider 管理
 
@@ -143,7 +143,7 @@ uv run python crawler.py --provider PROVIDER_ID --explore
 - 站点内部 API 所需的临时登录字段只短期缓存到 `chrome.storage.session`，按 provider 和 origin 隔离；不会写入持久化快照或日志，鉴权失败后会立即清除。
 - 页面解析不会枚举站点的 `localStorage` 或 `sessionStorage`；内置 API 只读取明确需要的登录字段。
 - 导入来源会限制页面数、规则数、正则复杂度和最长等待时间，异常配置会在保存前被拒绝。
-- DeepSeek 设置支持显式清除已保存的 API Key。
+- DeepSeek API Key 不属于 Provider JSON，不会随 Provider 配置导入或导出；编辑内置 DeepSeek Provider 时可更新或显式清除已保存的密钥。
 
 ### 从当前网页添加 Provider
 

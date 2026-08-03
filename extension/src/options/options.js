@@ -724,6 +724,10 @@ function renderEditor() {
   document.getElementById("source-type").value = draftConfig.type || "page";
   document.getElementById("source-target-url").value = draftConfig.targetUrl || "";
   document.getElementById("source-recharge-ratio").value = draftConfig.rechargeRatio ?? 1;
+  document.getElementById("deepseek-credentials-block").classList.toggle(
+    "hidden",
+    draftConfig.id !== "deepseek" || editorReadOnly
+  );
   document.getElementById("secondary-pages").innerHTML = renderSecondaryPages(draftConfig);
   document.getElementById("metric-rules").innerHTML = renderMetricRules(draftConfig);
   document.getElementById("source-login-hints").value = (draftConfig.parserRules?.loginHints || []).join("\n");
@@ -853,6 +857,7 @@ function openEditor(config, options = {}) {
   draftConfig = clone(config);
   draftOriginalId = options.isNew ? "" : config.id;
   editorReadOnly = Boolean(options.readOnly);
+  document.getElementById("deepseek-key").value = "";
   renderEditor();
   editorDirty = false;
 }
@@ -1007,6 +1012,12 @@ async function saveEditor(event) {
       : formStateToProvider(raw);
     if (!isBuiltinProviderId(source.id)) validateSelectors(source);
     await requestProviderPermissions(source);
+    const deepSeekKey = source.id === "deepseek"
+      ? document.getElementById("deepseek-key").value.trim()
+      : "";
+    if (deepSeekKey) {
+      await sendMessage({ type: "secret:setDeepSeekKey", value: deepSeekKey });
+    }
     const response = await sendMessage({ type: "config:saveProvider", provider: source });
     await load();
     openEditor(response.provider);
@@ -1179,10 +1190,6 @@ async function saveGlobal() {
     try {
     const updatedConfigs = configsWithCurrentToggles();
     const configResponse = await sendMessage({ type: "config:save", configs: updatedConfigs });
-    await sendMessage({
-      type: "secret:setDeepSeekKey",
-      value: document.getElementById("deepseek-key").value.trim()
-    });
     const settingsResponse = await sendMessage({
       type: "settings:save",
       settings: {
