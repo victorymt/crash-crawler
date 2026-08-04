@@ -82,6 +82,10 @@ class SyncAuthError(ProviderError):
     pass
 
 
+class HostValidationError(ProviderError):
+    pass
+
+
 class SyncRevisionConflict(ProviderError):
     pass
 
@@ -251,8 +255,18 @@ class RefreshJobManager:
                 self._persist()
                 return
             failed = not snapshot or snapshot.get("status") != "ok"
+            if self.operation == "channels" and snapshot:
+                failed = bool(
+                    failed
+                    or snapshot.get("channelError")
+                    or snapshot.get("channelsStale") is True
+                )
             item["status"] = "failed" if failed else "succeeded"
-            item["error"] = snapshot.get("error") if failed and snapshot else None
+            item["error"] = (
+                snapshot.get("error") or snapshot.get("channelError")
+                if failed and snapshot
+                else None
+            )
             self._job["completed"] += 1
             counter = "failureCount" if failed else "successCount"
             self._job[counter] += 1
@@ -359,7 +373,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(content)
+        if self.command != "HEAD":
+            self.wfile.write(content)
 
     def send_json(self, data: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json_bytes(data), "application/json; charset=utf-8", status)
@@ -381,7 +396,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return data
 
     def send_api_error(self, exc: Exception) -> None:
-        if isinstance(exc, SyncAuthError):
+        if isinstance(exc, HostValidationError):
+            self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+        elif isinstance(exc, SyncAuthError):
             self.send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
         elif isinstance(exc, SyncRevisionConflict):
             self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
@@ -399,6 +416,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         provided = self.headers.get("X-Provider-Sync-Token") or ""
         if not provided or not hmac.compare_digest(provided, expected):
             raise SyncAuthError("invalid local sync token")
+
+    def require_loopback_host(self) -> None:
+        raw_host = str(self.headers.get("Host") or "").strip()
+        try:
+            parsed = urlparse(f"//{raw_host}")
+            hostname = (parsed.hostname or "").lower()
+            _ = parsed.port
+        except ValueError as exc:
+            raise HostValidationError("invalid Host header") from exc
+        if (
+            not raw_host
+            or hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or bool(parsed.path or parsed.params or parsed.query or parsed.fragment)
+        ):
+            raise HostValidationError("Host must be a loopback address")
+
+    def authorize_request(self, mutation: bool = False) -> bool:
+        try:
+            self.require_loopback_host()
+            if mutation:
+                self.require_sync_token()
+            return True
+        except Exception as exc:
+            self.send_api_error(exc)
+            return False
 
     def apply_configs(self, configs) -> list[dict[str, object]]:
         self.manager.replace_configs(configs)
@@ -434,6 +478,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_bytes(file_path.read_bytes(), content_type)
 
     def do_GET(self) -> None:
+        if not self.authorize_request():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         if path in {"/", "/channels", "/settings"} or path.startswith("/static/"):
@@ -503,6 +549,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
+        if not self.authorize_request():
+            return
         path = urlparse(self.path).path
         if path in {"/", "/channels", "/settings"} or path.startswith("/static/"):
             self.send_response(HTTPStatus.OK)
@@ -523,6 +571,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if not self.authorize_request(mutation=True):
+            return
         path = urlparse(self.path).path
         if path == "/api/local-sync/token":
             try:
@@ -683,6 +733,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
+        if not self.authorize_request(mutation=True):
+            return
         path = urlparse(self.path).path
         if path == "/api/secrets/deepseek":
             delete_local_secret("deepseek_api_key")

@@ -15,9 +15,12 @@
       </div>
       <div class="toolbar">
         <button id="refresh-channels" class="primary">刷新渠道</button>
+        <button id="retry-channel-failed" hidden>重试失败</button>
+        <button id="cancel-channel-refresh" class="danger" hidden>取消刷新</button>
         <button id="options">设置</button>
       </div>
       <div id="message" class="message" aria-live="polite"></div>
+      <progress id="channel-refresh-progress" max="1" value="0" hidden></progress>
     </div>
   </header>
 

@@ -198,6 +198,29 @@ class ConfigStoreTests(unittest.TestCase):
                     "unexpected": True,
                 }])
 
+    def test_import_rejects_unsupported_provider_schema_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ConfigStore(Path(tmp) / "providers.json")
+            with self.assertRaisesRegex(ValueError, "Unsupported provider schemaVersion"):
+                store.import_configs([{
+                    "schemaVersion": 99,
+                    "id": "future",
+                    "name": "Future",
+                    "type": "page",
+                    "targetUrl": "https://example.test",
+                    "parserRules": {"balances": [], "quotas": [], "textMetrics": []},
+                }])
+            with self.assertRaisesRegex(ValueError, "Unsupported provider schemaVersion"):
+                providers_from_import_document({
+                    "schema_version": 99,
+                    "providers": [{
+                        "id": "future-wrapper",
+                        "name": "Future Wrapper",
+                        "type": "page",
+                        "targetUrl": "https://example.test",
+                    }],
+                })
+
 
 if __name__ == "__main__":
     unittest.main()

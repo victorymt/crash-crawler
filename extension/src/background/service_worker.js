@@ -1,6 +1,6 @@
 import { linksForConfig, normalizeProviderConfig } from "../shared/config.js";
 import { summarizeChannelRefresh } from "../shared/channels.js";
-import { badgeFromSnapshots, blankSnapshot, errorSnapshot, preservePreviousChannels } from "../shared/snapshots.js";
+import { badgeFromSnapshots, blankSnapshot, errorSnapshot, preservePreviousChannels, snapshotNeedsRetry } from "../shared/snapshots.js";
 import {
   exportProviderConfig,
   deleteProviderConfig,
@@ -306,8 +306,9 @@ async function refreshAllProviders(context = {}) {
   }
 }
 
-async function failedProviderConfigs() {
-  const configs = await publicConfigs();
+async function failedProviderConfigs({ channelsOnly = false } = {}) {
+  const allConfigs = await publicConfigs();
+  const configs = channelsOnly ? channelProviderConfigs(allConfigs) : allConfigs;
   const snapshots = await getSnapshots();
   const run = await getRefreshRun();
   const failedIds = new Set(
@@ -317,7 +318,7 @@ async function failedProviderConfigs() {
   );
   return configs.filter((config) => {
     const snapshot = snapshots[config.id];
-    return failedIds.has(config.id) || ["error", "stale"].includes(snapshot?.status);
+    return failedIds.has(config.id) || snapshotNeedsRetry(snapshot, { channelsOnly });
   });
 }
 
@@ -344,6 +345,36 @@ async function refreshFailedProviders(context = {}) {
   }
 }
 
+async function refreshFailedChannelProviders(context = {}) {
+  const configs = await failedProviderConfigs({ channelsOnly: true });
+  if (!configs.length) {
+    return { providers: [], summary: summarizeChannelRefresh([]), started: false, cancelled: false };
+  }
+  const previous = await getSnapshots();
+  const controller = new AbortController();
+  refreshBatchCancelController = controller;
+  try {
+    const providers = await runRefreshBatch({
+      configs,
+      previousSnapshots: previous,
+      context,
+      collect: collectOneExclusive,
+      saveSnapshot: saveCurrentProviderSnapshot,
+      cancelSignal: controller.signal
+    });
+    await syncBadgeFromStorage();
+    const run = await getRefreshRun();
+    return {
+      providers,
+      summary: summarizeChannelRefresh(providers),
+      started: true,
+      cancelled: run?.state === "cancelled"
+    };
+  } finally {
+    if (refreshBatchCancelController === controller) refreshBatchCancelController = null;
+  }
+}
+
 async function refreshChannelProviders(context = {}) {
   const configs = channelProviderConfigs(await getProviderConfigs());
   const previous = await getSnapshots();
@@ -359,7 +390,12 @@ async function refreshChannelProviders(context = {}) {
       cancelSignal: controller.signal
     });
     await syncBadgeFromStorage();
-    return { providers, summary: summarizeChannelRefresh(providers) };
+    const run = await getRefreshRun();
+    return {
+      providers,
+      summary: summarizeChannelRefresh(providers),
+      cancelled: run?.state === "cancelled"
+    };
   } finally {
     if (refreshBatchCancelController === controller) refreshBatchCancelController = null;
   }
@@ -402,6 +438,10 @@ async function refreshFailedProvidersExclusive(context = {}) {
 
 async function refreshChannelProvidersExclusive(context = {}) {
   return runExclusiveRefresh("channels", context, refreshChannelProviders);
+}
+
+async function refreshFailedChannelProvidersExclusive(context = {}) {
+  return runExclusiveRefresh("channels-retry", context, refreshFailedChannelProviders);
 }
 
 export async function syncAutoRefreshAlarm(settingsInput) {
@@ -490,6 +530,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           trigger: "manual-channels",
           tabPolicy: "allow-hidden-tabs"
         });
+      case "providers:refreshFailedChannels":
+        return refreshFailedChannelProvidersExclusive({
+          trigger: "manual-channels-retry",
+          tabPolicy: "allow-hidden-tabs"
+        });
       case "settings:get":
         return { settings: await getExtensionSettings() };
       case "settings:save": {
@@ -567,6 +612,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // lets a fresh worker continue a recent run without repeating completed sources.
 recoverRefreshRun((context) => {
   if (context.trigger === "auto") return runAutoRefresh(context);
+  if (context.trigger === "manual-channels-retry") return refreshFailedChannelProvidersExclusive(context);
   if (context.trigger === "manual-channels") return refreshChannelProvidersExclusive(context);
   return refreshAllProvidersExclusive(context);
 }).catch(() => undefined);

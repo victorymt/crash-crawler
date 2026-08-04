@@ -305,7 +305,11 @@ function normalizeParserRules(rawRules) {
 }
 
 function validatePortableSchemaShape(raw) {
-  if (raw?.schemaVersion !== PROVIDER_SCHEMA_VERSION) return;
+  const schemaVersion = raw?.schemaVersion ?? raw?.schema_version;
+  if (schemaVersion != null && ![1, 2, 3, PROVIDER_SCHEMA_VERSION].includes(schemaVersion)) {
+    throw new Error(`Unsupported provider schemaVersion: ${schemaVersion}`);
+  }
+  if (schemaVersion !== PROVIDER_SCHEMA_VERSION) return;
   const unknown = Object.keys(raw).filter((key) => !PORTABLE_PROVIDER_KEYS.has(key));
   if (unknown.length) throw new Error(`Provider ${raw.id || "<unknown>"} has unsupported fields: ${unknown.join(", ")}`);
   if (raw.parserRules && typeof raw.parserRules === "object" && !Array.isArray(raw.parserRules)) {
@@ -569,6 +573,10 @@ export function providersFromImportDocument(document) {
   if (Array.isArray(document)) return document;
   if (!document || typeof document !== "object") {
     throw new Error("Provider import must be an object or array");
+  }
+  const schemaVersion = document.schemaVersion ?? document.schema_version;
+  if (schemaVersion != null && ![1, 2, 3, PROVIDER_SCHEMA_VERSION].includes(schemaVersion)) {
+    throw new Error(`Unsupported provider schemaVersion: ${schemaVersion}`);
   }
   if (Array.isArray(document.providers)) return document.providers;
   if (document.id != null) return [document];

@@ -89,6 +89,16 @@ button.primary:hover {
   color: var(--on-accent);
 }
 
+button.danger {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
+button.danger:hover {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
 button:focus-visible,
 select:focus-visible,
 input:focus-visible,
@@ -162,6 +172,14 @@ h2 {
 
 .message:empty { min-height: 0; }
 .message.error { color: var(--bad); }
+
+#channel-refresh-progress {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 4px;
+  border: 0;
+  accent-color: var(--accent);
+}
 
 .page-shell { padding: 22px 0 42px; }
 

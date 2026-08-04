@@ -6,21 +6,12 @@ let activeOperation = false;
 let lastConfigLoadAt = 0;
 let configReloadPromise = null;
 const selectedIds = new Set();
+const requestJson = window.providerApi.requestJson;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
   })[char]);
-}
-
-async function requestJson(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-  return data;
 }
 
 function setMessage(message, isError = false) {
@@ -178,6 +169,12 @@ function closeEditor() {
 function editorProvider() {
   const type = document.getElementById("provider-type").value;
   const previous = configs.find((config) => config.id === editingId) || {};
+  const sameType = previous.type === type;
+  const defaultMode = type === "deepseek"
+    ? "api"
+    : type === "newapi" || type === "sub2api"
+      ? "api_then_page"
+      : "browser";
   const provider = {
     ...previous,
     id: document.getElementById("provider-id").value.trim(),
@@ -187,14 +184,14 @@ function editorProvider() {
     group: document.getElementById("provider-group").value.trim(),
     recharge_ratio: Number(document.getElementById("provider-ratio").value),
     enabled: document.getElementById("provider-enabled").checked,
-    mode: type === "deepseek" ? "api" : "browser"
+    mode: sameType && previous.mode ? previous.mode : defaultMode
   };
   if (type === "newapi") provider.quota_per_unit = Number(document.getElementById("quota-per-unit").value);
   else delete provider.quota_per_unit;
   if (type === "page") {
     provider.secondary_urls = parseJsonField("secondary-urls", []);
     provider.parser_rules = parseJsonField("parser-rules", {});
-  } else {
+  } else if (!sameType) {
     delete provider.parser_rules;
   }
   return provider;
@@ -309,6 +306,10 @@ document.getElementById("export-config").addEventListener("click", () => {
 
 function providersFromImportDocument(documentData) {
   if (Array.isArray(documentData)) return documentData;
+  const schemaVersion = documentData?.schemaVersion ?? documentData?.schema_version;
+  if (schemaVersion != null && ![1, 2, 3, 4].includes(schemaVersion)) {
+    throw new Error(`不支持的 Provider schemaVersion：${schemaVersion}`);
+  }
   if (documentData && Array.isArray(documentData.providers)) return documentData.providers;
   if (documentData?.id != null) return [documentData];
   throw new Error("导入内容必须是 Provider、Provider 数组或包含 providers 的对象");

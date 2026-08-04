@@ -1,7 +1,9 @@
+import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from providers import (
     DeepSeekProvider,
@@ -31,6 +33,28 @@ from providers import (
 
 
 class ProviderParserTests(unittest.TestCase):
+    def test_provider_cache_save_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = Path(tmp) / "cache.json"
+            original = {"providers": {"old": {"status": "ok"}}}
+            cache_file.write_text(json.dumps(original), encoding="utf-8")
+            manager = ProviderManager(configs=[], cache_file=cache_file)
+            manager.cache = {"providers": {"new": {"status": "ok"}}}
+
+            with patch("providers.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    manager.save_cache()
+
+            self.assertEqual(json.loads(cache_file.read_text(encoding="utf-8")), original)
+            self.assertEqual(list(Path(tmp).glob(".cache.json.*.tmp")), [])
+
+            manager.save_cache()
+            self.assertEqual(
+                json.loads(cache_file.read_text(encoding="utf-8")),
+                manager.cache,
+            )
+            self.assertEqual(list(Path(tmp).glob(".cache.json.*.tmp")), [])
+
     def test_parse_percent(self):
         self.assertEqual(parse_percent("35%"), 35)
         self.assertEqual(parse_percent(" 100% "), 100)

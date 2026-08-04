@@ -8,7 +8,7 @@ import {
   rankAvailableChannels,
   summarizeChannelRefresh
 } from "../extension/src/shared/channels.js";
-import { preservePreviousChannels } from "../extension/src/shared/snapshots.js";
+import { preservePreviousChannels, snapshotNeedsRetry } from "../extension/src/shared/snapshots.js";
 
 const config = {
   id: "fastaitoken",
@@ -270,4 +270,13 @@ test("partial channel failures retain previous data but exclude it from live ran
   assert.equal(merged.channels.length, 6);
   assert.equal(merged.channelsStale, true);
   assert.deepEqual(rankAvailableChannels([merged], "gpt-5.5"), []);
+});
+
+test("snapshot retry detection includes channel-only failures and needs-visit states", () => {
+  assert.equal(snapshotNeedsRetry({ status: "needs_visit" }), true);
+  assert.equal(snapshotNeedsRetry({ type: "sub2api", status: "ok", channelError: "monitor failed" }), false);
+  assert.equal(snapshotNeedsRetry({ type: "sub2api", status: "ok", channelError: "monitor failed" }, { channelsOnly: true }), true);
+  assert.equal(snapshotNeedsRetry({ type: "ezaiclub", status: "ok", channelsStale: true }, { channelsOnly: true }), true);
+  assert.equal(snapshotNeedsRetry({ type: "sub2api", status: "ok", channelsStale: false }, { channelsOnly: true }), false);
+  assert.equal(snapshotNeedsRetry({ type: "deepseek", status: "error" }, { channelsOnly: true }), false);
 });

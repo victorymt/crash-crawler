@@ -1,4 +1,5 @@
 import { groupProviderConfigs } from "../shared/provider_groups.js";
+import { snapshotNeedsRetry } from "../shared/snapshots.js";
 
 let configs = [];
 let snapshots = [];
@@ -6,6 +7,10 @@ let activeOperation = false;
 let providersLoaded = false;
 let currentPage = null;
 const collapsedGroups = new Set();
+let extensionSettings = {};
+let groupCollapseInitialized = false;
+let groupCollapseDefault = null;
+let knownGroupNames = new Set();
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -53,7 +58,7 @@ function setCancelVisible(visible) {
 }
 
 function hasFailedSnapshots() {
-  return snapshots.some((snapshot) => ["error", "stale"].includes(snapshot.status));
+  return snapshots.some((snapshot) => snapshotNeedsRetry(snapshot));
 }
 
 function setRetryVisible(visible) {
@@ -231,9 +236,31 @@ function providerCardHtml(config) {
     </article>`;
 }
 
+function syncGroupCollapseState(groups) {
+  const shouldCollapse = extensionSettings.collapseProviderGroupsByDefault !== false;
+  const currentNames = new Set(groups.map((group) => group.name));
+  for (const groupName of collapsedGroups) {
+    if (!currentNames.has(groupName)) collapsedGroups.delete(groupName);
+  }
+
+  if (!groupCollapseInitialized || groupCollapseDefault !== shouldCollapse) {
+    collapsedGroups.clear();
+    if (shouldCollapse) groups.slice(1).forEach((group) => collapsedGroups.add(group.name));
+    groupCollapseInitialized = true;
+    groupCollapseDefault = shouldCollapse;
+  } else if (shouldCollapse) {
+    groups.forEach((group, index) => {
+      if (!knownGroupNames.has(group.name) && index > 0) collapsedGroups.add(group.name);
+    });
+  }
+  knownGroupNames = currentNames;
+}
+
 function render() {
   const root = document.getElementById("provider-list");
-  root.innerHTML = groupProviderConfigs(configs).map((group) => {
+  const groups = groupProviderConfigs(configs);
+  syncGroupCollapseState(groups);
+  root.innerHTML = groups.map((group) => {
     const collapsed = collapsedGroups.has(group.name);
     return `<section class="provider-group ${collapsed ? "collapsed" : ""}" data-provider-group="${escapeHtml(group.name)}">
       <button class="provider-group-toggle" type="button" data-toggle-provider-group="${escapeHtml(group.name)}" aria-expanded="${!collapsed}">
@@ -289,6 +316,7 @@ async function loadStatus() {
   const data = await sendMessage({ type: "providers:list" });
   configs = data.configs;
   snapshots = data.providers;
+  extensionSettings = data.settings || {};
   providersLoaded = true;
   render();
   setRetryVisible(hasFailedSnapshots());

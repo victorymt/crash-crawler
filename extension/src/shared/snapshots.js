@@ -130,6 +130,13 @@ export function preservePreviousChannels(snapshot, previous) {
   };
 }
 
+export function snapshotNeedsRetry(snapshot, { channelsOnly = false } = {}) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  if (channelsOnly && !["ezaiclub", "sub2api"].includes(snapshot.type)) return false;
+  if (["error", "stale", "needs_visit"].includes(snapshot.status)) return true;
+  return channelsOnly && (Boolean(snapshot.channelError) || snapshot.channelsStale === true);
+}
+
 /** Derive toolbar badge from the latest snapshots. */
 export function badgeFromSnapshots(snapshots) {
   const list = Array.isArray(snapshots)

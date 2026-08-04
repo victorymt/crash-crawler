@@ -20,6 +20,7 @@
       </nav>
       <div class="toolbar">
         <button id="refresh-channels" type="button" class="primary">刷新渠道</button>
+        <button id="retry-channel-failed" type="button" hidden>重试失败</button>
         <button id="cancel-channel-refresh" type="button" class="danger" hidden>取消刷新</button>
       </div>
       <div class="operation-feedback">
@@ -52,6 +53,7 @@
     </section>
   </main>
   <script src="/static/config-events.js"></script>
+  <script src="/static/api.js"></script>
   <script src="/static/channels.js"></script>
 </body>
 </html>

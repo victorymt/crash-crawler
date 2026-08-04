@@ -3,24 +3,12 @@ let snapshots = [];
 let activeOperation = false;
 let lastStatusLoadAt = 0;
 let statusReloadPromise = null;
+const requestJson = window.providerApi.requestJson;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
   })[char]);
-}
-
-async function requestJson(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), options.timeout || 180000);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    return data;
-  } finally {
-    window.clearTimeout(timeout);
-  }
 }
 
 function statusLabel(value) {

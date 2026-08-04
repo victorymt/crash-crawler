@@ -4,24 +4,12 @@ let summary = {};
 let activeOperation = false;
 let lastChannelLoadAt = 0;
 let channelReloadPromise = null;
+const requestJson = window.providerApi.requestJson;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
   })[char]);
-}
-
-async function requestJson(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), options.timeout || 180000);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    return data;
-  } finally {
-    window.clearTimeout(timeout);
-  }
 }
 
 function setMessage(message, isError = false) {
@@ -40,6 +28,12 @@ function setCancelVisible(visible) {
   const button = document.getElementById("cancel-channel-refresh");
   button.hidden = !visible;
   button.disabled = !visible;
+}
+
+function setRetryVisible(visible) {
+  const button = document.getElementById("retry-channel-failed");
+  button.hidden = !visible;
+  button.disabled = !visible || activeOperation;
 }
 
 function showRefreshProgress(job) {
@@ -157,8 +151,11 @@ async function refreshChannels() {
   setMessage("正在刷新支持渠道监控的 Provider...");
   try {
     const data = await requestJson("/api/refresh-channels", { method: "POST", timeout: 20000 });
-    if (data.started) await monitorRefresh(data.refresh);
-    else setMessage("已有渠道刷新任务正在运行");
+    if (["running", "cancelling"].includes(data.refresh?.status)) {
+      await monitorRefresh(data.refresh);
+    } else {
+      setMessage("渠道刷新任务未启动", true);
+    }
   } catch (error) {
     setMessage(error.name === "AbortError" ? "刷新超时" : error.message || "刷新失败", true);
   } finally {
@@ -181,6 +178,7 @@ async function monitorRefresh(job) {
   await loadChannels();
   setCancelVisible(false);
   const failures = Number(job.failureCount || 0);
+  setRetryVisible(failures > 0);
   if (job.status === "cancelled") {
     setMessage(`渠道刷新已取消：完成 ${job.completed}/${job.total}`);
   } else if (job.status === "interrupted" || job.status === "failed") {
@@ -189,6 +187,29 @@ async function monitorRefresh(job) {
     setMessage(`渠道刷新完成：成功 ${job.successCount}，失败 ${failures}`, true);
   } else {
     setMessage(`渠道刷新完成：${job.completed}/${job.total}`);
+  }
+}
+
+async function retryFailedChannels() {
+  if (activeOperation) return;
+  activeOperation = true;
+  setControlsDisabled(true);
+  setRetryVisible(false);
+  setMessage("正在创建渠道失败项重试任务...");
+  try {
+    const data = await requestJson("/api/refresh-channels/retry", { method: "POST", timeout: 20000 });
+    if (!data.started) {
+      setMessage("当前没有可重试的失败渠道 Provider");
+      return;
+    }
+    setCancelVisible(true);
+    await monitorRefresh(data.refresh);
+  } catch (error) {
+    setMessage(error.name === "AbortError" ? "读取重试进度超时" : error.message || "重试失败", true);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
   }
 }
 
@@ -209,6 +230,7 @@ async function initialize() {
   await loadChannels();
   const data = await requestJson("/api/refresh-channels", { timeout: 20000 });
   if (!["running", "cancelling"].includes(data.refresh?.status)) {
+    setRetryVisible(Number(data.refresh?.failureCount || 0) > 0);
     if (data.refresh?.status === "interrupted") {
       setMessage(`上次渠道刷新中断：${data.refresh.error || "服务重启导致任务中断"}`, true);
     }
@@ -229,6 +251,7 @@ async function initialize() {
 document.getElementById("channel-model").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("include-degraded").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
+document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
 document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);
 window.providerConfigEvents?.subscribe(() => reloadChannelsIfVisible(true));
 window.addEventListener("focus", () => reloadChannelsIfVisible());

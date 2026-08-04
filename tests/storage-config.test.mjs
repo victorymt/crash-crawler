@@ -300,15 +300,18 @@ test("extension settings normalize auto-refresh intervals", async () => {
 
   assert.equal(normalizeExtensionSettings({ autoRefreshMinutes: 7 }).autoRefreshMinutes, 30);
   assert.equal(normalizeExtensionSettings({ autoRefreshMinutes: 0 }).autoRefreshMinutes, 0);
+  assert.equal(normalizeExtensionSettings({}).collapseProviderGroupsByDefault, true);
+  assert.equal(normalizeExtensionSettings({ collapseProviderGroupsByDefault: false }).collapseProviderGroupsByDefault, false);
   assert.equal(normalizeExtensionSettings({}).autoRefreshTabPolicy, "reuse-open-tabs");
   assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "api-only" }).autoRefreshTabPolicy, "api-only");
   assert.equal(normalizeExtensionSettings({ autoRefreshTabPolicy: "invalid" }).autoRefreshTabPolicy, "reuse-open-tabs");
   assert.equal(normalizeExtensionSettings({ preferredChannelModel: "gpt-5.6-sol" }).preferredChannelModel, "gpt-5.6-sol");
   assert.equal((await getExtensionSettings()).autoRefreshMinutes, 30);
 
-  const saved = await saveExtensionSettings({ autoRefreshMinutes: 60, autoRefreshTabPolicy: "allow-hidden-tabs" });
+  const saved = await saveExtensionSettings({ autoRefreshMinutes: 60, autoRefreshTabPolicy: "allow-hidden-tabs", collapseProviderGroupsByDefault: false });
   assert.equal(saved.autoRefreshMinutes, 60);
   assert.equal(saved.autoRefreshTabPolicy, "allow-hidden-tabs");
+  assert.equal(saved.collapseProviderGroupsByDefault, false);
   assert.equal((await getExtensionSettings()).autoRefreshMinutes, 60);
 
   globalThis.chrome = originalChrome;

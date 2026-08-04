@@ -1,8 +1,10 @@
 import { availableChannelModels, rankAvailableChannels } from "../shared/channels.js";
+import { snapshotNeedsRetry } from "../shared/snapshots.js";
 
 let snapshots = [];
 let settings = {};
 let activeOperation = false;
+let failedChannelRunCount = 0;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -31,6 +33,48 @@ function setControlsDisabled(disabled) {
   document.getElementById("refresh-channels").disabled = disabled;
   document.getElementById("channel-model").disabled = disabled;
   document.getElementById("include-degraded").disabled = disabled;
+  document.getElementById("options").disabled = disabled;
+  document.getElementById("retry-channel-failed").disabled = disabled;
+}
+
+function setCancelVisible(visible) {
+  const button = document.getElementById("cancel-channel-refresh");
+  button.hidden = !visible;
+  button.disabled = !visible;
+}
+
+function setRetryVisible(visible) {
+  const button = document.getElementById("retry-channel-failed");
+  button.hidden = !visible;
+  button.disabled = !visible || activeOperation;
+}
+
+function hasFailedChannelSnapshots() {
+  return snapshots.some((snapshot) => snapshotNeedsRetry(snapshot, { channelsOnly: true }));
+}
+
+function isChannelRun(run) {
+  return ["manual-channels", "manual-channels-retry"].includes(run?.trigger);
+}
+
+function failedRunCount(run) {
+  return Object.values(run?.providers || {}).filter((state) => (
+    state.snapshotStatus && state.snapshotStatus !== "ok"
+  )).length;
+}
+
+function showRefreshProgress(run) {
+  const progress = document.getElementById("channel-refresh-progress");
+  const states = Object.entries(run?.providers || {});
+  const completed = states.filter(([, state]) => ["complete", "cancelled"].includes(state.state)).length;
+  const active = states.find(([, state]) => state.state === "running");
+  progress.hidden = false;
+  progress.max = Math.max(1, states.length);
+  progress.value = completed;
+  const current = active
+    ? ` · ${active[0]}${active[1].currentStep ? ` (${active[1].currentStep})` : ""}`
+    : "";
+  setMessage(`渠道刷新进度 ${completed}/${states.length}${current}`);
 }
 
 function formatMultiplier(value) {
@@ -122,6 +166,7 @@ function render() {
     ? candidates.map(channelRowHtml).join("")
     : '<div class="empty">当前没有可用渠道</div>';
   setControlsDisabled(activeOperation);
+  setRetryVisible(hasFailedChannelSnapshots() || failedChannelRunCount > 0);
 }
 
 async function loadStatus() {
@@ -131,27 +176,131 @@ async function loadStatus() {
   render();
 }
 
-async function refreshChannels() {
+async function pollChannelRunUntilRequestSettles(request) {
+  let settled = false;
+  const observed = request.then(
+    (value) => ({ value }),
+    (error) => ({ error })
+  ).finally(() => { settled = true; });
+
+  while (!settled) {
+    const data = await sendMessage({ type: "providers:refreshStatus" });
+    const run = data.refresh;
+    if (isChannelRun(run) && run.state === "running") {
+      showRefreshProgress(run);
+      setCancelVisible(true);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 600));
+  }
+
+  const result = await observed;
+  if (result.error) throw result.error;
+  return result.value;
+}
+
+function completedMessage(data, actionLabel) {
+  const summary = data.summary || {};
+  const providerCount = Number(summary.providerCount) || 0;
+  const channelCount = Number(summary.channelCount) || 0;
+  const failedCount = Number(summary.failedCount) || 0;
+  failedChannelRunCount = failedCount;
+  if (data.cancelled) return { text: `${actionLabel}已取消`, error: false };
+  if (data.started === false) return { text: "当前没有可重试的失败渠道 Provider", error: false };
+  return {
+    text: `${actionLabel}完成：${providerCount} 个 Provider · ${channelCount} 个渠道 · ${failedCount} 个失败`,
+    error: failedCount > 0
+  };
+}
+
+async function runChannelRefresh(messageType, actionLabel) {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
-  setMessage("正在刷新渠道...");
+  setRetryVisible(false);
+  setCancelVisible(false);
+  setMessage(`${actionLabel}中...`);
   try {
-    const data = await sendMessage({ type: "providers:refreshChannels" });
+    const data = await pollChannelRunUntilRequestSettles(sendMessage({ type: messageType }));
     snapshots = data.providers || [];
-    render();
-    const summary = data.summary || {};
-    const providerCount = Number(summary.providerCount) || 0;
-    const channelCount = Number(summary.channelCount) || 0;
-    const failedCount = Number(summary.failedCount) || 0;
-    setMessage(`已刷新 ${providerCount} 个 Provider · ${channelCount} 个渠道 · ${failedCount} 个失败`, failedCount > 0);
+    await loadStatus();
+    const message = completedMessage(data, actionLabel);
+    setMessage(message.text, message.error);
   } catch (error) {
     await loadStatus();
-    setMessage(error.message || "刷新失败", true);
+    setMessage(error.message || `${actionLabel}失败`, true);
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
+    setCancelVisible(false);
+    setRetryVisible(hasFailedChannelSnapshots() || failedChannelRunCount > 0);
   }
+}
+
+function refreshChannels() {
+  return runChannelRefresh("providers:refreshChannels", "渠道刷新");
+}
+
+function retryFailedChannels() {
+  return runChannelRefresh("providers:refreshFailedChannels", "失败渠道重试");
+}
+
+async function cancelRefresh() {
+  if (!activeOperation) return;
+  const button = document.getElementById("cancel-channel-refresh");
+  button.disabled = true;
+  try {
+    const data = await sendMessage({ type: "providers:cancelRefresh" });
+    setMessage(data.cancelled ? "正在取消渠道刷新..." : "当前没有运行中的渠道刷新任务");
+  } catch (error) {
+    button.disabled = false;
+    setMessage(error.message || "取消渠道刷新失败", true);
+  }
+}
+
+async function monitorRestoredChannelRun(run) {
+  activeOperation = true;
+  setControlsDisabled(true);
+  setCancelVisible(true);
+  try {
+    while (isChannelRun(run) && run.state === "running") {
+      showRefreshProgress(run);
+      await new Promise((resolve) => window.setTimeout(resolve, 600));
+      const data = await sendMessage({ type: "providers:refreshStatus" });
+      run = data.refresh;
+    }
+    await loadStatus();
+    const failures = failedRunCount(run);
+    failedChannelRunCount = failures;
+    if (run?.state === "cancelled") {
+      setMessage("渠道刷新已取消");
+    } else if (run?.state === "interrupted") {
+      setMessage("上次渠道刷新已中断", true);
+    } else if (failures) {
+      setMessage(`渠道刷新完成：${failures} 个 Provider 需要重试`, true);
+    } else if (run?.state === "complete") {
+      setMessage("渠道刷新完成");
+    }
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
+    setRetryVisible(hasFailedChannelSnapshots() || failedRunCount(run) > 0);
+  }
+}
+
+async function initialize() {
+  await loadStatus();
+  const data = await sendMessage({ type: "providers:refreshStatus" });
+  const run = data.refresh;
+  failedChannelRunCount = isChannelRun(run) ? failedRunCount(run) : 0;
+  if (isChannelRun(run) && run.state === "running") {
+    await monitorRestoredChannelRun(run);
+    return;
+  }
+  if (isChannelRun(run) && run.state === "interrupted") {
+    setMessage("上次渠道刷新已中断", true);
+  }
+  setRetryVisible(hasFailedChannelSnapshots() || (isChannelRun(run) && failedRunCount(run) > 0));
 }
 
 document.getElementById("channel-model").addEventListener("change", async (event) => {
@@ -170,6 +319,8 @@ document.getElementById("channel-model").addEventListener("change", async (event
 
 document.getElementById("include-degraded").addEventListener("change", render);
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
+document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
+document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
 if (chrome.storage?.onChanged) {
@@ -179,4 +330,4 @@ if (chrome.storage?.onChanged) {
   });
 }
 
-loadStatus().catch((error) => setMessage(error.message, true));
+initialize().catch((error) => setMessage(error.message, true));

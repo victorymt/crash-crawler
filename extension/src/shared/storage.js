@@ -27,6 +27,7 @@ export const AUTO_REFRESH_MINUTES_OPTIONS = [0, 15, 30, 60, 120, 360];
 export const DEFAULT_EXTENSION_SETTINGS = {
   autoRefreshMinutes: 30,
   autoRefreshTabPolicy: TAB_POLICIES.REUSE_OPEN_TABS,
+  collapseProviderGroupsByDefault: true,
   preferredChannelModel: "",
   lastAutoRefreshAt: null,
   lastAutoRefreshAttemptAt: null,
@@ -42,6 +43,7 @@ export function normalizeExtensionSettings(raw = {}) {
     autoRefreshTabPolicy: TAB_POLICY_VALUES.includes(raw?.autoRefreshTabPolicy)
       ? raw.autoRefreshTabPolicy
       : DEFAULT_EXTENSION_SETTINGS.autoRefreshTabPolicy,
+    collapseProviderGroupsByDefault: raw?.collapseProviderGroupsByDefault !== false,
     preferredChannelModel: raw?.preferredChannelModel
       ? String(raw.preferredChannelModel).slice(0, 160)
       : "",

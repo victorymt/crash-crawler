@@ -43,8 +43,21 @@ test("normalizeProviderConfig preserves parser rules", async () => {
   }), /requires a CSS selector/);
 });
 
+test("provider imports reject unsupported schema versions", async () => {
+  const { normalizeProviderConfig, providersFromImportDocument } = await import("../extension/src/shared/config.js");
+  assert.throws(() => providersFromImportDocument({ schemaVersion: 99, providers: [] }), /Unsupported provider schemaVersion/);
+  assert.throws(() => normalizeProviderConfig({
+    schemaVersion: 99,
+    id: "future",
+    name: "Future",
+    type: "page",
+    targetUrl: "https://example.test",
+    parserRules: { balances: [], quotas: [], textMetrics: [] }
+  }), /Unsupported provider schemaVersion/);
+});
+
 test("page provider template generates a unique id", async () => {
-  const { metricRuleTemplate, newApiProviderTemplate, pageProviderTemplate, ruleFormValuesToRule, sub2ApiProviderTemplate } = await import("../extension/src/options/options.js");
+  const { mergeProviderEnabledStates, metricRuleTemplate, newApiProviderTemplate, pageProviderTemplate, ruleFormValuesToRule, sub2ApiProviderTemplate } = await import("../extension/src/options/options.js");
   const template = pageProviderTemplate([
     { id: "page-provider-1" },
     { id: "page-provider-2" }
@@ -78,6 +91,16 @@ test("page provider template generates a unique id", async () => {
     limitSelector: ".limit", limitAttribute: "aria-label", limitIndex: 3,
     currency: "USDT", usedGroup: 1, limitGroup: 1
   });
+  assert.deepEqual(mergeProviderEnabledStates([
+    { id: "second", enabled: true },
+    { id: "first", enabled: true }
+  ], [
+    { id: "first", enabled: false },
+    { id: "second", enabled: true }
+  ]), [
+    { id: "second", enabled: true },
+    { id: "first", enabled: false }
+  ]);
 });
 
 test("options page uses a structured provider editor", async () => {
@@ -112,6 +135,7 @@ test("manifest declares optional host permissions for user sources", async () =>
 test("options page exposes auto-refresh interval control", async () => {
   const html = await readFile(new URL("../extension/src/options/options.html", import.meta.url), "utf8");
   assert.match(html, /id="auto-refresh-minutes"/);
+  assert.match(html, /id="collapse-provider-groups"/);
   assert.match(html, /value="30"/);
 });
 
@@ -129,10 +153,16 @@ test("channel ranking lives on a dedicated extension page", async () => {
   assert.match(channelsHtml, /id="channel-model"/);
   assert.match(channelsHtml, /id="include-degraded"/);
   assert.match(channelsHtml, /id="channel-results"/);
+  assert.match(channelsHtml, /id="retry-channel-failed"/);
+  assert.match(channelsHtml, /id="cancel-channel-refresh"/);
+  assert.match(channelsHtml, /id="channel-refresh-progress"/);
   assert.match(channelsScript, /rankAvailableChannels/);
   assert.match(channelsScript, /statusTimelineHtml/);
   assert.match(channelsScript, /settings:save/);
   assert.match(channelsScript, /providers:refreshChannels/);
+  assert.match(channelsScript, /providers:refreshFailedChannels/);
+  assert.match(channelsScript, /providers:cancelRefresh/);
+  assert.match(channelsScript, /providers:refreshStatus/);
 });
 
 test("popup can detect and add the current relay site", async () => {
@@ -188,7 +218,7 @@ test("popup quota summary preserves prefix and suffix currencies", async () => {
   const source = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
   const moduleSource = source
     .slice(0, source.indexOf("function metricHtml"))
-    .replace(/^import[^\n]+\n/, "");
+    .replace(/^import[^\n]+\n/gm, "");
   const moduleUrl = `data:text/javascript,${encodeURIComponent(moduleSource)}`;
   const { quotaSummary } = await import(moduleUrl);
   assert.equal(quotaSummary("$50.15 / $50.00"), "$50.15 / $50.00 · 超出 $0.15");

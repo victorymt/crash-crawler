@@ -452,15 +452,26 @@ function configsWithCurrentToggles() {
   }));
 }
 
+export function mergeProviderEnabledStates(nextConfigs, currentConfigs) {
+  const enabledById = new Map((currentConfigs || []).map((config) => [config.id, config.enabled]));
+  return (nextConfigs || []).map((config) => ({
+    ...config,
+    enabled: enabledById.has(config.id) ? enabledById.get(config.id) : config.enabled
+  }));
+}
+
 async function persistProviderLayout(nextConfigs, message = "Provider 排序已保存。", { clearSelection = false } = {}) {
+  const currentConfigs = configsWithCurrentToggles();
+  const configsToSave = mergeProviderEnabledStates(nextConfigs, currentConfigs);
   return withOperationLock(async () => {
     try {
-      const response = await sendMessage({ type: "config:save", configs: nextConfigs });
+      const response = await sendMessage({ type: "config:save", configs: configsToSave });
       configs = response.configs;
       if (clearSelection) selectedProviderIds.clear();
       renderProviderList();
       setMessage(message);
     } catch (error) {
+      configs = mergeProviderEnabledStates(configs, currentConfigs);
       renderProviderList();
       setMessage(error.message || "保存 Provider 排序失败", true);
     }
@@ -1284,6 +1295,8 @@ function applySettingsToForm(settings) {
   if (select) select.value = String(settings?.autoRefreshMinutes ?? 30);
   const tabPolicy = document.getElementById("auto-refresh-tab-policy");
   if (tabPolicy) tabPolicy.value = settings?.autoRefreshTabPolicy || "reuse-open-tabs";
+  const collapseGroups = document.getElementById("collapse-provider-groups");
+  if (collapseGroups) collapseGroups.checked = settings?.collapseProviderGroupsByDefault !== false;
   const meta = document.getElementById("auto-refresh-meta");
   if (meta) meta.textContent = formatAutoRefreshMeta(settings);
 }
@@ -1297,7 +1310,8 @@ async function saveGlobal() {
       type: "settings:save",
       settings: {
         autoRefreshMinutes: Number(document.getElementById("auto-refresh-minutes").value || 0),
-        autoRefreshTabPolicy: document.getElementById("auto-refresh-tab-policy").value
+        autoRefreshTabPolicy: document.getElementById("auto-refresh-tab-policy").value,
+        collapseProviderGroupsByDefault: document.getElementById("collapse-provider-groups").checked
       }
     });
     configs = configResponse.configs;

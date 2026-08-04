@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2866,9 +2867,24 @@ class ProviderManager:
 
     def save_cache(self) -> None:
         with self._lock:
-            self.cache_file.write_text(
-                json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{self.cache_file.name}.",
+                suffix=".tmp",
+                dir=self.cache_file.parent,
             )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(self.cache, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, self.cache_file)
+            finally:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
 
     def list_snapshots(self) -> list[dict[str, Any]]:
         with self._lock:

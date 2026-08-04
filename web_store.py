@@ -232,13 +232,22 @@ def providers_from_import_document(document: Any) -> list[Any]:
 
 
 def _validate_portable_schema_shape(document: Any, providers: list[Any]) -> None:
-    wrapper_version = document.get("schemaVersion") if isinstance(document, dict) else None
+    wrapper_version = (
+        document.get("schemaVersion", document.get("schema_version"))
+        if isinstance(document, dict)
+        else None
+    )
     if wrapper_version not in (None, 1, 2, 3, 4):
         raise ValueError("Unsupported provider schemaVersion")
     if wrapper_version in (1, 2, 3):
         return
     for provider in providers:
-        if not isinstance(provider, dict) or provider.get("schemaVersion") != 4:
+        if not isinstance(provider, dict):
+            continue
+        provider_version = provider.get("schemaVersion", provider.get("schema_version"))
+        if provider_version not in (None, 1, 2, 3, 4):
+            raise ValueError(f"Unsupported provider schemaVersion: {provider_version}")
+        if provider_version != 4:
             continue
         unknown = set(provider) - PORTABLE_PROVIDER_KEYS
         if unknown:

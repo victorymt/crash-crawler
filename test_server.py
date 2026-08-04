@@ -16,6 +16,11 @@ from web_store import ConfigStore
 
 class ServerApiTests(unittest.TestCase):
     def setUp(self):
+        self.sync_token = "test-local-sync-token"
+        self.sync_token_patcher = patch(
+            "server.get_or_create_local_sync_token", return_value=self.sync_token
+        )
+        self.sync_token_patcher.start()
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         config_path = root / "providers.json"
@@ -77,20 +82,48 @@ class ServerApiTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.temporary.cleanup()
+        self.sync_token_patcher.stop()
 
-    def request(self, path, method="GET", data=None, headers=None):
+    def request(self, path, method="GET", data=None, headers=None, authenticate=True):
         body = json.dumps(data).encode("utf-8") if data is not None else None
+        request_headers = {"Content-Type": "application/json", **(headers or {})}
+        if method not in {"GET", "HEAD"} and authenticate:
+            request_headers.setdefault("X-Provider-Sync-Token", self.sync_token)
         request = Request(
             self.base_url + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json", **(headers or {})},
+            headers=request_headers,
         )
         try:
             response = urlopen(request, timeout=3)
             return response.status, json.loads(response.read())
         except HTTPError as exc:
             return exc.code, json.loads(exc.read())
+
+    def test_mutations_require_token_and_requests_require_loopback_host(self):
+        status, result = self.request("/api/refresh", "POST", authenticate=False)
+        self.assertEqual(status, 401)
+        self.assertIn("token", result["error"])
+
+        status, result = self.request("/api/config", headers={"Host": "attacker.example"})
+        self.assertEqual(status, 403)
+        self.assertIn("loopback", result["error"])
+
+        status, result = self.request("/api/config/settings", "POST", {
+            "settings": {"auto_refresh_minutes": 30}
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["settings"]["auto_refresh_minutes"], 30)
+
+        status, result = self.request(
+            "/api/local-sync/token",
+            "POST",
+            {},
+            {"X-Local-Sync-Rotate": "1"},
+            authenticate=False,
+        )
+        self.assertEqual(status, 401)
 
     def test_config_and_channel_endpoints(self):
         status, config = self.request("/api/config")
@@ -168,7 +201,7 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(result["summary"]["removed"], 2)
 
     def test_static_pages_are_available(self):
-        for path in ("/", "/channels", "/settings", "/static/app.css"):
+        for path in ("/", "/channels", "/settings", "/static/app.css", "/static/api.js"):
             response = urlopen(self.base_url + path, timeout=3)
             self.assertEqual(response.status, 200)
             self.assertTrue(response.read())
@@ -178,6 +211,7 @@ class ServerApiTests(unittest.TestCase):
         self.assertIn('value="merge"', settings)
         self.assertIn('id="local-sync-token"', settings)
         self.assertIn('/static/config-events.js', settings)
+        self.assertIn('/static/api.js', settings)
 
     def test_refresh_all_runs_in_background_and_reports_progress(self):
         refresh_started = threading.Event()
@@ -343,6 +377,48 @@ class ServerApiTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(result["refresh"]["status"], "cancelled")
         self.assertEqual(result["refresh"]["cancelledCount"], 1)
+
+    def test_channel_refresh_retry_includes_monitor_only_failures(self):
+        calls = []
+
+        def fake_refresh_channels(progress=None, configs=None, cancel_event=None):
+            calls.append([config.id for config in configs])
+            for config in configs:
+                progress("started", config, None)
+                progress("completed", config, {
+                    "id": config.id,
+                    "type": config.type,
+                    "status": "ok",
+                    "channelError": "monitor unavailable" if len(calls) == 1 else None,
+                    "channelsStale": False,
+                })
+            return []
+
+        self.server.RequestHandlerClass.manager.refresh_channels = fake_refresh_channels
+        status, result = self.request("/api/refresh-channels", "POST")
+        self.assertEqual(status, 202)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, result = self.request("/api/refresh-channels")
+            if result["refresh"]["status"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["refresh"]["failureCount"], 1)
+
+        status, retry = self.request("/api/refresh-channels/retry", "POST")
+        self.assertEqual(status, 202)
+        self.assertTrue(retry["started"])
+        self.assertEqual(retry["refresh"]["total"], 1)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, retry = self.request("/api/refresh-channels")
+            if retry["refresh"]["status"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(retry["refresh"]["failureCount"], 0)
+        self.assertEqual(calls, [["channel-test"], ["channel-test"]])
 
     def test_refresh_job_recovers_interrupted_state(self):
         job_file = Path(self.temporary.name) / "persisted-job.json"
