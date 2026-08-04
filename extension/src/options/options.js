@@ -2,8 +2,16 @@ import {
   PROVIDER_SCHEMA_VERSION,
   isBuiltinProviderId,
   normalizeProviderConfig,
-  originsForConfig
+  originsForConfig,
+  providersFromImportDocument
 } from "../shared/config.js";
+import { previewProviderConfigs } from "../shared/storage.js";
+import {
+  getLocalSyncSettings,
+  localSyncRequest,
+  requestLocalSyncPermission,
+  saveLocalSyncSettings
+} from "../shared/local_sync.js";
 import {
   UNGROUPED_PROVIDER_LABEL,
   deleteProviderGroup,
@@ -23,6 +31,7 @@ let activeOperation = false;
 let dragState = null;
 const selectedProviderIds = new Set();
 let bulkTargetGroup = "";
+let localSyncSettings = null;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -39,6 +48,96 @@ function setMessage(message, isError = false) {
   const node = document.getElementById("message");
   node.textContent = message || "";
   node.style.color = isError ? "#c2410c" : "";
+}
+
+function syncSummary(summary = {}) {
+  const parts = [`新增 ${summary.added || 0}`, `更新 ${summary.updated || 0}`, `未变化 ${summary.unchanged || 0}`];
+  if (summary.removed) parts.push(`删除 ${summary.removed}`);
+  return parts.join("，");
+}
+
+function renderLocalSyncSettings() {
+  if (!localSyncSettings) return;
+  document.getElementById("local-sync-url").value = localSyncSettings.url;
+  document.getElementById("local-sync-token").value = localSyncSettings.token;
+}
+
+async function readLocalSyncSettings() {
+  localSyncSettings = await getLocalSyncSettings();
+  renderLocalSyncSettings();
+}
+
+async function saveLocalSyncForm() {
+  localSyncSettings = await saveLocalSyncSettings({
+    url: document.getElementById("local-sync-url").value,
+    token: document.getElementById("local-sync-token").value
+  });
+  if (!await requestLocalSyncPermission(localSyncSettings.url)) {
+    throw new Error("未授予本地 Web 访问权限");
+  }
+  renderLocalSyncSettings();
+}
+
+async function pullFromLocalWeb() {
+  await saveLocalSyncForm();
+  const remote = await localSyncRequest(localSyncSettings, "/api/local-sync/config");
+  const mode = document.getElementById("local-sync-mode").value;
+  const preview = await previewProviderConfigs(remote.providers, { mode, allowBuiltins: true });
+  const confirmed = window.confirm(`本地 Web 配置版本 ${remote.revision}\n${syncSummary(preview.summary)}\n\n确认导入到扩展？`);
+  if (!confirmed) return;
+  const origins = remote.providers.flatMap(originsForConfig);
+  await requestOrigins(origins);
+  const response = await sendMessage({
+    type: "config:importProviders",
+    providers: remote.providers,
+    mode,
+    allowBuiltins: true
+  });
+  await load();
+  setMessage(`已从本地 Web 导入：${syncSummary(response.summary)}。`);
+}
+
+async function pushToLocalWeb() {
+  await saveLocalSyncForm();
+  const mode = document.getElementById("local-sync-mode").value;
+  const response = await sendMessage({ type: "config:get" });
+  const documentData = { schemaVersion: 4, providers: response.configs };
+  const preview = await localSyncRequest(localSyncSettings, "/api/local-sync/preview", {
+    method: "POST",
+    body: JSON.stringify({ document: documentData, importMode: mode })
+  });
+  const confirmed = window.confirm(`本地 Web 当前版本 ${preview.revision}\n${syncSummary(preview.summary)}\n\n确认推送到本地 Web？`);
+  if (!confirmed) return;
+  const applied = await localSyncRequest(localSyncSettings, "/api/local-sync/apply", {
+    method: "POST",
+    body: JSON.stringify({
+      document: documentData,
+      importMode: mode,
+      expectedRevision: preview.revision
+    })
+  });
+  setMessage(`已推送到本地 Web：${syncSummary(applied.summary)}。`);
+}
+
+function openLocalWebPairingPage() {
+  const url = document.getElementById("local-sync-url").value.trim() || "http://127.0.0.1:19765";
+  try {
+    const parsed = new URL(url);
+    window.open(`${parsed.origin}/settings#local-sync`, "_blank", "noopener,noreferrer");
+  } catch (error) {
+    setMessage(error.message || "本地 Web 地址无效", true);
+  }
+}
+
+function runLocalSync(operation, message) {
+  return withOperationLock(async () => {
+    try {
+      setMessage(message);
+      await operation();
+    } catch (error) {
+      setMessage(error.message || "同步失败", true);
+    }
+  });
 }
 
 function escapeHtml(value) {
@@ -1130,7 +1229,7 @@ async function importSources() {
   return withOperationLock(async () => {
     try {
     const parsed = JSON.parse(document.getElementById("import-json").value);
-    const sources = Array.isArray(parsed) ? parsed : [parsed];
+    const sources = providersFromImportDocument(parsed);
     if (!sources.length) throw new Error("Provider 配置文件为空。");
     const normalizedSources = sources.map((raw) => {
       const source = formStateToProvider(raw);
@@ -1143,13 +1242,17 @@ async function importSources() {
       sourceIds.add(source.id);
     }
     await requestOrigins(normalizedSources.flatMap(originsForConfig));
-    const response = await sendMessage({ type: "config:importProviders", providers: normalizedSources });
+    const mode = document.getElementById("import-mode").value;
+    const response = await sendMessage({ type: "config:importProviders", providers: normalizedSources, mode });
     const imported = response.providers.at(-1);
     await load();
     document.getElementById("import-panel").classList.add("hidden");
     document.getElementById("import-json").value = "";
     if (imported) openEditor(imported);
-    setMessage(`已导入 ${sources.length} 个 Provider。`);
+    const summary = response.summary || {};
+    const parts = [`新增 ${summary.added || 0}`, `更新 ${summary.updated || 0}`, `未变化 ${summary.unchanged || 0}`];
+    if (summary.removed) parts.push(`删除 ${summary.removed}`);
+    setMessage(`导入完成：${parts.join("，")}。`);
     } catch (error) {
       setMessage(error.message || "导入失败", true);
     }
@@ -1311,10 +1414,19 @@ if (typeof document !== "undefined") {
     if (file) document.getElementById("import-json").value = await file.text();
   });
   document.getElementById("confirm-import").addEventListener("click", importSources);
+  document.getElementById("local-sync-pull").addEventListener("click", () => runLocalSync(
+    pullFromLocalWeb,
+    "正在读取本地 Web 配置并生成预览..."
+  ));
+  document.getElementById("local-sync-push").addEventListener("click", () => runLocalSync(
+    pushToLocalWeb,
+    "正在读取扩展配置并生成 Web 预览..."
+  ));
+  document.getElementById("local-sync-rotate").addEventListener("click", openLocalWebPairingPage);
   window.addEventListener("beforeunload", (event) => {
     if (!editorDirty) return;
     event.preventDefault();
     event.returnValue = "";
   });
-  load().catch((error) => setMessage(error.message, true));
+  Promise.all([load(), readLocalSyncSettings()]).catch((error) => setMessage(error.message, true));
 }

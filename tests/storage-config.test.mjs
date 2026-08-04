@@ -224,6 +224,58 @@ test("storage preserves provider groups and the complete provider order", async 
   globalThis.chrome = originalChrome;
 });
 
+test("storage import reports merge and replace results", async () => {
+  const originalChrome = globalThis.chrome;
+  const store = {};
+  globalThis.chrome = {
+    storage: { local: {
+      async get(key) {
+        if (Array.isArray(key)) return Object.fromEntries(key.map((item) => [item, store[item]]));
+        return { [key]: store[key] };
+      },
+      async set(value) { Object.assign(store, value); }
+    } }
+  };
+  const { getProviderConfigs, importProviderConfigs, previewProviderConfigs, saveProviderConfigs } = await import(
+    `../extension/src/shared/storage.js?import-mode=${Date.now()}`
+  );
+  const provider = (id, name = id) => ({
+    id, name, type: "page", targetUrl: `https://${id}.example.test`,
+    parserRules: { balances: [], quotas: [], textMetrics: [] }
+  });
+  await saveProviderConfigs([provider("one"), provider("two")]);
+
+  const preview = await previewProviderConfigs(
+    [{
+      ...provider("deepseek", "DeepSeek synced"),
+      schemaVersion: 4,
+      group: "同步",
+      type: "deepseek",
+      targetUrl: "https://platform.deepseek.com/usage",
+      refreshOnVisit: true,
+      secondaryUrls: [],
+      mode: "api"
+    }],
+    { mode: "merge", allowBuiltins: true }
+  );
+  assert.equal(preview.summary.added, 0);
+  assert.equal(preview.configs.find((config) => config.id === "deepseek").name, "DeepSeek synced");
+  assert.equal((await getProviderConfigs()).find((config) => config.id === "deepseek").name, "DeepSeek");
+
+  const result = await importProviderConfigs(
+    [provider("one", "One updated"), provider("three")],
+    { mode: "replace" }
+  );
+  assert.deepEqual(result.summary, {
+    added: 1, updated: 1, unchanged: 0, removed: 1, total: 6
+  });
+  const customIds = (await getProviderConfigs())
+    .filter((config) => !["opencode-go", "deepseek", "ezaiclub", "siliconflow"].includes(config.id))
+    .map((config) => config.id);
+  assert.deepEqual(customIds, ["one", "three"]);
+  globalThis.chrome = originalChrome;
+});
+
 test("extension settings normalize auto-refresh intervals", async () => {
   const originalChrome = globalThis.chrome;
   const store = {};

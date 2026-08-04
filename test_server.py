@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -61,7 +62,7 @@ class ServerApiTests(unittest.TestCase):
 
         TestHandler.store = store
         TestHandler.manager = manager
-        TestHandler.refresh_jobs = RefreshJobManager(manager)
+        TestHandler.refresh_jobs = RefreshJobManager(manager, job_file=root / "refresh-job.json")
         TestHandler.scheduler = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -74,13 +75,13 @@ class ServerApiTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.temporary.cleanup()
 
-    def request(self, path, method="GET", data=None):
+    def request(self, path, method="GET", data=None, headers=None):
         body = json.dumps(data).encode("utf-8") if data is not None else None
         request = Request(
             self.base_url + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
         )
         try:
             response = urlopen(request, timeout=3)
@@ -126,18 +127,61 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("object", result["error"])
 
+    def test_provider_import_accepts_portable_documents_and_modes(self):
+        provider = {
+            "schemaVersion": 4,
+            "id": "portable-one",
+            "name": "Portable One",
+            "type": "page",
+            "targetUrl": "https://one.example.test",
+            "mode": "page",
+            "parserRules": {"balances": [], "quotas": [], "textMetrics": []},
+        }
+        status, result = self.request("/api/config/providers", "POST", provider)
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in result["configs"]], ["portable-one"])
+
+        status, result = self.request("/api/config/providers", "POST", {
+            "importMode": "merge",
+            "providers": [{
+                **provider,
+                "id": "portable-two",
+                "name": "Portable Two",
+                "targetUrl": "https://two.example.test",
+            }],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in result["configs"]], ["portable-one", "portable-two"])
+        self.assertEqual(result["summary"]["added"], 1)
+
+        status, result = self.request("/api/config/providers", "POST", [{
+            **provider,
+            "id": "portable-three",
+            "name": "Portable Three",
+            "targetUrl": "https://three.example.test",
+        }])
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in result["configs"]], ["portable-three"])
+        self.assertEqual(result["summary"]["removed"], 2)
+
     def test_static_pages_are_available(self):
         for path in ("/", "/channels", "/settings", "/static/app.css"):
             response = urlopen(self.base_url + path, timeout=3)
             self.assertEqual(response.status, 200)
             self.assertTrue(response.read())
 
+        settings = urlopen(self.base_url + "/settings", timeout=3).read().decode("utf-8")
+        self.assertIn('id="import-dialog"', settings)
+        self.assertIn('value="merge"', settings)
+        self.assertIn('id="local-sync-token"', settings)
+        self.assertIn('/static/config-events.js', settings)
+
     def test_refresh_all_runs_in_background_and_reports_progress(self):
         refresh_started = threading.Event()
         release_refresh = threading.Event()
 
-        def fake_refresh_all(progress=None):
-            config = self.server.RequestHandlerClass.manager.enabled_configs()[0]
+        def fake_refresh_all(progress=None, configs=None):
+            config = configs[0]
             progress("started", config, None)
             refresh_started.set()
             release_refresh.wait(timeout=2)
@@ -175,6 +219,156 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(progress["refresh"]["completed"], 1)
         self.assertEqual(progress["refresh"]["successCount"], 1)
         self.assertEqual(progress["refresh"]["failureCount"], 0)
+
+    def test_refresh_cancel_marks_unstarted_providers_cancelled(self):
+        refresh_started = threading.Event()
+
+        def fake_refresh_all(progress=None, configs=None, cancel_event=None):
+            config = configs[0]
+            progress("started", config, None)
+            refresh_started.set()
+            cancel_event.wait(timeout=2)
+            progress("completed", config, {
+                "id": config.id,
+                "status": "cancelled",
+                "error": "刷新已取消",
+            })
+            for config in configs[1:]:
+                progress("completed", config, {
+                    "id": config.id,
+                    "status": "cancelled",
+                    "error": "刷新已取消",
+                })
+            return []
+
+        self.server.RequestHandlerClass.manager.refresh_all = fake_refresh_all
+        status, created = self.request("/api/refresh", "POST")
+        self.assertEqual(status, 202)
+        self.assertTrue(refresh_started.wait(timeout=1))
+
+        status, result = self.request("/api/refresh/cancel", "POST")
+        self.assertEqual(status, 200)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(result["refresh"]["status"], "cancelling")
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, result = self.request("/api/refresh")
+            if result["refresh"]["status"] == "cancelled":
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["refresh"]["status"], "cancelled")
+        self.assertEqual(result["refresh"]["failureCount"], 0)
+        self.assertEqual(result["refresh"]["cancelledCount"], 2)
+
+    def test_refresh_job_recovers_interrupted_state(self):
+        job_file = Path(self.temporary.name) / "persisted-job.json"
+        job_file.write_text(json.dumps({
+            "id": "old-job",
+            "status": "running",
+            "providers": [],
+        }), encoding="utf-8")
+        manager = ProviderManager(configs=[], cache_file=Path(self.temporary.name) / "other-cache.json")
+        jobs = RefreshJobManager(manager, job_file=job_file)
+        current = jobs.current()
+        self.assertEqual(current["status"], "interrupted")
+        self.assertEqual(current["error"], "服务重启导致刷新任务中断")
+        persisted = json.loads(job_file.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "interrupted")
+
+    def test_refresh_endpoints_report_conflict_during_another_refresh(self):
+        manager = self.server.RequestHandlerClass.manager
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_refresh(config, browser=None):
+            started.set()
+            release.wait(timeout=2)
+            return {"id": config.id, "status": "ok"}
+
+        manager._refresh_config = fake_refresh
+        thread = threading.Thread(target=manager.refresh, args=("channel-test",))
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        try:
+            status, result = self.request("/api/refresh-channels", "POST")
+            self.assertEqual(status, 409)
+            self.assertIn("provider:channel-test", result["error"])
+
+            status, result = self.request("/api/refresh", "POST")
+            self.assertEqual(status, 409)
+            self.assertIn("provider:channel-test", result["error"])
+        finally:
+            release.set()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+    def test_local_sync_requires_token_and_honors_revision(self):
+        provider = {
+            "schemaVersion": 4,
+            "id": "sync-page",
+            "name": "Sync Page",
+            "group": "同步",
+            "type": "page",
+            "targetUrl": "https://sync.example/dashboard",
+            "rechargeRatio": 1,
+            "enabled": True,
+            "refreshOnVisit": False,
+            "secondaryUrls": [],
+            "mode": "page",
+            "parserRules": {"balances": [], "quotas": [], "textMetrics": []},
+        }
+        document = {"schemaVersion": 4, "providers": [provider]}
+        with patch("server.get_or_create_local_sync_token", return_value="sync-token"):
+            status, result = self.request("/api/local-sync/config")
+            self.assertEqual(status, 401)
+            self.assertIn("token", result["error"])
+
+            headers = {"X-Provider-Sync-Token": "sync-token"}
+            status, result = self.request("/api/local-sync/config", headers=headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(result["schemaVersion"], 4)
+            revision = result["revision"]
+
+            status, preview = self.request(
+                "/api/local-sync/preview",
+                "POST",
+                {"document": document, "importMode": "merge"},
+                headers,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(preview["revision"], revision)
+            self.assertEqual(preview["summary"]["added"], 1)
+            self.assertNotIn("sync-page", [config.id for config in self.server.RequestHandlerClass.store.snapshot()[0]])
+
+            status, conflict = self.request(
+                "/api/local-sync/apply",
+                "POST",
+                {
+                    "document": document,
+                    "importMode": "merge",
+                    "expectedRevision": "outdated",
+                },
+                headers,
+            )
+            self.assertEqual(status, 409)
+            self.assertIn("configuration changed", conflict["error"])
+
+            status, applied = self.request(
+                "/api/local-sync/apply",
+                "POST",
+                {
+                    "document": document,
+                    "importMode": "merge",
+                    "expectedRevision": revision,
+                },
+                headers,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(applied["summary"]["added"], 1)
+            status, current = self.request("/api/local-sync/config", headers=headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(applied["revision"], current["revision"])
 
 
 if __name__ == "__main__":

@@ -105,6 +105,58 @@ function normalizeStoredConfigs(configs) {
   return normalizeProviderConfigs(ordered);
 }
 
+function normalizeImportedProviders(providers, allowBuiltins = false) {
+  if (!Array.isArray(providers) || !providers.length) throw new Error("Provider import is empty");
+  const ids = new Set();
+  return providers.map((provider) => {
+    const normalized = normalizeProviderConfig(provider);
+    if (isBuiltinProviderId(normalized.id) && !allowBuiltins) {
+      throw new Error(`Built-in provider cannot be replaced: ${normalized.id}`);
+    }
+    if (ids.has(normalized.id)) throw new Error(`Duplicate provider id in import: ${normalized.id}`);
+    ids.add(normalized.id);
+    return normalized;
+  });
+}
+
+function planProviderImport(current, imported, mode) {
+  if (!["merge", "replace"].includes(mode)) throw new Error("Provider import mode must be merge or replace");
+  const currentCustom = current.filter((config) => !isBuiltinProviderId(config.id));
+  const currentById = new Map(currentCustom.map((config) => [config.id, config]));
+  const importedById = new Map(imported.map((provider) => [provider.id, provider]));
+  const currentBuiltins = current.filter((config) => isBuiltinProviderId(config.id));
+  let merged;
+  if (mode === "replace") {
+    merged = [
+      ...currentBuiltins.map((config) => importedById.get(config.id) || config),
+      ...imported.filter((provider) => !isBuiltinProviderId(provider.id))
+    ];
+  } else {
+    merged = current.map((config) => importedById.get(config.id) || config);
+    for (const provider of imported) {
+      if (!current.some((config) => config.id === provider.id)) merged.push(provider);
+    }
+  }
+  const normalized = normalizeStoredConfigs(merged);
+  const added = imported.filter((provider) => !currentById.has(provider.id) && !isBuiltinProviderId(provider.id)).length;
+  const unchanged = imported.filter((provider) => {
+    const existing = currentById.get(provider.id);
+    return existing && JSON.stringify(existing) === JSON.stringify(provider);
+  }).length;
+  return {
+    configs: normalized,
+    summary: {
+      added,
+      updated: imported.filter((provider) => !isBuiltinProviderId(provider.id)).length - added - unchanged,
+      unchanged,
+      removed: mode === "replace"
+        ? currentCustom.filter((provider) => !importedById.has(provider.id)).length
+        : 0,
+      total: normalized.length
+    }
+  };
+}
+
 function storageGet(keys) {
   return chrome.storage.local.get(keys);
 }
@@ -156,29 +208,25 @@ export async function importProviderConfig(provider) {
   return imported;
 }
 
-export async function importProviderConfigs(providers) {
-  if (!Array.isArray(providers) || !providers.length) throw new Error("Provider import is empty");
-  const ids = new Set();
-  const imported = providers.map((provider) => {
-    const normalized = normalizeProviderConfig(provider);
-    if (isBuiltinProviderId(normalized.id)) {
-      throw new Error(`Built-in provider cannot be replaced: ${normalized.id}`);
-    }
-    if (ids.has(normalized.id)) throw new Error(`Duplicate provider id in import: ${normalized.id}`);
-    ids.add(normalized.id);
-    return normalized;
-  });
+export async function importProviderConfigs(providers, options = {}) {
+  const mode = String(options.mode || "merge");
+  const imported = normalizeImportedProviders(providers, options.allowBuiltins === true);
   return withStorageMutationLock(async () => {
     const configs = await getProviderConfigs();
-    const replacements = new Map(imported.map((provider) => [provider.id, provider]));
-    const merged = configs.map((config) => replacements.get(config.id) || config);
-    for (const provider of imported) {
-      if (!configs.some((config) => config.id === provider.id)) merged.push(provider);
-    }
-    const normalized = normalizeProviderConfigs(merged);
-    await storageSet({ [CONFIG_KEY]: normalized });
-    return imported.map((provider) => normalized.find((item) => item.id === provider.id));
+    const plan = planProviderImport(configs, imported, mode);
+    await storageSet({ [CONFIG_KEY]: plan.configs });
+    const result = imported.map((provider) => plan.configs.find((item) => item.id === provider.id));
+    result.summary = plan.summary;
+    return result;
   });
+}
+
+export async function previewProviderConfigs(providers, options = {}) {
+  const mode = String(options.mode || "merge");
+  const imported = normalizeImportedProviders(providers, options.allowBuiltins === true);
+  const configs = await getProviderConfigs();
+  const plan = planProviderImport(configs, imported, mode);
+  return plan;
 }
 
 export async function deleteProviderConfig(providerId) {

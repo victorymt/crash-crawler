@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import hmac
+import inspect
 import json
 import mimetypes
+import os
+import secrets
 import threading
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -19,17 +25,20 @@ from channels import available_channel_models, rank_available_channels, summariz
 from providers import (
     ProviderError,
     ProviderManager,
+    RefreshBusyError,
     delete_local_secret,
     links_for_config,
     load_local_secret,
     set_local_secret,
     sync_browseros_profile,
 )
-from web_store import ConfigStore
+from web_store import ConfigStore, providers_from_import_document
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DEFAULT_PORT = 19765
+LOCAL_SYNC_TOKEN_SECRET = "local_sync_token"
+REFRESH_JOB_FILE = Path(os.environ.get("PROVIDER_REFRESH_JOB", ROOT / ".refresh-job.json"))
 
 
 def json_bytes(data: object) -> bytes:
@@ -51,30 +60,92 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def config_revision(configs) -> str:
+    payload = [config.to_portable_dict() for config in configs]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def get_or_create_local_sync_token() -> str:
+    token = load_local_secret(LOCAL_SYNC_TOKEN_SECRET)
+    if token:
+        return token
+    token = secrets.token_urlsafe(32)
+    set_local_secret(LOCAL_SYNC_TOKEN_SECRET, token)
+    return token
+
+
+class SyncAuthError(ProviderError):
+    pass
+
+
+class SyncRevisionConflict(ProviderError):
+    pass
+
+
 class RefreshJobManager:
     """Run one refresh batch in the background and expose its live progress."""
 
-    def __init__(self, manager: ProviderManager) -> None:
+    def __init__(self, manager: ProviderManager, job_file: Path = REFRESH_JOB_FILE) -> None:
         self.manager = manager
+        self.job_file = Path(job_file)
         self._lock = threading.RLock()
-        self._job: dict[str, object] | None = None
+        self._cancel_event: threading.Event | None = None
+        self._job: dict[str, object] | None = self._load()
+        if self._job and self._job.get("status") in {"running", "cancelling"}:
+            self._job["status"] = "interrupted"
+            self._job["error"] = "服务重启导致刷新任务中断"
+            self._job["finishedAt"] = utc_now()
+            self._persist()
 
-    def start(self) -> tuple[dict[str, object], bool]:
+    def _load(self) -> dict[str, object] | None:
+        try:
+            data = json.loads(self.job_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) and data.get("id") else None
+
+    def _persist(self) -> None:
+        if self._job is None:
+            return
+        self.job_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.job_file.name}.", suffix=".tmp", dir=self.job_file.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._job, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.job_file)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+    def start(self, source: str = "manual") -> tuple[dict[str, object], bool]:
         with self._lock:
-            if self._job and self._job["status"] == "running":
+            if self._job and self._job["status"] in {"running", "cancelling"}:
                 return copy.deepcopy(self._job), False
+            active = self.manager.active_refresh()
+            if active:
+                raise RefreshBusyError(f"refresh already running: {active}")
 
             configs = self.manager.enabled_configs()
             job_id = uuid.uuid4().hex
             self._job = {
                 "id": job_id,
                 "status": "running",
+                "source": source,
                 "total": len(configs),
                 "completed": 0,
                 "successCount": 0,
                 "failureCount": 0,
+                "cancelledCount": 0,
                 "startedAt": utc_now(),
                 "finishedAt": None,
+                "cancelRequestedAt": None,
                 "error": None,
                 "providers": [
                     {
@@ -86,13 +157,28 @@ class RefreshJobManager:
                     for config in configs
                 ],
             }
+            cancel_event = threading.Event()
+            self._cancel_event = cancel_event
+            self._persist()
             thread = threading.Thread(
                 target=self._run,
-                args=(job_id,),
+                args=(job_id, configs, cancel_event),
                 name=f"provider-refresh-{job_id[:8]}",
                 daemon=True,
             )
             thread.start()
+            return copy.deepcopy(self._job), True
+
+    def cancel(self) -> tuple[dict[str, object] | None, bool]:
+        with self._lock:
+            if not self._job or self._job.get("status") not in {"running", "cancelling"}:
+                return copy.deepcopy(self._job), False
+            if self._cancel_event:
+                self._cancel_event.set()
+            if self._job.get("status") == "running":
+                self._job["status"] = "cancelling"
+                self._job["cancelRequestedAt"] = utc_now()
+                self._persist()
             return copy.deepcopy(self._job), True
 
     def current(self) -> dict[str, object] | None:
@@ -111,8 +197,16 @@ class RefreshJobManager:
                 return
             if event == "started":
                 item["status"] = "refreshing"
+                self._persist()
                 return
-            if event != "completed" or item["status"] in {"succeeded", "failed"}:
+            if event != "completed" or item["status"] in {"succeeded", "failed", "cancelled"}:
+                return
+            if snapshot and snapshot.get("status") == "cancelled":
+                item["status"] = "cancelled"
+                item["error"] = snapshot.get("error") or "刷新已取消"
+                self._job["completed"] += 1
+                self._job["cancelledCount"] += 1
+                self._persist()
                 return
             failed = not snapshot or snapshot.get("status") != "ok"
             item["status"] = "failed" if failed else "succeeded"
@@ -120,38 +214,48 @@ class RefreshJobManager:
             self._job["completed"] += 1
             counter = "failureCount" if failed else "successCount"
             self._job[counter] += 1
+            self._persist()
 
-    def _run(self, job_id: str) -> None:
+    def _run(self, job_id: str, configs, cancel_event: threading.Event) -> None:
         try:
-            self.manager.refresh_all(
-                progress=lambda event, config, snapshot: self._progress(
+            refresh_kwargs = {
+                "progress": lambda event, config, snapshot: self._progress(
                     job_id, event, config, snapshot
-                )
-            )
+                ),
+                "configs": configs,
+            }
+            if "cancel_event" in inspect.signature(self.manager.refresh_all).parameters:
+                refresh_kwargs["cancel_event"] = cancel_event
+            self.manager.refresh_all(**refresh_kwargs)
         except Exception as exc:
             with self._lock:
                 if not self._job or self._job["id"] != job_id:
                     return
                 for item in self._job["providers"]:
-                    if item["status"] not in {"succeeded", "failed"}:
-                        item["status"] = "failed"
-                        item["error"] = str(exc)
+                    if item["status"] not in {"succeeded", "failed", "cancelled"}:
+                        item["status"] = "cancelled" if cancel_event.is_set() else "failed"
+                        item["error"] = "刷新已取消" if cancel_event.is_set() else str(exc)
                         self._job["completed"] += 1
-                        self._job["failureCount"] += 1
-                self._job["status"] = "failed"
+                        self._job["cancelledCount" if cancel_event.is_set() else "failureCount"] += 1
+                self._job["status"] = "cancelled" if cancel_event.is_set() else "failed"
                 self._job["error"] = str(exc)
                 self._job["finishedAt"] = utc_now()
+                self._persist()
             return
 
         with self._lock:
             if self._job and self._job["id"] == job_id:
-                self._job["status"] = "completed"
+                self._job["status"] = "cancelled" if cancel_event.is_set() else "completed"
+                if cancel_event.is_set():
+                    self._job["error"] = "刷新已取消"
                 self._job["finishedAt"] = utc_now()
+                self._persist()
+                self._cancel_event = None
 
 
 class AutoRefreshScheduler:
-    def __init__(self, manager: ProviderManager) -> None:
-        self.manager = manager
+    def __init__(self, refresh_jobs: RefreshJobManager) -> None:
+        self.refresh_jobs = refresh_jobs
         self.minutes = 0
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -183,7 +287,7 @@ class AutoRefreshScheduler:
                 self._wake.clear()
                 continue
             try:
-                self.manager.refresh_all()
+                self.refresh_jobs.start(source="automatic")
             except Exception as exc:
                 print(f"[server] automatic refresh failed: {exc}")
 
@@ -215,6 +319,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_bytes(json_bytes(data), "application/json; charset=utf-8", status)
 
     def read_json(self, max_bytes: int = 1024 * 1024) -> dict:
+        data = self.read_json_value(max_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
+
+    def read_json_value(self, max_bytes: int = 1024 * 1024):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError as exc:
@@ -222,17 +332,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > max_bytes:
             raise ValueError("request body must be between 1 byte and 1 MiB")
         data = json.loads(self.rfile.read(length).decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("request body must be a JSON object")
         return data
 
     def send_api_error(self, exc: Exception) -> None:
-        if isinstance(exc, KeyError):
+        if isinstance(exc, SyncAuthError):
+            self.send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
+        elif isinstance(exc, SyncRevisionConflict):
+            self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+        elif isinstance(exc, RefreshBusyError):
+            self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+        elif isinstance(exc, KeyError):
             self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
         elif isinstance(exc, (ValueError, ProviderError, json.JSONDecodeError)):
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         else:
             self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def require_sync_token(self) -> None:
+        expected = get_or_create_local_sync_token()
+        provided = self.headers.get("X-Provider-Sync-Token") or ""
+        if not provided or not hmac.compare_digest(provided, expected):
+            raise SyncAuthError("invalid local sync token")
 
     def apply_configs(self, configs) -> list[dict[str, object]]:
         self.manager.replace_configs(configs)
@@ -289,8 +409,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "configs": public_configs(configs),
                 "settings": settings,
+                "revision": config_revision(configs),
                 "has_deepseek_key": bool(load_local_secret("deepseek_api_key")),
             })
+            return
+        if path == "/api/local-sync/token":
+            configs, _ = self.store.snapshot()
+            self.send_json({
+                "token": get_or_create_local_sync_token(),
+                "revision": config_revision(configs),
+            })
+            return
+        if path == "/api/local-sync/config":
+            try:
+                self.require_sync_token()
+                configs, _ = self.store.snapshot()
+                self.send_json({
+                    "schemaVersion": 4,
+                    "revision": config_revision(configs),
+                    "providers": [config.to_portable_dict() for config in configs],
+                })
+            except Exception as exc:
+                self.send_api_error(exc)
             return
         if path == "/api/channels":
             query = parse_qs(parsed.query)
@@ -335,6 +475,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/local-sync/token":
+            try:
+                if self.headers.get("X-Local-Sync-Rotate") != "1":
+                    raise SyncAuthError("token rotation requires explicit confirmation")
+                token = secrets.token_urlsafe(32)
+                set_local_secret(LOCAL_SYNC_TOKEN_SECRET, token)
+                configs, _ = self.store.snapshot()
+                self.send_json({"token": token, "revision": config_revision(configs)})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path in {"/api/local-sync/preview", "/api/local-sync/apply"}:
+            try:
+                self.require_sync_token()
+                payload = self.read_json()
+                document = payload.get("document", payload.get("config"))
+                providers = providers_from_import_document(document)
+                mode = str(payload.get("importMode") or payload.get("mode") or "merge")
+                configs, _ = self.store.snapshot()
+                current_revision = config_revision(configs)
+                if path.endswith("/apply"):
+                    expected = str(payload.get("expectedRevision") or "")
+                    if not expected or expected != current_revision:
+                        raise SyncRevisionConflict(
+                            f"configuration changed; expected {expected or 'missing'}, current {current_revision}"
+                        )
+                    next_configs, summary = self.store.import_configs(providers, mode=mode)
+                    self.apply_configs(next_configs)
+                    new_revision = config_revision(next_configs)
+                    self.send_json({
+                        "ok": True,
+                        "revision": new_revision,
+                        "summary": summary,
+                        "providers": [config.to_portable_dict() for config in next_configs],
+                    })
+                else:
+                    next_configs, summary = self.store.preview_import(providers, mode=mode)
+                    self.send_json({
+                        "revision": current_revision,
+                        "summary": summary,
+                        "nextRevision": config_revision(next_configs),
+                    })
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
         if path == "/api/sync-auth":
             try:
                 self.send_json(sync_browseros_profile())
@@ -351,7 +536,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
                 )
             except Exception as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_api_error(exc)
+            return
+        if path == "/api/refresh/cancel":
+            try:
+                refresh, cancelled = self.refresh_jobs.cancel()
+                self.send_json({"refresh": refresh, "cancelled": cancelled})
+            except Exception as exc:
+                self.send_api_error(exc)
             return
         if path == "/api/refresh-channels":
             try:
@@ -371,11 +563,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/config/providers":
             try:
-                payload = self.read_json()
-                if not isinstance(payload.get("providers"), list):
-                    raise ValueError("providers must be an array")
-                configs = self.store.replace(payload["providers"])
-                self.send_json({"configs": self.apply_configs(configs)})
+                payload = self.read_json_value()
+                providers = providers_from_import_document(payload)
+                mode = "replace"
+                if isinstance(payload, dict) and isinstance(payload.get("providers"), list):
+                    mode = str(payload.get("importMode", payload.get("mode")) or "replace")
+                configs, summary = self.store.import_configs(providers, mode=mode)
+                self.send_json({"configs": self.apply_configs(configs), "summary": summary})
             except Exception as exc:
                 self.send_api_error(exc)
             return
@@ -404,10 +598,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             provider_id = unquote(path[len(prefix) : -len(suffix)].strip("/"))
             try:
                 self.send_json({"provider": self.manager.refresh(provider_id)})
-            except KeyError as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             except Exception as exc:
-                self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                self.send_api_error(exc)
             return
         self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -444,7 +636,7 @@ def main() -> None:
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
-    scheduler = AutoRefreshScheduler(DashboardHandler.manager)
+    scheduler = AutoRefreshScheduler(DashboardHandler.refresh_jobs)
     DashboardHandler.scheduler = scheduler
     scheduler.start(DashboardHandler.store.snapshot()[1]["auto_refresh_minutes"])
     print(f"[server] http://127.0.0.1:{args.port}")

@@ -57,9 +57,11 @@ Provider 看板包含：
 
 - “同步登录态”：把 BrowserOS 登录态同步到后端抓取 profile。
 - “刷新全部”：一次并行刷新（API 并行，同 profile 的浏览器抓取复用同一 BrowserOS 实例）。
+- 刷新期间可取消；任务进度会写入本地 `.refresh-job.json`，服务重启后会将未完成任务标记为中断并保留结果。
 - Provider 卡片上的“刷新”：只刷新当前 provider。
 - “打开全部”：一次打开所有 provider 主页面。
 - 按用户配置的分组和顺序展示余额、额度、订阅指标及错误状态。
+- 自动、全部、单 Provider 和渠道刷新共享同一个刷新协调器，不会同时争用浏览器会话或覆盖快照。
 
 渠道页汇总 Sub2API 类渠道监控数据，按模型筛选当前可用渠道，并按实际倍率从低到高排序。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率，可选择包含降级渠道。
 
@@ -67,10 +69,14 @@ Provider 看板包含：
 
 - 新增、编辑、启用、停用和删除 Provider。
 - 设置分组、批量移动 Provider，并用上下按钮调整整体顺序。
-- 导入、导出 Provider JSON；密钥不会进入导出文件。
+- 导入、导出 Provider JSON；可选择“合并”或“替换”，完成后显示新增、更新、未变化和删除数量。密钥不会进入导出文件。
 - 配置本地服务的自动刷新间隔，默认关闭。
 - 在 DeepSeek Provider 编辑器内保存或清除本地 API Key。也可继续使用 `DEEPSEEK_API_KEY` 环境变量，环境变量优先。
 - 添加通用页面 Provider，以插件兼容的 `secondaryUrls` 和 `parserRules` JSON 配置多页面 CSS/正则解析。
+
+扩展设置页的“本地 Web 同步”支持从本地服务预览并拉取配置，或将扩展配置预览并推送到本地服务。配对令牌在 Web 设置页生成，可轮换；同步地址仅允许本机回环地址。应用同步时会校验配置 revision，预览后如果另一侧发生变化会拒绝覆盖。
+
+设置保存后，已经打开的 Provider 和渠道页面会自动重新读取配置；标签页重新获得焦点时也会检查最新分组和顺序。
 
 ## BrowserOS 登录态
 
@@ -104,6 +110,10 @@ cp providers.example.json providers.local.json
 - `dumps/`
 
 本地 Web 支持官方 API、浏览器采集、Sub2API 类渠道和通用 `page` Provider。插件导出的通用页面 Provider 可以直接导入；当前网页自动识别、访问页面触发刷新、工具栏角标属于扩展运行时能力，不适用于本地服务。
+
+扩展和本地 Web 共用 [`schemas/provider-config-v4.schema.json`](schemas/provider-config-v4.schema.json) 定义的 portable v4 配置。两端运行时都会检查 v4 的字段形状，业务校验再额外检查 URL、正则和解析规则安全性。导入接受单个 Provider、Provider 数组或 `{ "providers": [...] }`；导出统一使用 camelCase。`refreshOnVisit` 等扩展字段会由本地 Web 保留并重新导出，即使本地采集不使用该字段。空的可选选择器和暂未配置解析规则的通用页面允许导入，刷新时会在 Provider 状态中提示缺少可采集指标。
+
+“合并”会按 ID 更新已存在的 Provider 并追加新 Provider，其他配置保持不变；“替换”会删除导入文件中不存在的 Provider。扩展执行替换时仍会保留内置 Provider。
 
 ## CLI
 
@@ -167,6 +177,7 @@ uv run python crawler.py --provider PROVIDER_ID --explore
 - 内置 provider 可改名称、主页 URL 和附加页面（例如 OpenCode workspace），解析类型不可改；也可复制成自定义来源。“导入 Provider 配置”和“导出”用于分享 JSON 配置。批量导入会整体校验，不会只导入其中一部分。
 - 编辑 Provider 时可以填写分组。设置页支持多选 Provider 后批量移动或新建分组，也可重命名、删除分组；拖拽和上下箭头可调整 Provider 及整个分组的顺序。分组操作会立即保存，Popup 按保存顺序分组展示并支持折叠。
 - 刷新后工具栏角标会提示异常/建议充值数量；popup 打开时会跟随 storage 中的最新快照更新。
+- Popup 执行“刷新全部”时可以取消；已完成的 Provider 会保留快照，排队中的 Provider 标记为已取消。
 - 设置页可配置后台自动刷新（默认每 30 分钟，可关）。默认只使用 API/HTTP 或复用已打开页面，不会静默创建后台标签页；也可显式选择“仅 API / HTTP”或允许后台标签页。
 - 内置来源默认在用户访问对应站点时主动更新；自定义来源需在编辑器中显式启用“访问页面时自动更新”。监听页面的 content script 只发送访问通知，指标仍由后台按已验证的 CSS/正则规则解析。
 - 部分内置 Provider 会优先使用站点内部 API，失败时再回退到页面 DOM 解析。

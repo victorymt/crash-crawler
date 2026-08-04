@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from providers import (
     NotLoggedInError,
     ProviderConfig,
     ProviderManager,
+    RefreshBusyError,
     SiliconFlowProvider,
     Sub2APIProvider,
     is_api_provider,
@@ -519,7 +521,8 @@ class ProviderParserTests(unittest.TestCase):
             manager = ProviderManager(configs=configs, cache_file=cache_file)
             seen_browsers = []
 
-            def fake_refresh(provider_id, browser=None):
+            def fake_refresh(config, browser=None):
+                provider_id = config.id
                 if provider_id != "deepseek":
                     seen_browsers.append(browser)
                 snapshot = {
@@ -535,7 +538,7 @@ class ProviderParserTests(unittest.TestCase):
                 manager.cache.setdefault("providers", {})[provider_id] = snapshot
                 return snapshot
 
-            manager.refresh = fake_refresh  # type: ignore[method-assign]
+            manager._refresh_config = fake_refresh  # type: ignore[method-assign]
             sessions = []
 
             class FakeSession:
@@ -583,6 +586,140 @@ class ProviderParserTests(unittest.TestCase):
                 for event, _, status in progress_events
                 if event == "completed"
             ))
+
+    def test_refresh_all_skips_queued_providers_after_cancel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            configs = [
+                ProviderConfig(
+                    id="first",
+                    name="First",
+                    type="page",
+                    target_url="https://first.example.test",
+                ),
+                ProviderConfig(
+                    id="second",
+                    name="Second",
+                    type="page",
+                    target_url="https://second.example.test",
+                ),
+            ]
+            manager = ProviderManager(configs=configs, cache_file=Path(tmp) / "cache.json")
+            cancel_event = threading.Event()
+            events = []
+
+            def fake_refresh(current, browser=None):
+                cancel_event.set()
+                return {"id": current.id, "status": "ok", "error": None}
+
+            manager._refresh_config = fake_refresh  # type: ignore[method-assign]
+            import providers as providers_mod
+
+            original = providers_mod.BrowserSession
+            providers_mod.BrowserSession = type(
+                "FakeSession",
+                (),
+                {
+                    "__init__": lambda self, profile_dir: None,
+                    "__enter__": lambda self: self,
+                    "__exit__": lambda self, *_args: None,
+                },
+            )
+            try:
+                results = manager.refresh_all(
+                    progress=lambda event, config, snapshot: events.append(
+                        (event, config.id, snapshot and snapshot.get("status"))
+                    ),
+                    cancel_event=cancel_event,
+                )
+            finally:
+                providers_mod.BrowserSession = original
+            self.assertEqual([item["status"] for item in results], ["ok", "cancelled"])
+            self.assertIn(("completed", "second", "cancelled"), events)
+
+    def test_provider_manager_rejects_overlapping_refresh_operations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = ProviderConfig(
+                id="provider",
+                name="Provider",
+                type="page",
+                target_url="https://example.test/dashboard",
+            )
+            manager = ProviderManager(
+                configs=[config],
+                cache_file=Path(tmp) / "cache.json",
+            )
+            started = threading.Event()
+            release = threading.Event()
+
+            def fake_refresh(current, browser=None):
+                started.set()
+                release.wait(timeout=2)
+                return {"id": current.id, "status": "ok"}
+
+            manager._refresh_config = fake_refresh  # type: ignore[method-assign]
+            thread = threading.Thread(target=manager.refresh, args=(config.id,))
+            thread.start()
+            self.assertTrue(started.wait(timeout=1))
+            try:
+                with self.assertRaisesRegex(RefreshBusyError, "provider:provider"):
+                    manager.refresh_channels()
+            finally:
+                release.set()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
+    def test_refresh_does_not_cache_result_after_provider_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = ProviderConfig(
+                id="provider",
+                name="Original",
+                type="page",
+                target_url="https://example.test/original",
+            )
+            updated = ProviderConfig(
+                id="provider",
+                name="Updated",
+                type="page",
+                target_url="https://example.test/updated",
+            )
+            manager = ProviderManager(
+                configs=[original],
+                cache_file=Path(tmp) / "cache.json",
+            )
+            started = threading.Event()
+            release = threading.Event()
+            result = {}
+
+            class FakeProvider:
+                def __init__(self, config):
+                    self.config = config
+
+                def fetch(self, browser=None):
+                    started.set()
+                    release.wait(timeout=2)
+                    return {
+                        "id": self.config.id,
+                        "name": self.config.name,
+                        "type": self.config.type,
+                        "status": "ok",
+                    }
+
+            manager._provider_for_config = FakeProvider  # type: ignore[method-assign]
+
+            def run_refresh():
+                result.update(manager.refresh(original.id))
+
+            thread = threading.Thread(target=run_refresh)
+            thread.start()
+            self.assertTrue(started.wait(timeout=1))
+            manager.replace_configs([updated])
+            release.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["name"], "Original")
+            self.assertNotIn(original.id, manager.cache["providers"])
+            self.assertEqual(manager.list_snapshots()[0]["name"], "Updated")
 
 
 if __name__ == "__main__":

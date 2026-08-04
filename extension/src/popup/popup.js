@@ -30,6 +30,8 @@ function setMessage(message, isError = false) {
 
 function setControlsDisabled(disabled) {
   document.getElementById("refresh-all").disabled = disabled;
+  const cancelButton = document.getElementById("cancel-refresh");
+  cancelButton.disabled = !activeOperation;
   const addButton = document.getElementById("add-current-page");
   const existing = providerForCurrentPage();
   addButton.textContent = existing?.type === "page"
@@ -41,6 +43,12 @@ function setControlsDisabled(disabled) {
   document.querySelectorAll("[data-refresh-provider]").forEach((button) => {
     button.disabled = disabled;
   });
+}
+
+function setCancelVisible(visible) {
+  const button = document.getElementById("cancel-refresh");
+  button.hidden = !visible;
+  button.disabled = !visible;
 }
 
 function pageOrigin(value) {
@@ -303,22 +311,44 @@ async function refreshAll() {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
+  setCancelVisible(true);
   setMessage("正在并行刷新所有 provider...");
   try {
     const data = await sendMessage({ type: "providers:refreshAll" });
-    snapshots = data.providers || [];
+    const updatedSnapshots = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]));
+    for (const snapshot of data.providers || []) updatedSnapshots.set(snapshot.id, snapshot);
+    snapshots = configs
+      .map((config) => updatedSnapshots.get(config.id))
+      .filter(Boolean);
     render();
-    setMessage(`刷新完成：${new Date().toLocaleTimeString()}`);
+    setMessage(data.cancelled
+      ? `刷新已取消：${new Date().toLocaleTimeString()}`
+      : `刷新完成：${new Date().toLocaleTimeString()}`);
   } catch (error) {
     await loadStatus();
     setMessage(error.message || "刷新失败", true);
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
+    setCancelVisible(false);
+  }
+}
+
+async function cancelRefresh() {
+  if (!activeOperation) return;
+  const button = document.getElementById("cancel-refresh");
+  button.disabled = true;
+  try {
+    const result = await sendMessage({ type: "providers:cancelRefresh" });
+    setMessage(result.cancelled ? "正在取消刷新..." : "当前没有运行中的刷新任务");
+  } catch (error) {
+    button.disabled = false;
+    setMessage(error.message || "取消刷新失败", true);
   }
 }
 
 document.getElementById("refresh-all").addEventListener("click", refreshAll);
+document.getElementById("cancel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("add-current-page").addEventListener("click", addCurrentPage);
 document.getElementById("open-all").addEventListener("click", () => {
   configs.forEach((config) => chrome.tabs.create({ url: config.targetUrl, active: false }));

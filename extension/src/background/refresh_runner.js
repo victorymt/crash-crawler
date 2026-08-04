@@ -6,6 +6,12 @@ export const DEFAULT_PAGE_CONCURRENCY = 2;
 const REFRESH_RUN_RESUME_WINDOW_MS = 10 * 60 * 1000;
 const PROVIDER_LEASE_MS = 2 * 60 * 1000;
 
+function refreshCancelledError() {
+  const error = new Error("刷新已取消");
+  error.name = "RefreshCancelledError";
+  return error;
+}
+
 class Semaphore {
   constructor(limit) {
     this.limit = Math.max(1, Number(limit) || 1);
@@ -148,7 +154,8 @@ export async function runRefreshBatch({
   collect,
   saveSnapshot,
   networkConcurrency = DEFAULT_NETWORK_CONCURRENCY,
-  pageConcurrency = DEFAULT_PAGE_CONCURRENCY
+  pageConcurrency = DEFAULT_PAGE_CONCURRENCY,
+  cancelSignal = null
 }) {
   const baseContext = createCollectionContext(contextInput);
   const networkGate = new Semaphore(networkConcurrency);
@@ -171,14 +178,30 @@ export async function runRefreshBatch({
         [config.id]: work(current.providers[config.id] || providerState(config))
       }
     }));
+    if (cancelSignal?.aborted) {
+      await updateProvider((state) => ({
+        ...state,
+        state: "cancelled",
+        currentStep: null,
+        createdTabId: null,
+        leaseUntil: null,
+        error: "刷新已取消",
+        completedAt: new Date().toISOString()
+      }));
+      return;
+    }
     const context = createCollectionContext({
       ...baseContext,
       isCollectionContext: false,
       attempts: [],
       runWithResource(resource, work) {
-        if (resource === "network") return networkGate.run(work);
-        if (resource === "page") return pageGate.run(work);
-        return work();
+        const guardedWork = () => {
+          if (cancelSignal?.aborted) throw refreshCancelledError();
+          return work();
+        };
+        if (resource === "network") return networkGate.run(guardedWork);
+        if (resource === "page") return pageGate.run(guardedWork);
+        return guardedWork();
       },
       onAttemptStart(attempt) {
         return updateProvider((state) => ({
@@ -202,7 +225,22 @@ export async function runRefreshBatch({
       }
     });
 
-    const snapshot = await collect(config, previousSnapshots[config.id], context);
+    let snapshot;
+    try {
+      snapshot = await collect(config, previousSnapshots[config.id], context);
+    } catch (error) {
+      if (!cancelSignal?.aborted) throw error;
+      await updateProvider((state) => ({
+        ...state,
+        state: "cancelled",
+        currentStep: null,
+        createdTabId: null,
+        leaseUntil: null,
+        error: "刷新已取消",
+        completedAt: new Date().toISOString()
+      }));
+      return;
+    }
     const saved = await saveSnapshot(snapshot);
     if (saved) results.set(config.id, saved);
     await updateProvider((state) => ({
@@ -218,7 +256,8 @@ export async function runRefreshBatch({
 
   await mutateRefreshRun(run.runId, (current) => ({
     ...current,
-    state: "complete",
+    state: cancelSignal?.aborted ? "cancelled" : "complete",
+    error: cancelSignal?.aborted ? "刷新已取消" : null,
     completedAt: new Date().toISOString()
   }));
   return configs.map((config) => results.get(config.id)).filter(Boolean);

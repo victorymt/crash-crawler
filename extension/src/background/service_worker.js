@@ -21,6 +21,7 @@ import {
 } from "../shared/storage.js";
 import { channelProviderConfigs, collectProvider, detectProvider } from "../providers/index.js";
 import { clearProviderSessionHints } from "../providers/session_cache.js";
+import { getRefreshRun } from "./refresh_job_store.js";
 import { recoverRefreshRun, runRefreshBatch } from "./refresh_runner.js";
 import { configsForObservedUrl, syncVisitObserver } from "./visit_observer.js";
 
@@ -28,6 +29,7 @@ export const AUTO_REFRESH_ALARM = "providers:autoRefresh";
 
 /** Keep refresh batches serialized so they cannot overwrite one session job. */
 let refreshBatchFlight = null;
+let refreshBatchCancelController = null;
 const providerRefreshes = new Map();
 const observedRefreshTimes = new Map();
 let configMutationChain = Promise.resolve();
@@ -65,9 +67,11 @@ async function listProviders() {
 }
 
 async function collectOne(config, previousSnapshot, context = {}) {
+  if (context.cancelSignal?.aborted) throw new Error("刷新已取消");
   try {
     return preservePreviousChannels(await collectProvider(config, context), previousSnapshot);
   } catch (error) {
+    if (context.cancelSignal?.aborted) throw error;
     return errorSnapshot(config, previousSnapshot, error);
   }
 }
@@ -284,29 +288,49 @@ function observedPageUrl(message, sender) {
 async function refreshAllProviders(context = {}) {
   const configs = await publicConfigs();
   const previous = await getSnapshots();
-  const providers = await runRefreshBatch({
-    configs,
-    previousSnapshots: previous,
-    context,
-    collect: collectOneExclusive,
-    saveSnapshot: saveCurrentProviderSnapshot
-  });
-  await syncBadgeFromStorage();
-  return providers;
+  const controller = new AbortController();
+  refreshBatchCancelController = controller;
+  try {
+    const providers = await runRefreshBatch({
+      configs,
+      previousSnapshots: previous,
+      context,
+      collect: collectOneExclusive,
+      saveSnapshot: saveCurrentProviderSnapshot,
+      cancelSignal: controller.signal
+    });
+    await syncBadgeFromStorage();
+    return providers;
+  } finally {
+    if (refreshBatchCancelController === controller) refreshBatchCancelController = null;
+  }
 }
 
 async function refreshChannelProviders(context = {}) {
   const configs = channelProviderConfigs(await getProviderConfigs());
   const previous = await getSnapshots();
-  const providers = await runRefreshBatch({
-    configs,
-    previousSnapshots: previous,
-    context,
-    collect: collectOneExclusive,
-    saveSnapshot: saveCurrentProviderSnapshot
-  });
-  await syncBadgeFromStorage();
-  return { providers, summary: summarizeChannelRefresh(providers) };
+  const controller = new AbortController();
+  refreshBatchCancelController = controller;
+  try {
+    const providers = await runRefreshBatch({
+      configs,
+      previousSnapshots: previous,
+      context,
+      collect: collectOneExclusive,
+      saveSnapshot: saveCurrentProviderSnapshot,
+      cancelSignal: controller.signal
+    });
+    await syncBadgeFromStorage();
+    return { providers, summary: summarizeChannelRefresh(providers) };
+  } finally {
+    if (refreshBatchCancelController === controller) refreshBatchCancelController = null;
+  }
+}
+
+function cancelRefreshBatch() {
+  if (!refreshBatchCancelController) return false;
+  refreshBatchCancelController.abort();
+  return true;
 }
 
 async function runExclusiveRefresh(scope, context, work) {
@@ -402,10 +426,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case "providers:refresh":
         return { provider: await refreshProvider(message.providerId) };
       case "providers:refreshAll":
-        return { providers: await refreshAllProvidersExclusive({
+        {
+          const providers = await refreshAllProvidersExclusive({
           trigger: "manual",
           tabPolicy: "allow-hidden-tabs"
-        }) };
+          });
+          const run = await getRefreshRun();
+          return { providers, cancelled: run?.state === "cancelled" };
+        }
+      case "providers:cancelRefresh":
+        return { cancelled: cancelRefreshBatch() };
       case "providers:refreshChannels":
         return refreshChannelProvidersExclusive({
           trigger: "manual-channels",
@@ -439,10 +469,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { provider };
       }
       case "config:importProviders": {
-        const providers = await mutateConfigs(() => importProviderConfigs(message.providers));
+        const providers = await mutateConfigs(() => importProviderConfigs(message.providers, {
+          mode: message.mode,
+          allowBuiltins: message.allowBuiltins === true
+        }));
         await syncVisitObserver(await getProviderConfigs());
         await syncBadgeFromStorage();
-        return { providers };
+        return { providers, summary: providers.summary };
       }
       case "config:deleteProvider": {
         const configs = await mutateConfigs(() => deleteProviderConfig(message.providerId));

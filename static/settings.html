@@ -22,7 +22,6 @@
         <button id="import-config" type="button">导入</button>
         <button id="export-config" type="button">导出</button>
         <button id="add-provider" type="button" class="primary">新增 Provider</button>
-        <input id="import-file" class="file-input" type="file" accept="application/json,.json">
       </div>
       <div id="message" class="message" aria-live="polite"></div>
     </div>
@@ -68,7 +67,49 @@
         </div>
       </div>
     </section>
+    <section class="settings-section" aria-labelledby="local-sync-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="local-sync-title">扩展同步</h2>
+          <p>将令牌填入浏览器扩展设置页后，扩展才能读取或更新本地 Provider 配置。</p>
+        </div>
+      </div>
+      <div class="inline-setting">
+        <label class="field wide"><span>配对令牌</span><input id="local-sync-token" type="text" readonly spellcheck="false"></label>
+        <button id="rotate-local-sync-token" type="button">重新生成令牌</button>
+      </div>
+      <div id="local-sync-meta" class="message" aria-live="polite"></div>
+    </section>
   </main>
+
+  <dialog id="import-dialog">
+    <form id="import-form" class="dialog-form">
+      <div class="dialog-head">
+        <h2>导入 Provider</h2>
+        <button id="close-import" type="button" class="compact" aria-label="关闭">关闭</button>
+      </div>
+      <div class="dialog-body">
+        <label class="field">
+          <span>导入方式</span>
+          <select id="import-mode">
+            <option value="merge">合并：更新同 ID，并保留其他 Provider</option>
+            <option value="replace">替换：删除文件中不存在的 Provider</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Provider JSON</span>
+          <textarea id="import-json" rows="12" spellcheck="false" required></textarea>
+        </label>
+        <div id="import-message" class="message" aria-live="polite"></div>
+        <input id="import-file" class="file-input" type="file" accept="application/json,.json">
+      </div>
+      <div class="dialog-actions">
+        <button id="choose-import-file" type="button">选择文件</button>
+        <button id="cancel-import" type="button">取消</button>
+        <button type="submit" class="primary">导入</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="provider-dialog">
     <form id="provider-form" class="dialog-form">
@@ -121,6 +162,7 @@
       </div>
     </form>
   </dialog>
+  <script src="/static/config-events.js"></script>
   <script src="/static/settings.js"></script>
 </body>
 </html>

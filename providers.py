@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -44,6 +45,7 @@ CONFIG_FILE = Path(os.environ.get("PROVIDER_CONFIG", ROOT / "providers.local.jso
 CACHE_FILE = Path(os.environ.get("PROVIDER_CACHE", ROOT / ".provider-cache.json"))
 SECRET_FILE = Path(os.environ.get("PROVIDER_SECRETS", ROOT / ".provider-secrets.json"))
 DEFAULT_DUMP_DIR = Path(os.environ.get("PROVIDER_DUMP_DIR", ROOT / "dumps"))
+PROVIDER_SCHEMA_VERSION = 4
 
 REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -140,6 +142,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class RefreshBusyError(ProviderError):
+    pass
+
+
 class NotLoggedInError(ProviderError):
     pass
 
@@ -163,6 +169,32 @@ class TextExtractor(HTMLParser):
             self.parts.append(text)
 
 
+def normalize_parser_rules(raw_rules: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_rules, dict):
+        return None
+    normalized = dict(raw_rules)
+    normalized["loginHints"] = [
+        str(item) for item in raw_rules.get("loginHints", []) if item
+    ] if isinstance(raw_rules.get("loginHints", []), list) else []
+    normalized["readySelector"] = str(raw_rules.get("readySelector") or "")
+    for key, prefix in (
+        ("balances", "balance"),
+        ("quotas", "quota"),
+        ("textMetrics", "text"),
+    ):
+        source = raw_rules.get(key, [])
+        normalized[key] = [
+            {
+                **item,
+                "id": str(item.get("id") or f"{prefix}-{index + 1}"),
+                "pageId": str(item.get("pageId") or "main"),
+            }
+            for index, item in enumerate(source)
+            if isinstance(item, dict)
+        ] if isinstance(source, list) else []
+    return normalized
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     id: str
@@ -170,11 +202,12 @@ class ProviderConfig:
     type: str
     target_url: str
     enabled: bool = True
+    refresh_on_visit: bool = False
     profile_dir: str = DEFAULT_PROFILE_DIR
     cookie_cache: str | None = None
     api_key_env: str | None = None
     secondary_urls: list[dict[str, str]] | None = None
-    mode: str = "browser"
+    mode: str = "page"
     group: str = ""
     recharge_ratio: float = 1.0
     parser_rules: dict[str, Any] | None = None
@@ -216,16 +249,19 @@ class ProviderConfig:
             type=provider_type,
             target_url=target_url,
             enabled=bool(data.get("enabled", True)),
+            refresh_on_visit=(data.get("refresh_on_visit", data.get("refreshOnVisit")) is True),
             profile_dir=os.path.expanduser(profile_dir),
             cookie_cache=os.path.expanduser(str(cookie_cache)) if cookie_cache else None,
             api_key_env=str(data.get("api_key_env", data.get("apiKeyEnv"))) if data.get("api_key_env", data.get("apiKeyEnv")) else None,
             secondary_urls=secondary_urls,
-            mode=str(data.get("mode") or "browser"),
+            mode=str(data.get("mode") or (
+                "api" if provider_type == "deepseek"
+                else "api_then_page" if provider_type in {"newapi", "sub2api"}
+                else "page"
+            )),
             group=str(data.get("group") or "").strip(),
             recharge_ratio=float(data.get("recharge_ratio", data.get("rechargeRatio", 1)) or 1),
-            parser_rules=data.get("parser_rules", data.get("parserRules")) if isinstance(
-                data.get("parser_rules", data.get("parserRules")), dict
-            ) else None,
+            parser_rules=normalize_parser_rules(data.get("parser_rules", data.get("parserRules"))),
             quota_per_unit=float(data.get("quota_per_unit", data.get("quotaPerUnit", 500000)) or 500000),
         )
 
@@ -236,6 +272,7 @@ class ProviderConfig:
             "type": self.type,
             "target_url": self.target_url,
             "enabled": self.enabled,
+            "refresh_on_visit": self.refresh_on_visit,
             "profile_dir": self.profile_dir,
             "mode": self.mode,
             "group": self.group,
@@ -251,6 +288,26 @@ class ProviderConfig:
             data["parser_rules"] = self.parser_rules
         if self.type == "newapi" or self.quota_per_unit != 500000:
             data["quota_per_unit"] = self.quota_per_unit
+        return data
+
+    def to_portable_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "schemaVersion": PROVIDER_SCHEMA_VERSION,
+            "id": self.id,
+            "name": self.name,
+            "group": self.group,
+            "type": self.type,
+            "targetUrl": self.target_url,
+            "rechargeRatio": self.recharge_ratio,
+            "enabled": self.enabled,
+            "refreshOnVisit": self.refresh_on_visit,
+            "secondaryUrls": self.secondary_urls or [],
+            "mode": self.mode,
+        }
+        if self.parser_rules is not None:
+            data["parserRules"] = self.parser_rules
+        if self.type == "newapi" or self.quota_per_unit != 500000:
+            data["quotaPerUnit"] = self.quota_per_unit
         return data
 
 
@@ -2744,10 +2801,30 @@ class ProviderManager:
         self.cache_file = cache_file
         self.cache: dict[str, Any] = self.load_cache()
         self._lock = threading.RLock()
+        self._refresh_gate = threading.Lock()
+        self._active_refresh: str | None = None
 
     def enabled_configs(self) -> list[ProviderConfig]:
         with self._lock:
-            return [config for config in self.configs if config.enabled]
+            return copy.deepcopy([config for config in self.configs if config.enabled])
+
+    def active_refresh(self) -> str | None:
+        with self._lock:
+            return self._active_refresh
+
+    @contextmanager
+    def _refresh_operation(self, operation: str) -> Iterator[None]:
+        if not self._refresh_gate.acquire(blocking=False):
+            active = self.active_refresh() or "unknown"
+            raise RefreshBusyError(f"refresh already running: {active}")
+        with self._lock:
+            self._active_refresh = operation
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_refresh = None
+            self._refresh_gate.release()
 
     def replace_configs(self, configs: list[ProviderConfig]) -> list[ProviderConfig]:
         with self._lock:
@@ -2763,9 +2840,14 @@ class ProviderManager:
             return list(self.configs)
 
     def get_provider(self, provider_id: str) -> Provider:
-        config = next((item for item in self.configs if item.id == provider_id), None)
+        with self._lock:
+            config = next((item for item in self.configs if item.id == provider_id), None)
+            config = copy.deepcopy(config)
         if not config:
             raise KeyError(f"unknown provider: {provider_id}")
+        return self._provider_for_config(config)
+
+    def _provider_for_config(self, config: ProviderConfig) -> Provider:
         provider_class = PROVIDER_TYPES.get(config.type)
         if provider_class:
             return provider_class(config)
@@ -2805,10 +2887,25 @@ class ProviderManager:
         provider_id: str,
         browser: BrowserSession | None = None,
     ) -> dict[str, Any]:
-        provider = self.get_provider(provider_id)
+        with self._refresh_operation(f"provider:{provider_id}"):
+            with self._lock:
+                config = next(
+                    (item for item in self.configs if item.id == provider_id), None
+                )
+                config = copy.deepcopy(config)
+            if not config:
+                raise KeyError(f"unknown provider: {provider_id}")
+            return self._refresh_config(config, browser=browser)
+
+    def _refresh_config(
+        self,
+        config: ProviderConfig,
+        browser: BrowserSession | None = None,
+    ) -> dict[str, Any]:
+        provider = self._provider_for_config(config)
         with self._lock:
             providers = self.cache.setdefault("providers", {})
-            previous = providers.get(provider_id)
+            previous = providers.get(config.id)
         try:
             snapshot = provider.fetch(browser=browser)
         except Exception as exc:
@@ -2838,16 +2935,36 @@ class ProviderManager:
             snapshot["channelCheckedAt"] = previous.get("channelCheckedAt") if previous else None
             snapshot["channelsStale"] = bool(previous_channels)
         with self._lock:
-            self.cache.setdefault("providers", {})[provider_id] = snapshot
+            current = next((item for item in self.configs if item.id == config.id), None)
+            if current != config:
+                return snapshot
+            self.cache.setdefault("providers", {})[config.id] = snapshot
             self.save_cache()
         return snapshot
 
     def refresh_all(
         self,
         progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
+        configs: list[ProviderConfig] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
         """Refresh API providers in parallel; reuse one browser per profile for the rest."""
-        enabled = self.enabled_configs()
+        enabled = (
+            self.enabled_configs()
+            if configs is None
+            else copy.deepcopy([config for config in configs if config.enabled])
+        )
+        with self._refresh_operation("all"):
+            return self._refresh_all_configs(
+                enabled, progress=progress, cancel_event=cancel_event
+            )
+
+    def _refresh_all_configs(
+        self,
+        enabled: list[ProviderConfig],
+        progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}
         api_ids = [config.id for config in enabled if is_api_provider(config)]
         browser_groups: dict[str, list[str]] = {}
@@ -2863,10 +2980,21 @@ class ProviderManager:
             browser: BrowserSession | None = None,
         ) -> dict[str, Any]:
             config = configs_by_id[provider_id]
+            if cancel_event and cancel_event.is_set():
+                snapshot = {
+                    "id": provider_id,
+                    "name": config.name,
+                    "type": config.type,
+                    "status": "cancelled",
+                    "error": "刷新已取消",
+                }
+                if progress:
+                    progress("completed", config, snapshot)
+                return snapshot
             if progress:
                 progress("started", config, None)
             try:
-                snapshot = self.refresh(provider_id, browser=browser)
+                snapshot = self._refresh_config(config, browser=browser)
             except Exception as exc:
                 if progress:
                     progress("completed", config, {
@@ -2897,6 +3025,13 @@ class ProviderManager:
             config for config in self.enabled_configs()
             if config.type in {"ezaiclub", "sub2api"}
         ]
+        with self._refresh_operation("channels"):
+            return self._refresh_channel_configs(channel_configs)
+
+    def _refresh_channel_configs(
+        self,
+        channel_configs: list[ProviderConfig],
+    ) -> list[dict[str, Any]]:
         results = []
         browser_groups: dict[str, list[str]] = {}
         for config in channel_configs:
@@ -2904,7 +3039,10 @@ class ProviderManager:
         for profile_dir, provider_ids in browser_groups.items():
             with BrowserSession(profile_dir) as session:
                 for provider_id in provider_ids:
-                    results.append(self.refresh(provider_id, browser=session))
+                    config = next(
+                        item for item in channel_configs if item.id == provider_id
+                    )
+                    results.append(self._refresh_config(config, browser=session))
         return results
 
     def explore(self, provider_id: str) -> Path:

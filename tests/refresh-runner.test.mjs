@@ -235,3 +235,56 @@ test("refresh runner recovers recent worker jobs and abandons stale jobs safely"
     globalThis.chrome = originalChrome;
   }
 });
+
+test("refresh runner cancels queued providers without counting them as failures", async () => {
+  const originalChrome = globalThis.chrome;
+  const store = {};
+  globalThis.chrome = {
+    storage: { session: sessionArea(store) },
+    tabs: { async remove() {} }
+  };
+
+  try {
+    const { runRefreshBatch } = await import(`../extension/src/background/refresh_runner.js?cancel=${Date.now()}`);
+    const configs = [
+      { id: "first", name: "First", type: "test", resource: "page" },
+      { id: "second", name: "Second", type: "test", resource: "page" }
+    ];
+    const controller = new AbortController();
+    let firstStartedResolve;
+    const firstStarted = new Promise((resolve) => { firstStartedResolve = resolve; });
+    let releaseFirst;
+    const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+
+    const resultsPromise = runRefreshBatch({
+      configs,
+      previousSnapshots: {},
+      context: { trigger: "manual", tabPolicy: "allow-hidden-tabs" },
+      pageConcurrency: 1,
+      cancelSignal: controller.signal,
+      async collect(config, _previous, context) {
+        return context.runAttempt("page", "page", async () => {
+          if (config.id === "first") {
+            firstStartedResolve();
+            await firstRelease;
+          }
+          return snapshot(config);
+        });
+      },
+      async saveSnapshot(value) { return value; }
+    });
+
+    await firstStarted;
+    controller.abort();
+    releaseFirst();
+    const results = await resultsPromise;
+
+    assert.deepEqual(results.map((item) => item.id), ["first"]);
+    assert.equal(store.providerRefreshRun.state, "cancelled");
+    assert.equal(store.providerRefreshRun.providers.first.state, "complete");
+    assert.equal(store.providerRefreshRun.providers.second.state, "cancelled");
+    assert.equal(store.providerRefreshRun.providers.second.error, "刷新已取消");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});

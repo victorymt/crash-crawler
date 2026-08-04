@@ -3,6 +3,8 @@ let settings = {};
 let hasDeepseekKey = false;
 let editingId = "";
 let activeOperation = false;
+let lastConfigLoadAt = 0;
+let configReloadPromise = null;
 const selectedIds = new Set();
 
 function escapeHtml(value) {
@@ -67,8 +69,27 @@ async function loadConfig() {
   configs = data.configs || [];
   settings = data.settings || {};
   hasDeepseekKey = Boolean(data.has_deepseek_key);
+  lastConfigLoadAt = Date.now();
   for (const id of [...selectedIds]) if (!configs.some((config) => config.id === id)) selectedIds.delete(id);
   render();
+}
+
+async function loadLocalSyncToken() {
+  const data = await requestJson("/api/local-sync/token");
+  const field = document.getElementById("local-sync-token");
+  if (field) field.value = data.token || "";
+  const meta = document.getElementById("local-sync-meta");
+  if (meta) meta.textContent = data.revision ? `当前配置版本 ${data.revision}` : "";
+}
+
+async function rotateLocalSyncToken() {
+  const response = await requestJson("/api/local-sync/token", {
+    method: "POST",
+    headers: { "X-Local-Sync-Rotate": "1" },
+    body: "{}"
+  });
+  document.getElementById("local-sync-token").value = response.token || "";
+  document.getElementById("local-sync-meta").textContent = "令牌已重新生成，旧扩展令牌立即失效。";
 }
 
 async function runMutation(message, operation) {
@@ -77,9 +98,10 @@ async function runMutation(message, operation) {
   setControlsDisabled(true);
   setMessage(message);
   try {
-    await operation();
+    const resultMessage = await operation();
     await loadConfig();
-    setMessage("已保存");
+    window.providerConfigEvents?.notify();
+    setMessage(typeof resultMessage === "string" ? resultMessage : "已保存");
   } catch (error) {
     setMessage(error.message || "操作失败", true);
     throw error;
@@ -87,6 +109,19 @@ async function runMutation(message, operation) {
     activeOperation = false;
     setControlsDisabled(false);
   }
+}
+
+function reloadConfigIfVisible(force = false) {
+  if (
+    activeOperation
+    || document.visibilityState === "hidden"
+    || document.querySelector("dialog[open]")
+    || configReloadPromise
+  ) return;
+  if (!force && Date.now() - lastConfigLoadAt < 1000) return;
+  configReloadPromise = loadConfig()
+    .catch((error) => setMessage(error.message || "读取配置失败", true))
+    .finally(() => { configReloadPromise = null; });
 }
 
 async function replaceConfigs(nextConfigs) {
@@ -245,6 +280,7 @@ document.getElementById("save-settings").addEventListener("click", () => {
     method: "POST", body: JSON.stringify({ settings: next })
   })).catch(() => {});
 });
+document.getElementById("rotate-local-sync-token").addEventListener("click", () => runMutation("正在重新生成同步令牌...", rotateLocalSyncToken));
 
 document.getElementById("export-config").addEventListener("click", () => {
   const portableConfigs = configs.map((config) => ({
@@ -256,6 +292,7 @@ document.getElementById("export-config").addEventListener("click", () => {
     targetUrl: config.target_url,
     rechargeRatio: config.recharge_ratio,
     enabled: config.enabled !== false,
+    refreshOnVisit: config.refresh_on_visit === true,
     mode: config.mode,
     secondaryUrls: config.secondary_urls || [],
     ...(config.parser_rules ? { parserRules: config.parser_rules } : {}),
@@ -270,25 +307,68 @@ document.getElementById("export-config").addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
-document.getElementById("import-config").addEventListener("click", () => document.getElementById("import-file").click());
+function providersFromImportDocument(documentData) {
+  if (Array.isArray(documentData)) return documentData;
+  if (documentData && Array.isArray(documentData.providers)) return documentData.providers;
+  if (documentData?.id != null) return [documentData];
+  throw new Error("导入内容必须是 Provider、Provider 数组或包含 providers 的对象");
+}
+
+function closeImportDialog() {
+  document.getElementById("import-dialog").close();
+}
+
+function setImportMessage(message, isError = false) {
+  const node = document.getElementById("import-message");
+  node.textContent = message || "";
+  node.classList.toggle("error", isError);
+}
+
+document.getElementById("import-config").addEventListener("click", () => {
+  document.getElementById("import-json").value = "";
+  document.getElementById("import-mode").value = "merge";
+  setImportMessage("");
+  document.getElementById("import-dialog").showModal();
+});
+document.getElementById("choose-import-file").addEventListener("click", () => document.getElementById("import-file").click());
 document.getElementById("import-file").addEventListener("change", async (event) => {
   const [file] = event.target.files;
   event.target.value = "";
   if (!file) return;
   try {
-    const documentData = JSON.parse(await file.text());
-    const providers = Array.isArray(documentData)
-      ? documentData
-      : Array.isArray(documentData.providers)
-        ? documentData.providers
-        : documentData.id
-          ? [documentData]
-          : null;
-    if (!Array.isArray(providers)) throw new Error("导入文件缺少 providers 数组");
-    await runMutation("正在导入 Provider...", () => replaceConfigs(providers));
+    const text = await file.text();
+    JSON.parse(text);
+    document.getElementById("import-json").value = text;
   } catch (error) {
-    setMessage(error.message || "导入失败", true);
+    setImportMessage(`读取导入文件失败：${error.message}`, true);
   }
+});
+document.getElementById("import-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  let providers;
+  try {
+    providers = providersFromImportDocument(JSON.parse(document.getElementById("import-json").value));
+  } catch (error) {
+    return setImportMessage(`导入 JSON 无效：${error.message}`, true);
+  }
+  const mode = document.getElementById("import-mode").value;
+  setImportMessage("正在校验并导入 Provider...");
+  runMutation("正在导入 Provider...", async () => {
+    const data = await requestJson("/api/config/providers", {
+      method: "POST",
+      body: JSON.stringify({ providers, importMode: mode })
+    });
+    closeImportDialog();
+    const summary = data.summary || {};
+    const parts = [`新增 ${summary.added || 0}`, `更新 ${summary.updated || 0}`, `未变化 ${summary.unchanged || 0}`];
+    if (summary.removed) parts.push(`删除 ${summary.removed}`);
+    return `导入完成：${parts.join("，")}`;
+  }).catch((error) => setImportMessage(error.message || "导入失败", true));
+});
+document.getElementById("close-import").addEventListener("click", closeImportDialog);
+document.getElementById("cancel-import").addEventListener("click", closeImportDialog);
+document.getElementById("import-dialog").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeImportDialog();
 });
 
 document.getElementById("add-provider").addEventListener("click", () => openEditor());
@@ -298,5 +378,8 @@ document.getElementById("cancel-editor").addEventListener("click", closeEditor);
 document.getElementById("provider-dialog").addEventListener("click", (event) => {
   if (event.target === event.currentTarget) closeEditor();
 });
+window.providerConfigEvents?.subscribe(() => reloadConfigIfVisible(true));
+window.addEventListener("focus", () => reloadConfigIfVisible());
+document.addEventListener("visibilitychange", () => reloadConfigIfVisible());
 
-loadConfig().catch((error) => setMessage(error.message || "读取配置失败", true));
+Promise.all([loadConfig(), loadLocalSyncToken()]).catch((error) => setMessage(error.message || "读取配置失败", true));

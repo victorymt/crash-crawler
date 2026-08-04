@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://provider-usage-hub.local/schemas/provider-config-v4.schema.json",
+  "title": "Provider Usage Hub portable provider configuration v4",
+  "oneOf": [
+    { "$ref": "#/$defs/provider" },
+    {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/provider" }
+    },
+    {
+      "type": "object",
+      "required": ["providers"],
+      "properties": {
+        "schemaVersion": { "const": 4 },
+        "providers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/provider" }
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "secondaryUrl": {
+      "type": "object",
+      "required": ["id", "label", "url"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "label": { "type": "string", "maxLength": 200 },
+        "url": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "waitOptions": {
+      "type": "object",
+      "properties": {
+        "waitMs": { "type": "number", "minimum": 100, "maximum": 30000 },
+        "minWaitMs": { "type": "number", "minimum": 0, "maximum": 30000 },
+        "pollMs": { "type": "number", "minimum": 100, "maximum": 2000 },
+        "stableSamples": { "type": "number", "minimum": 1, "maximum": 20 }
+      },
+      "additionalProperties": false
+    },
+    "rule": {
+      "type": "object",
+      "required": ["id", "pageId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "pageId": { "$ref": "#/$defs/identifier" },
+        "label": { "type": "string", "maxLength": 200 },
+        "selector": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "usedSelector": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "limitSelector": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "resetSelector": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "attribute": { "enum": ["textContent", "innerText", "value", "href", "title", "aria-label"] },
+        "usedAttribute": { "enum": ["textContent", "innerText", "value", "href", "title", "aria-label"] },
+        "limitAttribute": { "enum": ["textContent", "innerText", "value", "href", "title", "aria-label"] },
+        "resetAttribute": { "enum": ["textContent", "innerText", "value", "href", "title", "aria-label"] },
+        "pattern": { "type": "string", "maxLength": 512 },
+        "usedPattern": { "type": "string", "maxLength": 512 },
+        "limitPattern": { "type": "string", "maxLength": 512 },
+        "resetPattern": { "type": "string", "maxLength": 512 },
+        "valuePattern": { "type": "string", "maxLength": 512 },
+        "flags": { "type": "string", "pattern": "^[imsu]*$" },
+        "usedFlags": { "type": "string", "pattern": "^[imsu]*$" },
+        "limitFlags": { "type": "string", "pattern": "^[imsu]*$" },
+        "resetFlags": { "type": "string", "pattern": "^[imsu]*$" },
+        "valueFlags": { "type": "string", "pattern": "^[imsu]*$" }
+      },
+      "additionalProperties": true
+    },
+    "parserRules": {
+      "type": "object",
+      "required": ["loginHints", "readySelector", "balances", "quotas", "textMetrics"],
+      "properties": {
+        "loginHints": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string", "maxLength": 100 }
+        },
+        "readySelector": { "type": "string", "maxLength": 1000 },
+        "readyPattern": { "type": "string", "maxLength": 512 },
+        "waitOptions": { "$ref": "#/$defs/waitOptions" },
+        "afterLoadDelayMs": { "type": "number", "minimum": 0, "maximum": 5000 },
+        "requirePathMatch": { "type": "boolean" },
+        "balances": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/rule" } },
+        "quotas": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/rule" } },
+        "textMetrics": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/rule" } }
+      },
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "schemaVersion", "id", "name", "group", "type", "targetUrl",
+        "rechargeRatio", "enabled", "refreshOnVisit", "secondaryUrls", "mode"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 4 },
+        "id": { "$ref": "#/$defs/identifier" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "group": { "type": "string", "maxLength": 200 },
+        "type": { "enum": ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"] },
+        "targetUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "rechargeRatio": { "type": "number", "minimum": 0.01, "maximum": 1000 },
+        "enabled": { "type": "boolean" },
+        "refreshOnVisit": { "type": "boolean" },
+        "secondaryUrls": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/secondaryUrl" } },
+        "mode": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "parserRules": { "$ref": "#/$defs/parserRules" },
+        "quotaPerUnit": { "type": "number", "minimum": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

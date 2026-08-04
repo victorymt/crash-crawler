@@ -2,6 +2,8 @@ let models = [];
 let channels = [];
 let summary = {};
 let activeOperation = false;
+let lastChannelLoadAt = 0;
+let channelReloadPromise = null;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -117,7 +119,16 @@ async function loadChannels() {
   models = data.models || [];
   channels = data.channels || [];
   summary = data.summary || {};
+  lastChannelLoadAt = Date.now();
   render();
+}
+
+function reloadChannelsIfVisible(force = false) {
+  if (activeOperation || document.visibilityState === "hidden" || channelReloadPromise) return;
+  if (!force && Date.now() - lastChannelLoadAt < 1000) return;
+  channelReloadPromise = loadChannels()
+    .catch((error) => setMessage(error.message || "读取渠道失败", true))
+    .finally(() => { channelReloadPromise = null; });
 }
 
 async function refreshChannels() {
@@ -142,4 +153,7 @@ async function refreshChannels() {
 document.getElementById("channel-model").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("include-degraded").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
+window.providerConfigEvents?.subscribe(() => reloadChannelsIfVisible(true));
+window.addEventListener("focus", () => reloadChannelsIfVisible());
+document.addEventListener("visibilitychange", () => reloadChannelsIfVisible());
 loadChannels().catch((error) => setMessage(error.message || "读取渠道失败", true));

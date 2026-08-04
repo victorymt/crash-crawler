@@ -1,0 +1,138 @@
+{
+  "valid": [
+    {
+      "name": "empty optional page rules",
+      "input": {
+        "schemaVersion": 4,
+        "id": "page-provider-11",
+        "name": "Generic relay",
+        "group": "",
+        "type": "page",
+        "targetUrl": "https://relay.example.test/dashboard",
+        "rechargeRatio": 1,
+        "enabled": true,
+        "refreshOnVisit": false,
+        "secondaryUrls": [],
+        "mode": "page",
+        "parserRules": {
+          "loginHints": ["Login", "登录"],
+          "readySelector": "",
+          "balances": [],
+          "quotas": [],
+          "textMetrics": []
+        }
+      },
+      "expected": {
+        "schemaVersion": 4,
+        "id": "page-provider-11",
+        "name": "Generic relay",
+        "group": "",
+        "type": "page",
+        "targetUrl": "https://relay.example.test/dashboard",
+        "rechargeRatio": 1,
+        "enabled": true,
+        "refreshOnVisit": false,
+        "secondaryUrls": [],
+        "mode": "page",
+        "parserRules": {
+          "loginHints": ["Login", "登录"],
+          "readySelector": "",
+          "balances": [],
+          "quotas": [],
+          "textMetrics": []
+        }
+      }
+    },
+    {
+      "name": "legacy snake case fields",
+      "input": {
+        "schema_version": 2,
+        "id": "legacy-page",
+        "name": "Legacy page",
+        "type": "page",
+        "target_url": "https://legacy.example.test/dashboard",
+        "refresh_on_visit": true,
+        "secondary_urls": [
+          { "label": "Usage", "url": "https://legacy.example.test/usage" }
+        ],
+        "parser_rules": {
+          "loginHints": ["Login"],
+          "balances": [
+            { "label": "Balance", "pattern": "balance\\s+(\\d+)", "valueGroup": 1 }
+          ]
+        }
+      },
+      "expected": {
+        "schemaVersion": 4,
+        "id": "legacy-page",
+        "name": "Legacy page",
+        "group": "",
+        "type": "page",
+        "targetUrl": "https://legacy.example.test/dashboard",
+        "rechargeRatio": 1,
+        "enabled": true,
+        "refreshOnVisit": true,
+        "secondaryUrls": [
+          { "id": "page-1", "label": "Usage", "url": "https://legacy.example.test/usage" }
+        ],
+        "mode": "page",
+        "parserRules": {
+          "loginHints": ["Login"],
+          "readySelector": "",
+          "balances": [
+            {
+              "id": "balance-1",
+              "pageId": "main",
+              "label": "Balance",
+              "pattern": "balance\\s+(\\d+)",
+              "valueGroup": 1
+            }
+          ],
+          "quotas": [],
+          "textMetrics": []
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "URL credentials",
+      "input": {
+        "id": "credentials",
+        "name": "Credentials",
+        "type": "page",
+        "targetUrl": "https://user:secret@example.test",
+        "parserRules": { "balances": [], "quotas": [], "textMetrics": [] }
+      }
+    },
+    {
+      "name": "unsafe regex",
+      "input": {
+        "id": "unsafe-regex",
+        "name": "Unsafe regex",
+        "type": "page",
+        "targetUrl": "https://example.test",
+        "parserRules": {
+          "balances": [{ "id": "balance", "pattern": "(a+)+$" }],
+          "quotas": [],
+          "textMetrics": []
+        }
+      }
+    },
+    {
+      "name": "minimum wait exceeds wait",
+      "input": {
+        "id": "bad-wait",
+        "name": "Bad wait",
+        "type": "page",
+        "targetUrl": "https://example.test",
+        "parserRules": {
+          "waitOptions": { "waitMs": 1000, "minWaitMs": 2000 },
+          "balances": [],
+          "quotas": [],
+          "textMetrics": []
+        }
+      }
+    }
+  ]
+}

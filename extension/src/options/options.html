@@ -40,6 +40,32 @@
       </div>
       <p id="auto-refresh-meta" class="empty-state">默认每 30 分钟在后台刷新已启用的 provider，并更新工具栏角标。</p>
     </section>
+    <section class="settings-section" aria-labelledby="local-sync-title">
+      <h2 id="local-sync-title">本地 Web 同步</h2>
+      <div class="settings-grid local-sync-grid">
+        <label>
+          Web 地址
+          <input id="local-sync-url" type="url" spellcheck="false">
+        </label>
+        <label>
+          配对令牌
+          <input id="local-sync-token" type="password" autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          同步方式
+          <select id="local-sync-mode">
+            <option value="merge">合并：保留另一侧其他 Provider</option>
+            <option value="replace">替换：移除另一侧不存在的自定义 Provider</option>
+          </select>
+        </label>
+      </div>
+      <div class="source-actions">
+        <button id="local-sync-pull" type="button">从 Web 拉取</button>
+        <button id="local-sync-push" type="button" class="primary">推送到 Web</button>
+        <button id="local-sync-rotate" type="button">打开 Web 配对页</button>
+      </div>
+      <p id="local-sync-meta" class="empty-state">令牌只保存在此浏览器的扩展存储中，不会写入 Provider 配置导出文件。</p>
+    </section>
     <section class="provider-section">
       <div class="section-head">
         <h2>Providers</h2>
@@ -174,6 +200,13 @@
       <label>
         Provider 配置 JSON
         <textarea id="import-json" rows="8" spellcheck="false"></textarea>
+      </label>
+      <label>
+        导入方式
+        <select id="import-mode">
+          <option value="merge">合并：更新同 ID，并保留其他 Provider</option>
+          <option value="replace">替换：删除文件中不存在的自定义 Provider</option>
+        </select>
       </label>
       <div class="source-actions">
         <input id="import-file" type="file" accept="application/json,.json" hidden>

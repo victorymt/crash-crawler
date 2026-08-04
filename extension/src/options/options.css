@@ -116,6 +116,8 @@ main > section:last-of-type { border-bottom: 0; }
   gap: 14px;
 }
 
+.local-sync-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
 .credential-row {
   display: grid;
   max-width: 820px;
@@ -715,6 +717,8 @@ button:disabled {
 
   .settings-grid,
   .credential-row { grid-template-columns: 1fr; }
+
+  .local-sync-grid { grid-template-columns: 1fr; }
 
   .credential-row button { justify-self: start; }
 

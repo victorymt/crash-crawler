@@ -113,6 +113,8 @@ a.primary:hover {
   color: var(--on-accent);
 }
 
+button.danger { color: var(--bad); }
+
 button:focus-visible,
 a.button:focus-visible {
   outline: 2px solid var(--accent);

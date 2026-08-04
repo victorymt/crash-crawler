@@ -69,7 +69,7 @@ const MAX_TOTAL_RULES = 64;
 const MAX_REGEX_LENGTH = 512;
 const MAX_SELECTOR_LENGTH = 1000;
 const MAX_URL_LENGTH = 2048;
-const MAX_ID_LENGTH = 128;
+const MAX_ID_LENGTH = 100;
 const MAX_LABEL_LENGTH = 200;
 const MAX_LOGIN_HINTS = 20;
 const MAX_LOGIN_HINT_LENGTH = 100;
@@ -83,6 +83,14 @@ const WAIT_OPTION_LIMITS = {
   pollMs: [100, 2000],
   stableSamples: [1, 20]
 };
+const PORTABLE_PROVIDER_KEYS = new Set([
+  "schemaVersion", "id", "name", "group", "type", "targetUrl", "rechargeRatio",
+  "enabled", "refreshOnVisit", "secondaryUrls", "mode", "parserRules", "quotaPerUnit"
+]);
+const PORTABLE_PARSER_KEYS = new Set([
+  "loginHints", "readySelector", "readyPattern", "waitOptions", "afterLoadDelayMs",
+  "requirePathMatch", "balances", "quotas", "textMetrics"
+]);
 
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
@@ -296,6 +304,18 @@ function normalizeParserRules(rawRules) {
   return normalized;
 }
 
+function validatePortableSchemaShape(raw) {
+  if (raw?.schemaVersion !== PROVIDER_SCHEMA_VERSION) return;
+  const unknown = Object.keys(raw).filter((key) => !PORTABLE_PROVIDER_KEYS.has(key));
+  if (unknown.length) throw new Error(`Provider ${raw.id || "<unknown>"} has unsupported fields: ${unknown.join(", ")}`);
+  if (raw.parserRules && typeof raw.parserRules === "object" && !Array.isArray(raw.parserRules)) {
+    const unknownRules = Object.keys(raw.parserRules).filter((key) => !PORTABLE_PARSER_KEYS.has(key));
+    if (unknownRules.length) {
+      throw new Error(`Provider ${raw.id || "<unknown>"} parserRules has unsupported fields: ${unknownRules.join(", ")}`);
+    }
+  }
+}
+
 function validateUrl(value, label) {
   if (String(value || "").length > MAX_URL_LENGTH) throw new Error(`${label} is too long`);
   let parsed;
@@ -472,6 +492,7 @@ export function validateProviderConfig(config, existingConfigs = []) {
   if (!config.name || !String(config.name).trim()) throw new Error(`Provider ${config.id} name is required`);
   validateShortText(config.name, `Provider ${config.id} name`);
   validateShortText(config.group, `Provider ${config.id} group`);
+  validateShortText(config.mode, `Provider ${config.id} mode`, 64);
   if (!SUPPORTED_PROVIDER_TYPES.includes(config.type)) {
     throw new Error(`Unsupported provider type: ${config.type}`);
   }
@@ -481,6 +502,9 @@ export function validateProviderConfig(config, existingConfigs = []) {
       || config.rechargeRatio < minRechargeRatio
       || config.rechargeRatio > maxRechargeRatio) {
     throw new Error(`Provider ${config.id} rechargeRatio must be between ${minRechargeRatio} and ${maxRechargeRatio}`);
+  }
+  if (config.quotaPerUnit != null && (!Number.isFinite(config.quotaPerUnit) || config.quotaPerUnit < 1)) {
+    throw new Error(`Provider ${config.id} quotaPerUnit must be at least 1`);
   }
   if ((config.secondaryUrls || []).length > MAX_SECONDARY_PAGES) throw new Error(`Provider ${config.id} has too many secondary pages`);
   const pageIds = new Set();
@@ -502,7 +526,8 @@ export function validateProviderConfig(config, existingConfigs = []) {
 
 export function normalizeProviderConfig(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Provider config must be an object");
-  const parserRules = normalizeParserRules(raw.parserRules);
+  validatePortableSchemaShape(raw);
+  const parserRules = normalizeParserRules(raw.parserRules ?? raw.parser_rules);
   const requestedType = raw.type == null || raw.type === ""
     ? (isNewApiTemplateRequest(raw) ? "newapi" : isSub2ApiTemplateRequest(raw) ? "sub2api" : "")
     : String(raw.type);
@@ -515,10 +540,13 @@ export function normalizeProviderConfig(raw) {
     targetUrl: raw.targetUrl || raw.target_url ? String(raw.targetUrl || raw.target_url) : "",
     rechargeRatio: normalizeRechargeRatio(raw, requestedType),
     enabled: raw.enabled !== false,
-    refreshOnVisit: raw.refreshOnVisit === true,
+    refreshOnVisit: (raw.refreshOnVisit ?? raw.refresh_on_visit) === true,
     secondaryUrls: normalizeSecondaryUrls(raw),
     mode: String(raw.mode || "page"),
-    ...(parserRules ? { parserRules } : {})
+    ...(parserRules ? { parserRules } : {}),
+    ...((raw.quotaPerUnit ?? raw.quota_per_unit) != null
+      ? { quotaPerUnit: Number(raw.quotaPerUnit ?? raw.quota_per_unit) }
+      : {})
   };
   if (config.type === "newapi" || isNewApiTemplateRequest(raw)) {
     return validateProviderConfig(withNewApiTemplate(config, raw));
@@ -535,6 +563,16 @@ export function normalizeProviderConfigs(configs) {
   const normalized = configs.map(normalizeProviderConfig);
   normalized.forEach((config) => validateProviderConfig(config, normalized));
   return normalized;
+}
+
+export function providersFromImportDocument(document) {
+  if (Array.isArray(document)) return document;
+  if (!document || typeof document !== "object") {
+    throw new Error("Provider import must be an object or array");
+  }
+  if (Array.isArray(document.providers)) return document.providers;
+  if (document.id != null) return [document];
+  throw new Error("Provider import is missing a providers array");
 }
 
 export function upsertProviderConfig(configs, rawProvider) {

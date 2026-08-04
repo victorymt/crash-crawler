@@ -1,6 +1,8 @@
 let providers = [];
 let snapshots = [];
 let activeOperation = false;
+let lastStatusLoadAt = 0;
+let statusReloadPromise = null;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -96,7 +98,15 @@ function setMessage(message, isError = false) {
 }
 
 function setControlsDisabled(disabled) {
-  document.querySelectorAll("button").forEach((button) => { button.disabled = disabled; });
+  document.querySelectorAll("button").forEach((button) => {
+    button.disabled = disabled && button.id !== "cancel-refresh";
+  });
+}
+
+function setCancelVisible(visible) {
+  const button = document.getElementById("cancel-refresh");
+  button.hidden = !visible;
+  button.disabled = !visible;
 }
 
 function delay(milliseconds) {
@@ -127,7 +137,16 @@ async function loadStatus() {
   const data = await requestJson("/api/providers", { timeout: 20000 });
   providers = data.configs || [];
   snapshots = data.providers || [];
+  lastStatusLoadAt = Date.now();
   render();
+}
+
+function reloadStatusIfVisible(force = false) {
+  if (activeOperation || document.visibilityState === "hidden" || statusReloadPromise) return;
+  if (!force && Date.now() - lastStatusLoadAt < 1000) return;
+  statusReloadPromise = loadStatus()
+    .catch((error) => setMessage(error.message || "读取状态失败", true))
+    .finally(() => { statusReloadPromise = null; });
 }
 
 async function runOperation(message, operation) {
@@ -149,8 +168,10 @@ async function runOperation(message, operation) {
 
 async function monitorRefresh(job) {
   let lastCompleted = Number(job.completed || 0);
-  while (job?.status === "running") {
+  setCancelVisible(["running", "cancelling"].includes(job?.status));
+  while (["running", "cancelling"].includes(job?.status)) {
     showRefreshProgress(job);
+    if (job.status === "cancelling") setMessage("正在取消刷新...");
     await delay(800);
     const data = await requestJson("/api/refresh", { timeout: 20000 });
     job = data.refresh;
@@ -168,7 +189,12 @@ async function monitorRefresh(job) {
   progress.value = Number(job.completed || 0);
   await loadStatus();
   const failures = Number(job.failureCount || 0);
-  if (job.status === "failed") {
+  setCancelVisible(false);
+  if (job.status === "cancelled") {
+    setMessage(`刷新已取消：完成 ${job.completed}/${job.total}`);
+  } else if (job.status === "interrupted") {
+    setMessage(`刷新中断：${job.error || "服务重启导致任务中断"}`, true);
+  } else if (job.status === "failed") {
     setMessage(`刷新中断：${job.error || "后台任务失败"}（${job.completed}/${job.total}）`, true);
   } else if (failures) {
     setMessage(`刷新完成：成功 ${job.successCount}，失败 ${failures} · ${new Date().toLocaleTimeString()}`, true);
@@ -181,6 +207,7 @@ async function refreshAll() {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
+  setCancelVisible(true);
   setMessage("正在创建刷新任务...");
   try {
     const data = await requestJson("/api/refresh", { method: "POST", timeout: 20000 });
@@ -190,15 +217,40 @@ async function refreshAll() {
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
+    setCancelVisible(false);
+  }
+}
+
+async function cancelRefresh() {
+  if (!activeOperation) return;
+  const button = document.getElementById("cancel-refresh");
+  button.disabled = true;
+  try {
+    const data = await requestJson("/api/refresh/cancel", { method: "POST", timeout: 20000 });
+    if (data.cancelled) setMessage("正在取消刷新...");
+  } catch (error) {
+    button.disabled = false;
+    setMessage(error.message || "取消刷新失败", true);
   }
 }
 
 async function initialize() {
   await loadStatus();
   const data = await requestJson("/api/refresh", { timeout: 20000 });
-  if (data.refresh?.status !== "running") return;
+  const persisted = data.refresh;
+  if (!["running", "cancelling"].includes(persisted?.status)) {
+    if (persisted?.status === "interrupted" || persisted?.status === "failed") {
+      setMessage(`上次刷新中断：${persisted.error || "后台任务失败"}`, true);
+    } else if (persisted?.status === "cancelled") {
+      setMessage(`上次刷新已取消：完成 ${persisted.completed}/${persisted.total}`);
+    } else if (persisted?.status === "completed") {
+      setMessage(`最近刷新完成：${persisted.completed}/${persisted.total}`);
+    }
+    return;
+  }
   activeOperation = true;
   setControlsDisabled(true);
+  setCancelVisible(true);
   try {
     await monitorRefresh(data.refresh);
   } catch (error) {
@@ -206,10 +258,12 @@ async function initialize() {
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
+    setCancelVisible(false);
   }
 }
 
 document.getElementById("refresh-all").addEventListener("click", refreshAll);
+document.getElementById("cancel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("sync-auth").addEventListener("click", () => runOperation(
   "正在同步 BrowserOS 登录态...",
   () => requestJson("/api/sync-auth", { method: "POST", timeout: 120000 })
@@ -226,5 +280,8 @@ document.getElementById("provider-groups").addEventListener("click", (event) => 
     `/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" }
   ));
 });
+window.providerConfigEvents?.subscribe(() => reloadStatusIfVisible(true));
+window.addEventListener("focus", () => reloadStatusIfVisible());
+document.addEventListener("visibilitychange", () => reloadStatusIfVisible());
 
 initialize().catch((error) => setMessage(error.message || "读取状态失败", true));
