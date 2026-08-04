@@ -62,6 +62,69 @@ function setRetryVisible(visible) {
   button.disabled = !visible || activeOperation;
 }
 
+function showRefreshProgress(run) {
+  const progress = document.getElementById("refresh-progress");
+  progress.hidden = false;
+  progress.max = Math.max(1, Object.keys(run?.providers || {}).length);
+  progress.value = Object.values(run?.providers || {}).filter((state) => state.state === "complete").length;
+  const active = Object.values(run?.providers || {})
+    .filter((state) => state.state === "running")
+    .map((state) => state.currentStep)
+    .filter(Boolean);
+  setMessage(`后台刷新进度 ${progress.value}/${progress.max}${active.length ? ` · ${active[0]}` : ""}`);
+}
+
+async function monitorRefreshStatus(run) {
+  let lastUpdated = run.updatedAt || run.startedAt || "";
+  setCancelVisible(true);
+  while (run?.state === "running") {
+    showRefreshProgress(run);
+    await new Promise((resolve) => window.setTimeout(resolve, 800));
+    const data = await sendMessage({ type: "providers:refreshStatus" });
+    run = data.refresh;
+    if (!run) break;
+    if (run.updatedAt !== lastUpdated) {
+      lastUpdated = run.updatedAt || "";
+      await loadStatus();
+    }
+  }
+  if (!run) return;
+  await loadStatus();
+  const failed = Object.values(run.providers || {})
+    .filter((state) => state.snapshotStatus && state.snapshotStatus !== "ok")
+    .length;
+  if (run.state === "cancelled") {
+    setMessage("后台刷新已取消");
+  } else if (run.state === "interrupted") {
+    setMessage("后台刷新已中断", true);
+  } else if (failed) {
+    setMessage(`后台刷新完成：${failed} 个 Provider 需要重试`, true);
+  } else if (run.state === "complete") {
+    setMessage("后台刷新完成");
+  }
+  setRetryVisible(hasFailedSnapshots());
+}
+
+async function restoreRefreshStatus() {
+  const data = await sendMessage({ type: "providers:refreshStatus" });
+  const run = data.refresh;
+  if (!run || run.state !== "running") {
+    if (run?.state === "interrupted") setMessage("上次后台刷新已中断", true);
+    setRetryVisible(hasFailedSnapshots());
+    return;
+  }
+  activeOperation = true;
+  setControlsDisabled(true);
+  try {
+    await monitorRefreshStatus(run);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
+    setRetryVisible(hasFailedSnapshots());
+  }
+}
+
 function pageOrigin(value) {
   try {
     const parsed = new URL(value);
@@ -403,4 +466,6 @@ document.getElementById("channels").addEventListener("click", () => {
 });
 document.getElementById("options").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
-Promise.all([loadStatus(), loadCurrentPage()]).catch((error) => setMessage(error.message, true));
+Promise.all([loadStatus(), loadCurrentPage()])
+  .then(() => restoreRefreshStatus())
+  .catch((error) => setMessage(error.message, true));

@@ -481,6 +481,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           trigger: "manual-retry",
           tabPolicy: "allow-hidden-tabs"
         });
+      case "providers:refreshStatus":
+        return { refresh: await getRefreshRun() };
       case "providers:cancelRefresh":
         return { cancelled: cancelRefreshBatch() };
       case "providers:refreshChannels":

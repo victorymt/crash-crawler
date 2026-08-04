@@ -123,6 +123,7 @@ test("channel ranking lives on a dedicated extension page", async () => {
 
   assert.match(popupHtml, /id="channels"/);
   assert.match(popupHtml, /id="retry-failed"/);
+  assert.match(popupHtml, /id="refresh-progress"/);
   assert.doesNotMatch(popupHtml, /id="channel-results"/);
   assert.match(popupScript, /src\/channels\/channels\.html/);
   assert.match(channelsHtml, /id="channel-model"/);
