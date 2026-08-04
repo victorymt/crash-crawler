@@ -306,6 +306,44 @@ async function refreshAllProviders(context = {}) {
   }
 }
 
+async function failedProviderConfigs() {
+  const configs = await publicConfigs();
+  const snapshots = await getSnapshots();
+  const run = await getRefreshRun();
+  const failedIds = new Set(
+    Object.entries(run?.providers || {})
+      .filter(([, state]) => state?.state === "complete" && state.snapshotStatus && state.snapshotStatus !== "ok")
+      .map(([id]) => id)
+  );
+  return configs.filter((config) => {
+    const snapshot = snapshots[config.id];
+    return failedIds.has(config.id) || ["error", "stale"].includes(snapshot?.status);
+  });
+}
+
+async function refreshFailedProviders(context = {}) {
+  const configs = await failedProviderConfigs();
+  if (!configs.length) return { providers: [], started: false, cancelled: false };
+  const previous = await getSnapshots();
+  const controller = new AbortController();
+  refreshBatchCancelController = controller;
+  try {
+    const providers = await runRefreshBatch({
+      configs,
+      previousSnapshots: previous,
+      context,
+      collect: collectOneExclusive,
+      saveSnapshot: saveCurrentProviderSnapshot,
+      cancelSignal: controller.signal
+    });
+    await syncBadgeFromStorage();
+    const run = await getRefreshRun();
+    return { providers, started: true, cancelled: run?.state === "cancelled" };
+  } finally {
+    if (refreshBatchCancelController === controller) refreshBatchCancelController = null;
+  }
+}
+
 async function refreshChannelProviders(context = {}) {
   const configs = channelProviderConfigs(await getProviderConfigs());
   const previous = await getSnapshots();
@@ -356,6 +394,10 @@ async function runExclusiveRefresh(scope, context, work) {
 
 async function refreshAllProvidersExclusive(context = {}) {
   return runExclusiveRefresh("all", context, refreshAllProviders);
+}
+
+async function refreshFailedProvidersExclusive(context = {}) {
+  return runExclusiveRefresh("retry", context, refreshFailedProviders);
 }
 
 async function refreshChannelProvidersExclusive(context = {}) {
@@ -434,6 +476,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const run = await getRefreshRun();
           return { providers, cancelled: run?.state === "cancelled" };
         }
+      case "providers:refreshFailed":
+        return refreshFailedProvidersExclusive({
+          trigger: "manual-retry",
+          tabPolicy: "allow-hidden-tabs"
+        });
       case "providers:cancelRefresh":
         return { cancelled: cancelRefreshBatch() };
       case "providers:refreshChannels":

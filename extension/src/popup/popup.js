@@ -30,6 +30,7 @@ function setMessage(message, isError = false) {
 
 function setControlsDisabled(disabled) {
   document.getElementById("refresh-all").disabled = disabled;
+  document.getElementById("retry-failed").disabled = disabled;
   const cancelButton = document.getElementById("cancel-refresh");
   cancelButton.disabled = !activeOperation;
   const addButton = document.getElementById("add-current-page");
@@ -49,6 +50,16 @@ function setCancelVisible(visible) {
   const button = document.getElementById("cancel-refresh");
   button.hidden = !visible;
   button.disabled = !visible;
+}
+
+function hasFailedSnapshots() {
+  return snapshots.some((snapshot) => ["error", "stale"].includes(snapshot.status));
+}
+
+function setRetryVisible(visible) {
+  const button = document.getElementById("retry-failed");
+  button.hidden = !visible;
+  button.disabled = !visible || activeOperation;
 }
 
 function pageOrigin(value) {
@@ -217,6 +228,7 @@ async function loadStatus() {
   snapshots = data.providers;
   providersLoaded = true;
   render();
+  setRetryVisible(hasFailedSnapshots());
   const hint = autoRefreshHint(data.settings);
   if (hint) setMessage(hint);
 }
@@ -273,8 +285,9 @@ if (chrome.storage?.onChanged) {
       return snapshot;
     }).filter(Boolean);
     if (!changed) return;
-    snapshots = merged;
-    render();
+  snapshots = merged;
+  render();
+  setRetryVisible(hasFailedSnapshots());
     setMessage(`快照已更新：${new Date().toLocaleTimeString()}`);
   });
 }
@@ -311,6 +324,7 @@ async function refreshAll() {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
+  setRetryVisible(false);
   setCancelVisible(true);
   setMessage("正在并行刷新所有 provider...");
   try {
@@ -334,6 +348,36 @@ async function refreshAll() {
   }
 }
 
+async function retryFailed() {
+  if (activeOperation) return;
+  activeOperation = true;
+  setControlsDisabled(true);
+  setRetryVisible(false);
+  setCancelVisible(true);
+  setMessage("正在重试失败 provider...");
+  try {
+    const data = await sendMessage({ type: "providers:refreshFailed" });
+    if (!data.started) {
+      setMessage("当前没有可重试的失败 provider");
+      return;
+    }
+    const updatedSnapshots = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]));
+    for (const snapshot of data.providers || []) updatedSnapshots.set(snapshot.id, snapshot);
+    snapshots = configs.map((config) => updatedSnapshots.get(config.id)).filter(Boolean);
+    render();
+    setRetryVisible(hasFailedSnapshots());
+    setMessage(data.cancelled ? "失败 provider 重试已取消" : `失败 provider 重试完成：${new Date().toLocaleTimeString()}`);
+  } catch (error) {
+    await loadStatus();
+    setMessage(error.message || "重试失败", true);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
+    setRetryVisible(hasFailedSnapshots());
+  }
+}
+
 async function cancelRefresh() {
   if (!activeOperation) return;
   const button = document.getElementById("cancel-refresh");
@@ -348,6 +392,7 @@ async function cancelRefresh() {
 }
 
 document.getElementById("refresh-all").addEventListener("click", refreshAll);
+document.getElementById("retry-failed").addEventListener("click", retryFailed);
 document.getElementById("cancel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("add-current-page").addEventListener("click", addCurrentPage);
 document.getElementById("open-all").addEventListener("click", () => {

@@ -122,6 +122,7 @@ test("channel ranking lives on a dedicated extension page", async () => {
   const channelsScript = await readFile(new URL("../extension/src/channels/channels.js", import.meta.url), "utf8");
 
   assert.match(popupHtml, /id="channels"/);
+  assert.match(popupHtml, /id="retry-failed"/);
   assert.doesNotMatch(popupHtml, /id="channel-results"/);
   assert.match(popupScript, /src\/channels\/channels\.html/);
   assert.match(channelsHtml, /id="channel-model"/);
