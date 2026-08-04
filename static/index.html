@@ -23,7 +23,10 @@
         <button id="open-all" type="button">打开全部</button>
         <button id="refresh-all" type="button" class="primary">刷新全部</button>
       </div>
-      <div id="message" class="message" aria-live="polite"></div>
+      <div class="operation-feedback">
+        <div id="message" class="message" aria-live="polite"></div>
+        <progress id="refresh-progress" class="refresh-progress" max="1" value="0" hidden></progress>
+      </div>
     </div>
   </header>
   <main class="page-shell">

@@ -25,6 +25,18 @@ UV_CACHE_DIR=/tmp/uv-cache uv pip install -r requirements.txt
 uv run python server.py 19765
 ```
 
+也可以使用启动脚本。首次运行会自动创建 `.venv` 并安装依赖：
+
+```bash
+./launch.sh
+```
+
+传入端口即可覆盖默认的 `19765`：
+
+```bash
+./launch.sh 19766
+```
+
 如果刷新时提示 Playwright 未安装，先确认 `uv run` 使用的是项目虚拟环境：
 
 ```bash

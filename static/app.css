@@ -213,8 +213,13 @@ textarea {
   gap: 7px;
 }
 
-.message {
+.operation-feedback {
   grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+}
+
+.message {
   min-height: 16px;
   color: var(--muted);
   font-size: 12px;
@@ -223,6 +228,12 @@ textarea {
 
 .message:empty { min-height: 0; }
 .message.error { color: var(--bad); }
+.refresh-progress {
+  width: 100%;
+  height: 4px;
+  border: 0;
+  accent-color: var(--accent);
+}
 .page-shell { padding: 22px 0 44px; }
 
 .summary-band {
@@ -506,7 +517,7 @@ dialog::backdrop { background: rgb(8 15 24 / 48%); }
   .header-inner { grid-template-columns: minmax(0, 1fr) auto; }
   .main-nav { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
   .toolbar { grid-column: 2; grid-row: 1; }
-  .message { grid-row: 3; }
+  .operation-feedback { grid-row: 3; }
   .summary-band { grid-template-columns: repeat(3, 1fr); }
   .summary-band p { grid-column: 1 / -1; text-align: left; }
   .provider-row { grid-template-columns: minmax(180px, 1fr) 100px auto; }
@@ -525,7 +536,7 @@ dialog::backdrop { background: rgb(8 15 24 / 48%); }
   .toolbar { grid-column: 1; grid-row: 3; justify-content: flex-start; overflow-x: auto; }
   .main-nav { grid-column: 1; grid-row: 2; width: 100%; }
   .main-nav a { flex: 1; justify-content: center; }
-  .message { grid-row: 4; }
+  .operation-feedback { grid-row: 4; }
   .summary-band { grid-template-columns: repeat(3, 1fr); }
   .summary-band > div { padding: 11px 9px; }
   .summary-band strong { font-size: 19px; }

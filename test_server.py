@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -8,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from providers import ProviderManager
-from server import DashboardHandler
+from server import DashboardHandler, RefreshJobManager
 from web_store import ConfigStore
 
 
@@ -60,6 +61,7 @@ class ServerApiTests(unittest.TestCase):
 
         TestHandler.store = store
         TestHandler.manager = manager
+        TestHandler.refresh_jobs = RefreshJobManager(manager)
         TestHandler.scheduler = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -129,6 +131,50 @@ class ServerApiTests(unittest.TestCase):
             response = urlopen(self.base_url + path, timeout=3)
             self.assertEqual(response.status, 200)
             self.assertTrue(response.read())
+
+    def test_refresh_all_runs_in_background_and_reports_progress(self):
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+
+        def fake_refresh_all(progress=None):
+            config = self.server.RequestHandlerClass.manager.enabled_configs()[0]
+            progress("started", config, None)
+            refresh_started.set()
+            release_refresh.wait(timeout=2)
+            snapshot = {"id": config.id, "status": "ok", "error": None}
+            progress("completed", config, snapshot)
+            return [snapshot]
+
+        self.server.RequestHandlerClass.manager.refresh_all = fake_refresh_all
+
+        status, created = self.request("/api/refresh", "POST")
+        self.assertEqual(status, 202)
+        self.assertTrue(created["started"])
+        self.assertTrue(refresh_started.wait(timeout=1))
+        job_id = created["refresh"]["id"]
+
+        status, progress = self.request("/api/refresh")
+        self.assertEqual(status, 200)
+        self.assertEqual(progress["refresh"]["status"], "running")
+        self.assertEqual(progress["refresh"]["providers"][0]["status"], "refreshing")
+
+        status, duplicate = self.request("/api/refresh", "POST")
+        self.assertEqual(status, 200)
+        self.assertFalse(duplicate["started"])
+        self.assertEqual(duplicate["refresh"]["id"], job_id)
+
+        release_refresh.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, progress = self.request("/api/refresh")
+            if progress["refresh"]["status"] != "running":
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(progress["refresh"]["status"], "completed")
+        self.assertEqual(progress["refresh"]["completed"], 1)
+        self.assertEqual(progress["refresh"]["successCount"], 1)
+        self.assertEqual(progress["refresh"]["failureCount"], 0)
 
 
 if __name__ == "__main__":

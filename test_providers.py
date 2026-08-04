@@ -553,8 +553,13 @@ class ProviderParserTests(unittest.TestCase):
 
             original = providers_mod.BrowserSession
             providers_mod.BrowserSession = FakeSession
+            progress_events = []
             try:
-                results = manager.refresh_all()
+                results = manager.refresh_all(
+                    progress=lambda event, config, snapshot: progress_events.append(
+                        (event, config.id, snapshot and snapshot.get("status"))
+                    )
+                )
             finally:
                 providers_mod.BrowserSession = original
 
@@ -562,6 +567,22 @@ class ProviderParserTests(unittest.TestCase):
             self.assertEqual(len(sessions), 1)
             self.assertEqual(seen_browsers[0], seen_browsers[1])
             self.assertIs(seen_browsers[0], sessions[0])
+            self.assertEqual(
+                {(event, provider_id) for event, provider_id, _ in progress_events},
+                {
+                    ("started", "deepseek"),
+                    ("completed", "deepseek"),
+                    ("started", "ezaiclub"),
+                    ("completed", "ezaiclub"),
+                    ("started", "siliconflow"),
+                    ("completed", "siliconflow"),
+                },
+            )
+            self.assertTrue(all(
+                status == "ok"
+                for event, _, status in progress_events
+                if event == "completed"
+            ))
 
 
 if __name__ == "__main__":

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import mimetypes
 import threading
+import uuid
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +45,108 @@ def public_configs(configs, enabled_only: bool = False) -> list[dict[str, object
         for config in configs
         if config.enabled or not enabled_only
     ]
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class RefreshJobManager:
+    """Run one refresh batch in the background and expose its live progress."""
+
+    def __init__(self, manager: ProviderManager) -> None:
+        self.manager = manager
+        self._lock = threading.RLock()
+        self._job: dict[str, object] | None = None
+
+    def start(self) -> tuple[dict[str, object], bool]:
+        with self._lock:
+            if self._job and self._job["status"] == "running":
+                return copy.deepcopy(self._job), False
+
+            configs = self.manager.enabled_configs()
+            job_id = uuid.uuid4().hex
+            self._job = {
+                "id": job_id,
+                "status": "running",
+                "total": len(configs),
+                "completed": 0,
+                "successCount": 0,
+                "failureCount": 0,
+                "startedAt": utc_now(),
+                "finishedAt": None,
+                "error": None,
+                "providers": [
+                    {
+                        "id": config.id,
+                        "name": config.name,
+                        "status": "queued",
+                        "error": None,
+                    }
+                    for config in configs
+                ],
+            }
+            thread = threading.Thread(
+                target=self._run,
+                args=(job_id,),
+                name=f"provider-refresh-{job_id[:8]}",
+                daemon=True,
+            )
+            thread.start()
+            return copy.deepcopy(self._job), True
+
+    def current(self) -> dict[str, object] | None:
+        with self._lock:
+            return copy.deepcopy(self._job)
+
+    def _progress(self, job_id: str, event: str, config, snapshot) -> None:
+        with self._lock:
+            if not self._job or self._job["id"] != job_id:
+                return
+            item = next(
+                (row for row in self._job["providers"] if row["id"] == config.id),
+                None,
+            )
+            if not item:
+                return
+            if event == "started":
+                item["status"] = "refreshing"
+                return
+            if event != "completed" or item["status"] in {"succeeded", "failed"}:
+                return
+            failed = not snapshot or snapshot.get("status") != "ok"
+            item["status"] = "failed" if failed else "succeeded"
+            item["error"] = snapshot.get("error") if failed and snapshot else None
+            self._job["completed"] += 1
+            counter = "failureCount" if failed else "successCount"
+            self._job[counter] += 1
+
+    def _run(self, job_id: str) -> None:
+        try:
+            self.manager.refresh_all(
+                progress=lambda event, config, snapshot: self._progress(
+                    job_id, event, config, snapshot
+                )
+            )
+        except Exception as exc:
+            with self._lock:
+                if not self._job or self._job["id"] != job_id:
+                    return
+                for item in self._job["providers"]:
+                    if item["status"] not in {"succeeded", "failed"}:
+                        item["status"] = "failed"
+                        item["error"] = str(exc)
+                        self._job["completed"] += 1
+                        self._job["failureCount"] += 1
+                self._job["status"] = "failed"
+                self._job["error"] = str(exc)
+                self._job["finishedAt"] = utc_now()
+            return
+
+        with self._lock:
+            if self._job and self._job["id"] == job_id:
+                self._job["status"] = "completed"
+                self._job["finishedAt"] = utc_now()
 
 
 class AutoRefreshScheduler:
@@ -86,6 +191,7 @@ class AutoRefreshScheduler:
 class DashboardHandler(BaseHTTPRequestHandler):
     store = ConfigStore()
     manager = ProviderManager(configs=store.snapshot()[0])
+    refresh_jobs = RefreshJobManager(manager)
     scheduler: AutoRefreshScheduler | None = None
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -175,6 +281,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "settings": settings,
             })
             return
+        if path == "/api/refresh":
+            self.send_json({"refresh": self.refresh_jobs.current()})
+            return
         if path == "/api/config":
             configs, settings = self.store.snapshot()
             self.send_json({
@@ -236,7 +345,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/refresh":
             try:
-                self.send_json({"providers": self.manager.refresh_all()})
+                refresh, created = self.refresh_jobs.start()
+                self.send_json(
+                    {"refresh": refresh, "started": created},
+                    HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                )
             except Exception as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

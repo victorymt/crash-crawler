@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from http.cookiejar import Cookie, CookieJar
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
@@ -2842,7 +2842,10 @@ class ProviderManager:
             self.save_cache()
         return snapshot
 
-    def refresh_all(self) -> list[dict[str, Any]]:
+    def refresh_all(
+        self,
+        progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Refresh API providers in parallel; reuse one browser per profile for the rest."""
         enabled = self.enabled_configs()
         results: dict[str, dict[str, Any]] = {}
@@ -2853,13 +2856,36 @@ class ProviderManager:
                 continue
             browser_groups.setdefault(config.profile_dir, []).append(config.id)
 
+        configs_by_id = {config.id: config for config in enabled}
+
+        def refresh_one(
+            provider_id: str,
+            browser: BrowserSession | None = None,
+        ) -> dict[str, Any]:
+            config = configs_by_id[provider_id]
+            if progress:
+                progress("started", config, None)
+            try:
+                snapshot = self.refresh(provider_id, browser=browser)
+            except Exception as exc:
+                if progress:
+                    progress("completed", config, {
+                        "id": provider_id,
+                        "status": "error",
+                        "error": str(exc),
+                    })
+                raise
+            if progress:
+                progress("completed", config, snapshot)
+            return snapshot
+
         max_workers = max(1, len(api_ids))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(self.refresh, provider_id): provider_id for provider_id in api_ids}
+            futures = {pool.submit(refresh_one, provider_id): provider_id for provider_id in api_ids}
             for profile_dir, provider_ids in browser_groups.items():
                 with BrowserSession(profile_dir) as session:
                     for provider_id in provider_ids:
-                        results[provider_id] = self.refresh(provider_id, browser=session)
+                        results[provider_id] = refresh_one(provider_id, browser=session)
             for future in as_completed(futures):
                 provider_id = futures[future]
                 results[provider_id] = future.result()
