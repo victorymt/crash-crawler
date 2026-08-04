@@ -5,6 +5,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${1:-19765}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
+export UV_CACHE_DIR
 
 if ! command -v uv >/dev/null 2>&1; then
   printf '%s\n' "uv is required. Install uv, then run ./launch.sh again." >&2

@@ -35,15 +35,40 @@
         <span>模型</span>
         <select id="channel-model"><option value="">全部模型</option></select>
       </label>
-      <label class="degraded-filter">
-        <input id="include-degraded" type="checkbox">
-        <span>包含降级</span>
+      <label class="field">
+        <span>状态</span>
+        <select id="channel-status">
+          <option value="">全部状态</option>
+          <option value="operational">可用</option>
+          <option value="degraded">降级</option>
+          <option value="error">故障</option>
+          <option value="unknown">未知</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>可用性</span>
+        <select id="channel-availability">
+          <option value="all">全部渠道</option>
+          <option value="available">当前可用</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>倍率</span>
+        <select id="channel-rate">
+          <option value="all">全部倍率</option>
+          <option value="known">仅已识别</option>
+          <option value="unknown">仅未识别</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Provider</span>
+        <select id="channel-provider"><option value="">全部 Provider</option></select>
       </label>
       <div id="channel-meta" class="channel-meta">正在读取渠道快照...</div>
     </section>
     <section class="results" aria-labelledby="results-title">
       <div class="results-head">
-        <h1 id="results-title">最低倍率可用渠道</h1>
+        <h1 id="results-title">渠道列表</h1>
         <span id="updated-at">--</span>
       </div>
       <div class="column-headings" aria-hidden="true">

@@ -1,6 +1,7 @@
 let models = [];
 let channels = [];
 let summary = {};
+let providers = [];
 let activeOperation = false;
 let lastChannelLoadAt = 0;
 let channelReloadPromise = null;
@@ -51,7 +52,7 @@ function statusLabel(status) {
 }
 
 function formatMultiplier(value) {
-  const number = Number(value);
+  const number = value == null || value === "" ? NaN : Number(value);
   return Number.isFinite(number) ? `${Number(number.toFixed(4))}x` : "--";
 }
 
@@ -60,6 +61,7 @@ function rateSourceLabel(channel) {
   if (channel.rateSource === "peak") return "峰时倍率";
   if (channel.rateSource === "user") return "个人倍率";
   if (channel.rateSource === "monitor-name") return "监控倍率";
+  if (channel.rateSource === "unknown") return "未识别倍率";
   return "分组倍率";
 }
 
@@ -94,7 +96,10 @@ function channelRowHtml(channel, index) {
       <small>${escapeHtml(statusSource)} · ${escapeHtml(latency)} · 7 天 ${escapeHtml(availability)}</small>
     </span>
     <span class="rate"><strong>${escapeHtml(formatMultiplier(channel.effectiveMultiplier))}</strong><small>${escapeHtml(rateSourceLabel(channel))}</small></span>`;
-  const className = `channel-row${index === 0 ? " best" : ""}`;
+  const hasRate = channel.effectiveMultiplier != null
+    && channel.effectiveMultiplier !== ""
+    && Number.isFinite(Number(channel.effectiveMultiplier));
+  const className = `channel-row${index === 0 && hasRate ? " best" : ""}`;
   return channel.monitorUrl
     ? `<a class="${className}" href="${escapeHtml(channel.monitorUrl)}" target="_blank" rel="noopener noreferrer">${body}</a>`
     : `<div class="${className}">${body}</div>`;
@@ -108,12 +113,30 @@ function render() {
     ...models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
   ].join("");
   select.value = models.includes(selected) ? selected : "";
+  const statusSelect = document.getElementById("channel-status");
+  const availabilitySelect = document.getElementById("channel-availability");
+  const rateSelect = document.getElementById("channel-rate");
+  const providerSelect = document.getElementById("channel-provider");
+  const selectedStatus = statusSelect.value;
+  const selectedAvailability = availabilitySelect.value || "all";
+  const selectedRate = rateSelect.value || "all";
+  const selectedProvider = providerSelect.value;
+  providerSelect.innerHTML = [
+    '<option value="">全部 Provider</option>',
+    ...providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`)
+  ].join("");
+  providerSelect.value = providers.some((provider) => String(provider.id) === String(selectedProvider)) ? selectedProvider : "";
   document.getElementById("channel-results").innerHTML = channels.length
     ? channels.map(channelRowHtml).join("")
-    : '<div class="empty">当前没有符合筛选条件的可用渠道</div>';
+    : '<div class="empty">当前没有符合筛选条件的渠道</div>';
   const failed = Number(summary.failedCount) || 0;
-  const countText = `${channels.length} 个候选 · ${Number(summary.channelCount) || 0} 个监控渠道`;
-  document.getElementById("channel-meta").textContent = failed ? `${countText} · ${failed} 个 Provider 异常` : countText;
+  const details = [
+    `${channels.length} 个渠道`,
+    `${Number(summary.channelCount) || 0} 个监控渠道`,
+    Number(summary.unrankedCount) ? `${Number(summary.unrankedCount)} 个渠道倍率未识别` : "",
+    failed ? `${failed} 个 Provider 异常` : ""
+  ].filter(Boolean);
+  document.getElementById("channel-meta").textContent = details.join(" · ");
   const latestCheckedAt = Date.parse(summary.latestCheckedAt || "");
   document.getElementById("updated-at").textContent = Number.isFinite(latestCheckedAt)
     ? `最近检查 ${new Date(latestCheckedAt).toLocaleString()}`
@@ -123,13 +146,20 @@ function render() {
 
 async function loadChannels() {
   const model = document.getElementById("channel-model").value;
-  const degraded = document.getElementById("include-degraded").checked;
+  const status = document.getElementById("channel-status").value;
+  const rate = document.getElementById("channel-rate").value || "all";
+  const provider = document.getElementById("channel-provider").value;
+  const availability = document.getElementById("channel-availability").value || "all";
   const query = new URLSearchParams();
   if (model) query.set("model", model);
-  if (degraded) query.set("include_degraded", "1");
+  if (status) query.set("status", status);
+  if (rate !== "all") query.set("rate", rate);
+  if (availability !== "all") query.set("availability", availability);
+  if (provider) query.set("provider", provider);
   const data = await requestJson(`/api/channels?${query}`);
   models = data.models || [];
   channels = data.channels || [];
+  providers = data.providers || [];
   summary = data.summary || {};
   lastChannelLoadAt = Date.now();
   render();
@@ -249,7 +279,10 @@ async function initialize() {
 }
 
 document.getElementById("channel-model").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
-document.getElementById("include-degraded").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
+document.getElementById("channel-status").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
+document.getElementById("channel-availability").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
+document.getElementById("channel-rate").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
+document.getElementById("channel-provider").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
 document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
 document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);

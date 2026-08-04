@@ -829,7 +829,10 @@ export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null, c
       balance: balance ?? null,
       today_requests: todayRequests ?? null,
       total_requests: totalRequests ?? null,
-      channel_count: channels?.length ?? null
+      channel_count: channels?.length ?? null,
+      channel_available_endpoint: channelData.availableEndpoint ?? null,
+      channel_available_fallback: Boolean(channelData.availableFallbackUsed),
+      channel_group_count: channelData.availableGroupCount ?? null
     }
   };
 }

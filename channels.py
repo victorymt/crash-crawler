@@ -338,7 +338,7 @@ def channel_status_for_model(channel: dict[str, Any], selected_model: str = "") 
         return None
     observed = next((item for item in channel.get("observedModels", []) if item.get("model") == selected_model), None)
     if observed:
-        return {"status": observed.get("status"), "latencyMs": observed.get("latencyMs"), "statusSource": "model"}
+        return {"status": observed.get("status") or "unknown", "latencyMs": observed.get("latencyMs"), "statusSource": "model"}
     return {
         "status": channel.get("status") or "unknown",
         "latencyMs": channel.get("latencyMs"),
@@ -355,6 +355,76 @@ def available_channel_models(snapshots: list[dict[str, Any]]) -> list[str]:
     ]))
 
 
+def available_channel_providers(snapshots: list[dict[str, Any]]) -> list[dict[str, str]]:
+    providers = {
+        str(channel.get("providerId") or snapshot.get("id")): str(
+            channel.get("providerName") or snapshot.get("name") or channel.get("providerId") or snapshot.get("id")
+        )
+        for snapshot in snapshots
+        for channel in snapshot.get("channels", []) or []
+    }
+    return [
+        {"id": provider_id, "name": name}
+        for provider_id, name in sorted(providers.items(), key=lambda item: item[1])
+    ]
+
+
+def list_channels(
+    snapshots: list[dict[str, Any]],
+    selected_model: str = "",
+    statuses: tuple[str, ...] | list[str] | None = None,
+    rate_mode: str = "all",
+    provider_id: str = "",
+    availability_only: bool = False,
+) -> list[dict[str, Any]]:
+    allowed = set(statuses) if statuses is not None else None
+    status_ranks = {"operational": 0, "degraded": 1, "error": 2, "unknown": 3}
+    result = []
+    for snapshot in snapshots:
+        balance_available = _provider_balance_allows_use(snapshot)
+        for channel in snapshot.get("channels", []) or []:
+            resolved = channel_status_for_model(channel, selected_model)
+            if not resolved or allowed is not None and resolved.get("status") not in allowed:
+                continue
+            if provider_id and str(channel.get("providerId") or snapshot.get("id")) != str(provider_id):
+                continue
+            effective_multiplier = _finite_number(channel.get("effectiveMultiplier"))
+            has_rate = effective_multiplier is not None
+            if rate_mode == "known" and not has_rate or rate_mode == "unknown" and has_rate:
+                continue
+            if availability_only and (
+                snapshot.get("status") != "ok"
+                or snapshot.get("channelsStale") is True
+                or not balance_available
+                or resolved.get("status") != "operational"
+                or not has_rate
+            ):
+                continue
+            status = resolved.get("status") or "unknown"
+            result.append({
+                **channel,
+                "effectiveMultiplier": effective_multiplier,
+                "selectedModel": selected_model or channel.get("primaryModel", ""),
+                "resolvedStatus": status,
+                "resolvedLatencyMs": resolved.get("latencyMs"),
+                "statusSource": resolved.get("statusSource"),
+                "providerStatus": snapshot.get("status") or "unknown",
+                "balanceAvailable": balance_available,
+                "channelsStale": snapshot.get("channelsStale") is True,
+                "statusRank": status_ranks.get(status, 3),
+            })
+    result.sort(key=lambda channel: (
+        _finite_number(channel.get("effectiveMultiplier")) is None,
+        _finite_number(channel.get("effectiveMultiplier")) if _finite_number(channel.get("effectiveMultiplier")) is not None else math.inf,
+        channel.get("statusRank", 3),
+        -(channel.get("availability7d") if channel.get("availability7d") is not None else -1),
+        channel.get("resolvedLatencyMs") if channel.get("resolvedLatencyMs") is not None else math.inf,
+        channel.get("providerName", ""),
+        channel.get("name", ""),
+    ))
+    return result
+
+
 def summarize_channel_refresh(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     channel_snapshots = [
         snapshot for snapshot in snapshots
@@ -368,6 +438,13 @@ def summarize_channel_refresh(snapshots: list[dict[str, Any]]) -> dict[str, Any]
     return {
         "providerCount": len(channel_snapshots),
         "channelCount": sum(len(snapshot.get("channels", []) or []) for snapshot in channel_snapshots),
+        "unrankedCount": sum(
+            sum(
+                _finite_number(channel.get("effectiveMultiplier")) is None
+                for channel in snapshot.get("channels", []) or []
+            )
+            for snapshot in channel_snapshots
+        ),
         "failedCount": sum(bool(
             snapshot.get("channelError")
             or snapshot.get("channelsStale") is True
@@ -392,28 +469,23 @@ def rank_available_channels(
     selected_model: str = "",
     statuses: tuple[str, ...] | list[str] = ("operational",),
 ) -> list[dict[str, Any]]:
-    allowed = set(statuses)
-    candidates = []
-    for snapshot in snapshots:
-        if snapshot.get("status") != "ok" or snapshot.get("channelsStale") is True or not _provider_balance_allows_use(snapshot):
-            continue
-        for channel in snapshot.get("channels", []) or []:
-            resolved = channel_status_for_model(channel, selected_model)
-            if not resolved or resolved.get("status") not in allowed or _finite_number(channel.get("effectiveMultiplier")) is None:
-                continue
-            candidates.append({
-                **channel,
-                "selectedModel": selected_model or channel.get("primaryModel", ""),
-                "resolvedStatus": resolved.get("status"),
-                "resolvedLatencyMs": resolved.get("latencyMs"),
-                "statusSource": resolved.get("statusSource"),
-                "channelsStale": False,
-            })
-    candidates.sort(key=lambda channel: (
-        channel["effectiveMultiplier"],
+    result = [
+        channel for channel in list_channels(
+            snapshots,
+            selected_model,
+            statuses=statuses,
+            rate_mode="known",
+        )
+        if channel.get("providerStatus") == "ok"
+        and channel.get("channelsStale") is not True
+        and channel.get("balanceAvailable")
+    ]
+    result.sort(key=lambda channel: (
+        channel.get("effectiveMultiplier", math.inf),
         channel.get("statusSource") != "model",
         -(channel.get("availability7d") if channel.get("availability7d") is not None else -1),
         channel.get("resolvedLatencyMs") if channel.get("resolvedLatencyMs") is not None else math.inf,
         channel.get("providerName", ""),
+        channel.get("name", ""),
     ))
-    return candidates
+    return result

@@ -343,7 +343,7 @@ export function channelStatusForModel(channel, selectedModel = "") {
   if (model && !(channel.models || []).includes(model)) return null;
   const observed = (channel.observedModels || []).find((item) => item.model === model);
   if (observed) {
-    return { status: observed.status, latencyMs: observed.latencyMs, statusSource: "model" };
+    return { status: observed.status || "unknown", latencyMs: observed.latencyMs, statusSource: "model" };
   }
   return {
     status: channel.status || "unknown",
@@ -366,11 +366,68 @@ export function availableChannelModels(snapshots) {
   ))).sort((left, right) => left.localeCompare(right));
 }
 
+function channelSort(left, right) {
+  const leftRate = finiteNumber(left.effectiveMultiplier);
+  const rightRate = finiteNumber(right.effectiveMultiplier);
+  const leftUnknown = leftRate == null;
+  const rightUnknown = rightRate == null;
+  return Number(leftUnknown) - Number(rightUnknown)
+    || (leftRate ?? Number.POSITIVE_INFINITY) - (rightRate ?? Number.POSITIVE_INFINITY)
+    || (left.statusRank ?? 3) - (right.statusRank ?? 3)
+    || (right.availability7d ?? -1) - (left.availability7d ?? -1)
+    || (left.resolvedLatencyMs ?? Number.POSITIVE_INFINITY) - (right.resolvedLatencyMs ?? Number.POSITIVE_INFINITY)
+    || String(left.providerName || "").localeCompare(String(right.providerName || ""))
+    || String(left.name || "").localeCompare(String(right.name || ""));
+}
+
+export function listChannels(
+  snapshots,
+  selectedModel = "",
+  { statuses = null, rateMode = "all", providerId = "", availabilityOnly = false } = {}
+) {
+  const allowedStatuses = statuses == null ? null : new Set(statuses);
+  return (snapshots || []).flatMap((snapshot) => {
+    const balanceAvailable = providerBalanceAllowsUse(snapshot);
+    return (snapshot?.channels || []).flatMap((channel) => {
+      const resolved = channelStatusForModel(channel, selectedModel);
+      if (!resolved || (allowedStatuses && !allowedStatuses.has(resolved.status))) return [];
+      if (providerId && String(channel.providerId || snapshot.id) !== String(providerId)) return [];
+      const effectiveMultiplier = finiteNumber(channel.effectiveMultiplier);
+      const hasRate = effectiveMultiplier != null;
+      if (rateMode === "known" && !hasRate) return [];
+      if (rateMode === "unknown" && hasRate) return [];
+      if (availabilityOnly && (
+        snapshot?.status !== "ok"
+        || snapshot.channelsStale === true
+        || !balanceAvailable
+        || resolved.status !== "operational"
+        || !hasRate
+      )) return [];
+      const statusRank = { operational: 0, degraded: 1, error: 2, unknown: 3 }[resolved.status] ?? 3;
+      return [{
+        ...channel,
+        effectiveMultiplier,
+        selectedModel: selectedModel || channel.primaryModel || "",
+        resolvedStatus: resolved.status,
+        resolvedLatencyMs: resolved.latencyMs,
+        statusSource: resolved.statusSource,
+        providerStatus: snapshot.status || "unknown",
+        balanceAvailable,
+        channelsStale: snapshot.channelsStale === true,
+        statusRank
+      }];
+    });
+  }).sort(channelSort);
+}
+
 export function summarizeChannelRefresh(providers) {
   const snapshots = Array.isArray(providers) ? providers : [];
   return {
     providerCount: snapshots.length,
     channelCount: snapshots.reduce((count, snapshot) => count + (snapshot?.channels?.length || 0), 0),
+    unrankedCount: snapshots.reduce((count, snapshot) => count + (snapshot?.channels || []).filter(
+      (channel) => finiteNumber(channel?.effectiveMultiplier) == null
+    ).length, 0),
     failedCount: snapshots.filter((snapshot) => (
       snapshot?.channelError
       || snapshot?.channelsStale === true
@@ -380,28 +437,18 @@ export function summarizeChannelRefresh(providers) {
 }
 
 export function rankAvailableChannels(snapshots, selectedModel = "", { statuses = ["operational"] } = {}) {
-  const allowedStatuses = new Set(statuses);
-  const candidates = [];
-  for (const snapshot of snapshots || []) {
-    if (snapshot?.status !== "ok" || snapshot.channelsStale === true || !providerBalanceAllowsUse(snapshot)) continue;
-    for (const channel of snapshot.channels || []) {
-      const resolved = channelStatusForModel(channel, selectedModel);
-      if (!resolved || !allowedStatuses.has(resolved.status) || !Number.isFinite(channel.effectiveMultiplier)) continue;
-      candidates.push({
-        ...channel,
-        selectedModel: selectedModel || channel.primaryModel,
-        resolvedStatus: resolved.status,
-        resolvedLatencyMs: resolved.latencyMs,
-        statusSource: resolved.statusSource,
-        channelsStale: snapshot.channelsStale === true
-      });
-    }
-  }
-  return candidates.sort((left, right) => (
-    left.effectiveMultiplier - right.effectiveMultiplier
-    || Number(left.statusSource !== "model") - Number(right.statusSource !== "model")
-    || (right.availability7d ?? -1) - (left.availability7d ?? -1)
-    || (left.resolvedLatencyMs ?? Number.POSITIVE_INFINITY) - (right.resolvedLatencyMs ?? Number.POSITIVE_INFINITY)
-    || left.providerName.localeCompare(right.providerName)
-  ));
+  return listChannels(snapshots, selectedModel, { statuses, rateMode: "known" })
+    .filter((channel) => (
+      channel.providerStatus === "ok"
+      && channel.channelsStale !== true
+      && channel.balanceAvailable
+    ))
+    .sort((left, right) => (
+      left.effectiveMultiplier - right.effectiveMultiplier
+      || Number(left.statusSource !== "model") - Number(right.statusSource !== "model")
+      || (right.availability7d ?? -1) - (left.availability7d ?? -1)
+      || (left.resolvedLatencyMs ?? Number.POSITIVE_INFINITY) - (right.resolvedLatencyMs ?? Number.POSITIVE_INFINITY)
+      || String(left.providerName || "").localeCompare(String(right.providerName || ""))
+      || String(left.name || "").localeCompare(String(right.name || ""))
+    ));
 }

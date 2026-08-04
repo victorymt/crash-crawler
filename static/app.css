@@ -352,7 +352,7 @@ textarea {
 /* Channels */
 .filters {
   display: grid;
-  grid-template-columns: minmax(240px, 420px) auto minmax(0, 1fr);
+  grid-template-columns: repeat(5, minmax(120px, 1fr)) minmax(200px, auto);
   gap: 14px 22px;
   align-items: end;
   padding-bottom: 20px;
@@ -545,7 +545,7 @@ dialog::backdrop { background: rgb(8 15 24 / 48%); }
   .provider-state { justify-self: end; }
   .provider-metrics { grid-column: 1 / -1; grid-row: auto; overflow-x: auto; }
   .row-actions { grid-column: 1 / -1; grid-row: auto; justify-content: flex-start; overflow-x: auto; }
-  .filters { grid-template-columns: 1fr auto; }
+  .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .channel-meta { grid-column: 1 / -1; text-align: left; }
   .column-headings { display: none; }
   .channel-row { grid-template-columns: 34px minmax(0, 1fr) auto; gap: 10px; }
@@ -566,4 +566,8 @@ dialog::backdrop { background: rgb(8 15 24 / 48%); }
   .form-grid .wide { grid-column: auto; }
   .section-heading { align-items: flex-start; }
   .section-actions { flex-wrap: wrap; }
+}
+
+@media (max-width: 480px) {
+  .filters { grid-template-columns: 1fr; }
 }

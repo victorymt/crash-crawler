@@ -17,6 +17,9 @@ from providers import (
     SiliconFlowProvider,
     Sub2APIProvider,
     is_api_provider,
+    evaluate_with_frame_retry,
+    goto_with_frame_retry,
+    install_provider_auth_session,
     parse_deepseek_balance,
     parse_ezaiclub_balance_tokens,
     parse_ezaiclub_subscription_tokens,
@@ -29,6 +32,7 @@ from providers import (
     profile_fingerprint,
     sync_browseros_profile,
     wait_for_page_ready,
+    is_transient_frame_error,
 )
 
 
@@ -270,6 +274,45 @@ class ProviderParserTests(unittest.TestCase):
         self.assertIsInstance(manager.get_provider("siliconflow"), SiliconFlowProvider)
         self.assertIsInstance(manager.get_provider("newapi"), NewAPIProvider)
         self.assertIsInstance(manager.get_provider("sub2api"), Sub2APIProvider)
+
+    def test_sub2api_channel_group_endpoint_falls_back_to_groups_available(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.example/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+        requested = []
+
+        class FakePage:
+            def evaluate(self, _script, url):
+                requested.append(url)
+                if url.endswith("/api/v1/channel-monitors"):
+                    return {"ok": True, "status": 200, "data": {"data": {"items": []}}}
+                if url.endswith("/api/v1/channels/available"):
+                    return {"ok": True, "status": 200, "data": {"data": []}}
+                if url.endswith("/api/v1/groups/available"):
+                    return {
+                        "ok": True,
+                        "status": 200,
+                        "data": {"data": [{"id": 2, "platform": "openai", "rate_multiplier": 0.1}]},
+                    }
+                if url.endswith("/api/v1/groups/rates"):
+                    return {"ok": True, "status": 200, "data": {"data": {}}}
+                raise AssertionError(f"unexpected URL: {url}")
+
+        monitors, groups, rates, error = provider.fetch_channel_payloads(
+            FakePage(),
+            ("/api/v1/channels/available", "/api/v1/groups/available"),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(groups["data"][0]["rate_multiplier"], 0.1)
+        self.assertEqual(rates, {"data": {}})
+        self.assertEqual(requested[1:3], [
+            "https://fluxionai.example/api/v1/channels/available",
+            "https://fluxionai.example/api/v1/groups/available",
+        ])
 
     def test_newapi_provider_uses_authenticated_response_captured_during_load(self):
         config = ProviderConfig(
@@ -513,6 +556,63 @@ class ProviderParserTests(unittest.TestCase):
             poll_ms=1,
         )
         self.assertIn("账户余额", text)
+
+    def test_transient_frame_error_is_classified_for_retry(self):
+        self.assertTrue(is_transient_frame_error(Exception("Frame with ID 0 was removed.")))
+        self.assertTrue(is_transient_frame_error(Exception("Execution context was destroyed.")))
+        self.assertFalse(is_transient_frame_error(Exception("Page closed")))
+
+    def test_frame_retry_recovers_evaluate_and_navigation(self):
+        class FakePage:
+            def __init__(self):
+                self.evaluate_calls = 0
+                self.goto_calls = 0
+                self.reload_calls = 0
+
+            def evaluate(self, _script, argument):
+                self.evaluate_calls += 1
+                if self.evaluate_calls == 1:
+                    raise RuntimeError("Frame with ID 0 was removed.")
+                return {"argument": argument}
+
+            def goto(self, url, **_kwargs):
+                self.goto_calls += 1
+                if self.goto_calls == 1:
+                    raise RuntimeError("Execution context was destroyed")
+                return url
+
+            def reload(self, **_kwargs):
+                self.reload_calls += 1
+
+        page = FakePage()
+        self.assertEqual(evaluate_with_frame_retry(page, "() => 1", "value"), {"argument": "value"})
+        self.assertEqual(goto_with_frame_retry(page, "https://example.test"), "https://example.test")
+        self.assertEqual(page.reload_calls, 2)
+
+    def test_provider_auth_session_is_injected_only_for_matching_provider(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+
+        class FakePage:
+            def __init__(self):
+                self.script = ""
+
+            def add_init_script(self, script):
+                self.script = script
+
+        page = FakePage()
+        with patch("providers.load_local_secret", return_value=json.dumps({
+            "authToken": "access-token",
+            "refreshToken": "refresh-token",
+            "expiresAt": "123",
+        })):
+            self.assertTrue(install_provider_auth_session(page, config))
+        self.assertIn("access-token", page.script)
+        self.assertIn("localStorage", page.script)
 
     def test_refresh_all_reuses_browser_session_and_runs_api(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -55,6 +55,24 @@ class ServerApiTests(unittest.TestCase):
                     "status": "operational",
                     "effectiveMultiplier": 0.1,
                     "timeline": [],
+                }, {
+                    "providerId": "channel-test",
+                    "providerName": "Channel Test",
+                    "name": "Degraded Rate",
+                    "models": ["model-a"],
+                    "primaryModel": "model-a",
+                    "status": "degraded",
+                    "effectiveMultiplier": "0.2",
+                    "timeline": [],
+                }, {
+                    "providerId": "channel-test",
+                    "providerName": "Channel Test",
+                    "name": "Unknown Rate",
+                    "models": ["model-a"],
+                    "primaryModel": "model-a",
+                    "status": "error",
+                    "effectiveMultiplier": None,
+                    "timeline": [],
                 }],
                 "channelCheckedAt": "2026-08-03T12:00:00+08:00",
                 "channelsStale": False,
@@ -134,8 +152,22 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(channels["models"], ["model-a"])
         self.assertEqual(channels["channels"][0]["effectiveMultiplier"], 0.1)
+        self.assertEqual(len(channels["channels"]), 3)
+        self.assertEqual(channels["channels"][1]["effectiveMultiplier"], 0.2)
+        self.assertIsNone(channels["channels"][2]["effectiveMultiplier"])
         self.assertEqual(channels["summary"]["providerCount"], 1)
         self.assertEqual(channels["summary"]["latestCheckedAt"], "2026-08-03T12:00:00+08:00")
+
+        status, legacy_operational = self.request("/api/channels?model=model-a&include_degraded=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(legacy_operational["channels"]), 1)
+
+        status, legacy_degraded = self.request("/api/channels?model=model-a&include_degraded=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [item["resolvedStatus"] for item in legacy_degraded["channels"]],
+            ["operational", "degraded"],
+        )
 
     def test_provider_update_order_settings_and_validation(self):
         status, result = self.request("/api/config/provider", "POST", {"provider": {
@@ -528,6 +560,33 @@ class ServerApiTests(unittest.TestCase):
             status, current = self.request("/api/local-sync/config", headers=headers)
             self.assertEqual(status, 200)
             self.assertEqual(applied["revision"], current["revision"])
+
+    def test_local_sync_auth_sessions_are_origin_scoped_and_secret(self):
+        with patch("server.set_local_secret") as save_secret:
+            status, result = self.request("/api/local-sync/auth", "POST", {
+                "sessions": [{
+                    "providerId": "channel-test",
+                    "origin": "https://channel.example",
+                    "authToken": "access-token",
+                    "refreshToken": "refresh-token",
+                    "expiresAt": "123456",
+                }]
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["synced"], 1)
+        secret_name, secret_value = save_secret.call_args.args
+        self.assertEqual(secret_name, "provider_auth_session:channel-test")
+        self.assertEqual(json.loads(secret_value)["authToken"], "access-token")
+
+        status, result = self.request("/api/local-sync/auth", "POST", {
+            "sessions": [{
+                "providerId": "channel-test",
+                "origin": "https://attacker.example",
+                "authToken": "access-token",
+            }]
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("origin", result["error"])
 
 
 if __name__ == "__main__":

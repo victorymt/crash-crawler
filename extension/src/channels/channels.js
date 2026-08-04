@@ -1,4 +1,4 @@
-import { availableChannelModels, rankAvailableChannels } from "../shared/channels.js";
+import { availableChannelModels, listChannels } from "../shared/channels.js";
 import { snapshotNeedsRetry } from "../shared/snapshots.js";
 
 let snapshots = [];
@@ -32,7 +32,10 @@ function setMessage(message, isError = false) {
 function setControlsDisabled(disabled) {
   document.getElementById("refresh-channels").disabled = disabled;
   document.getElementById("channel-model").disabled = disabled;
-  document.getElementById("include-degraded").disabled = disabled;
+  document.getElementById("channel-status").disabled = disabled;
+  document.getElementById("channel-availability").disabled = disabled;
+  document.getElementById("channel-rate").disabled = disabled;
+  document.getElementById("channel-provider").disabled = disabled;
   document.getElementById("options").disabled = disabled;
   document.getElementById("retry-channel-failed").disabled = disabled;
 }
@@ -78,7 +81,8 @@ function showRefreshProgress(run) {
 }
 
 function formatMultiplier(value) {
-  return Number.isFinite(value) ? `${Number(value.toFixed(4))}x` : "--";
+  const number = value == null || value === "" ? NaN : Number(value);
+  return Number.isFinite(number) ? `${Number(number.toFixed(4))}x` : "--";
 }
 
 function statusLabel(status) {
@@ -90,6 +94,7 @@ function rateSourceLabel(channel) {
   if (channel.rateSource === "peak") return "峰时倍率";
   if (channel.rateSource === "user") return "个人倍率";
   if (channel.rateSource === "monitor-name") return "监控倍率";
+  if (channel.rateSource === "unknown") return "未识别倍率";
   return "分组倍率";
 }
 
@@ -128,7 +133,10 @@ function channelRowHtml(channel, index) {
       <strong>${escapeHtml(formatMultiplier(channel.effectiveMultiplier))}</strong>
       <small>${escapeHtml(rateSourceLabel(channel))}</small>
     </span>`;
-  const className = `channel-row${index === 0 ? " best" : ""}`;
+  const hasRate = channel.effectiveMultiplier != null
+    && channel.effectiveMultiplier !== ""
+    && Number.isFinite(Number(channel.effectiveMultiplier));
+  const className = `channel-row${index === 0 && hasRate ? " best" : ""}`;
   return channel.monitorUrl
     ? `<a class="${className}" href="${escapeHtml(channel.monitorUrl)}" target="_blank" rel="noopener noreferrer">${content}</a>`
     : `<div class="${className}">${content}</div>`;
@@ -145,26 +153,55 @@ function render() {
   const modelSelect = document.getElementById("channel-model");
   const resultRoot = document.getElementById("channel-results");
   const models = availableChannelModels(snapshots);
+  const statusSelect = document.getElementById("channel-status");
+  const availabilitySelect = document.getElementById("channel-availability");
+  const rateSelect = document.getElementById("channel-rate");
+  const providerSelect = document.getElementById("channel-provider");
+  const selectedStatus = statusSelect.value;
+  const selectedAvailability = availabilitySelect.value || "all";
+  const selectedRate = rateSelect.value || "all";
+  const selectedProvider = providerSelect.value;
   const selectedModel = models.includes(settings.preferredChannelModel) ? settings.preferredChannelModel : "";
   modelSelect.innerHTML = [
     '<option value="">全部模型</option>',
     ...models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
   ].join("");
   modelSelect.value = selectedModel;
-
-  const includeDegraded = document.getElementById("include-degraded").checked;
-  const statuses = includeDegraded ? ["operational", "degraded"] : ["operational"];
-  const candidates = rankAvailableChannels(snapshots, selectedModel, { statuses });
+  const providers = [...new Map(snapshots.flatMap((snapshot) => (snapshot.channels || []).map((channel) => {
+    const id = channel.providerId || snapshot.id;
+    return [id, { id, name: channel.providerName || snapshot.name || id }];
+  }))).values()]
+    .sort((left, right) => left.name.localeCompare(right.name));
+  providerSelect.innerHTML = [
+    '<option value="">全部 Provider</option>',
+    ...providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`)
+  ].join("");
+  providerSelect.value = providers.some((provider) => String(provider.id) === String(selectedProvider)) ? selectedProvider : "";
+  const candidates = listChannels(snapshots, selectedModel, {
+    statuses: selectedStatus ? [selectedStatus] : null,
+    availabilityOnly: selectedAvailability === "available",
+    rateMode: selectedRate,
+    providerId: providerSelect.value
+  });
   const channelCount = snapshots.reduce((count, snapshot) => count + (snapshot.channels?.length || 0), 0);
+  const unrankedCount = snapshots.reduce((count, snapshot) => count + (snapshot.channels || []).filter(
+    (channel) => channel?.effectiveMultiplier == null
+      || channel.effectiveMultiplier === ""
+      || !Number.isFinite(Number(channel.effectiveMultiplier))
+  ).length, 0);
   const channelErrors = snapshots.filter((snapshot) => snapshot.channelError).length;
-  document.getElementById("channel-meta").textContent = channelErrors
-    ? `${candidates.length} 个候选 · ${channelErrors} 个 Provider 刷新失败`
-    : `${candidates.length} 个候选 · ${channelCount} 个监控渠道`;
+  const details = [
+    `${candidates.length} 个候选`,
+    `${channelCount} 个监控渠道`,
+    unrankedCount ? `${unrankedCount} 个渠道倍率未识别` : "",
+    channelErrors ? `${channelErrors} 个 Provider 刷新失败` : ""
+  ].filter(Boolean);
+  document.getElementById("channel-meta").textContent = details.join(" · ");
   document.getElementById("updated-at").textContent = `渠道更新 ${latestChannelCheck()}`;
 
   resultRoot.innerHTML = candidates.length
     ? candidates.map(channelRowHtml).join("")
-    : '<div class="empty">当前没有可用渠道</div>';
+    : '<div class="empty">当前没有符合筛选条件的渠道</div>';
   setControlsDisabled(activeOperation);
   setRetryVisible(hasFailedChannelSnapshots() || failedChannelRunCount > 0);
 }
@@ -317,7 +354,10 @@ document.getElementById("channel-model").addEventListener("change", async (event
   }
 });
 
-document.getElementById("include-degraded").addEventListener("change", render);
+document.getElementById("channel-status").addEventListener("change", render);
+document.getElementById("channel-availability").addEventListener("change", render);
+document.getElementById("channel-rate").addEventListener("change", render);
+document.getElementById("channel-provider").addEventListener("change", render);
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
 document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
 document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);

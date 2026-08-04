@@ -116,7 +116,15 @@ async function pushToLocalWeb() {
       expectedRevision: preview.revision
     })
   });
-  setMessage(`已推送到本地 Web：${syncSummary(applied.summary)}。`);
+  const auth = await sendMessage({ type: "localSync:getAuthSessions" });
+  const authResult = await localSyncRequest(localSyncSettings, "/api/local-sync/auth", {
+    method: "POST",
+    body: JSON.stringify({ sessions: auth.sessions || [] })
+  });
+  const authText = authResult.synced
+    ? `，同步 ${authResult.synced} 个 Provider 登录会话`
+    : "，没有发现可同步的已打开登录页面";
+  setMessage(`已推送到本地 Web：${syncSummary(applied.summary)}${authText}。`);
 }
 
 function openLocalWebPairingPage() {

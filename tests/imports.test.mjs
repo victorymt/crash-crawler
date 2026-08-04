@@ -151,12 +151,15 @@ test("channel ranking lives on a dedicated extension page", async () => {
   assert.doesNotMatch(popupHtml, /id="channel-results"/);
   assert.match(popupScript, /src\/channels\/channels\.html/);
   assert.match(channelsHtml, /id="channel-model"/);
-  assert.match(channelsHtml, /id="include-degraded"/);
+  assert.match(channelsHtml, /id="channel-status"/);
+  assert.match(channelsHtml, /id="channel-availability"/);
+  assert.match(channelsHtml, /id="channel-rate"/);
+  assert.match(channelsHtml, /id="channel-provider"/);
   assert.match(channelsHtml, /id="channel-results"/);
   assert.match(channelsHtml, /id="retry-channel-failed"/);
   assert.match(channelsHtml, /id="cancel-channel-refresh"/);
   assert.match(channelsHtml, /id="channel-refresh-progress"/);
-  assert.match(channelsScript, /rankAvailableChannels/);
+  assert.match(channelsScript, /listChannels/);
   assert.match(channelsScript, /statusTimelineHtml/);
   assert.match(channelsScript, /settings:save/);
   assert.match(channelsScript, /providers:refreshChannels/);

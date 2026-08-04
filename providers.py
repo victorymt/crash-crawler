@@ -48,6 +48,51 @@ SECRET_FILE = Path(os.environ.get("PROVIDER_SECRETS", ROOT / ".provider-secrets.
 DEFAULT_DUMP_DIR = Path(os.environ.get("PROVIDER_DUMP_DIR", ROOT / "dumps"))
 PROVIDER_SCHEMA_VERSION = 4
 
+# Chromium may detach the main document while a single-page app replaces its
+# root document. Playwright reports this as a low-level frame error; callers
+# should retry the navigation/evaluation once instead of storing a permanent
+# provider failure.
+FRAME_REMOVED_RE = re.compile(
+    r"frame with id .* was removed|frame was detached|execution context was destroyed",
+    re.I,
+)
+
+
+def is_transient_frame_error(error: BaseException) -> bool:
+    return bool(FRAME_REMOVED_RE.search(str(error)))
+
+
+def evaluate_with_frame_retry(page, script: str, argument: Any = None) -> Any:
+    """Evaluate in the current page, recovering once from a detached frame."""
+    for attempt in range(2):
+        try:
+            return page.evaluate(script, argument)
+        except Exception as exc:
+            if not is_transient_frame_error(exc) or attempt:
+                raise
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                # The next evaluation is still useful when the browser has
+                # already completed the replacement asynchronously.
+                pass
+    raise RuntimeError("unreachable")
+
+
+def goto_with_frame_retry(page, url: str, **kwargs: Any) -> Any:
+    """Navigate once more when an SPA detaches the current main frame."""
+    for attempt in range(2):
+        try:
+            return page.goto(url, **kwargs)
+        except Exception as exc:
+            if not is_transient_frame_error(exc) or attempt:
+                raise
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+    raise RuntimeError("unreachable")
+
 REQUEST_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -439,6 +484,51 @@ def delete_local_secret(name: str, path: Path = SECRET_FILE) -> None:
     set_local_secret(name, "", path)
 
 
+def provider_auth_secret_name(provider_id: str) -> str:
+    return f"provider_auth_session:{provider_id}"
+
+
+def load_provider_auth_session(config: ProviderConfig) -> dict[str, str]:
+    raw = load_local_secret(provider_auth_secret_name(config.id))
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {"authToken": raw}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: str(data.get(key) or "").strip()
+        for key in ("authToken", "refreshToken", "expiresAt")
+        if str(data.get(key) or "").strip()
+    }
+
+
+def install_provider_auth_session(page, config: ProviderConfig) -> bool:
+    session = load_provider_auth_session(config)
+    if not session.get("authToken") and not session.get("refreshToken"):
+        return False
+    session_json = json.dumps(session, ensure_ascii=True, separators=(",", ":"))
+    page.add_init_script(
+        f"""
+        (() => {{
+          const session = {session_json};
+          const values = {{
+            auth_token: session.authToken,
+            refresh_token: session.refreshToken,
+            token_expires_at: session.expiresAt,
+          }};
+          for (const [key, value] of Object.entries(values)) {{
+            if (value) globalThis.localStorage?.setItem(key, value);
+            else globalThis.localStorage?.removeItem(key);
+          }}
+        }})()
+        """,
+    )
+    return True
+
+
 def build_browser(profile_dir: str):
     try:
         from playwright.sync_api import sync_playwright
@@ -563,13 +653,17 @@ def wait_for_page_ready(
 
     try:
         page.wait_for_load_state("domcontentloaded", timeout=min(timeout_ms, 60000))
-    except Exception:
+    except Exception as exc:
+        if is_transient_frame_error(exc):
+            raise
         pass
 
     while time.monotonic() < deadline:
         try:
             body_text = page.inner_text("body")
-        except Exception:
+        except Exception as exc:
+            if is_transient_frame_error(exc):
+                raise
             page.wait_for_timeout(poll_ms)
             continue
 
@@ -591,7 +685,9 @@ def wait_for_page_ready(
 
     try:
         return page.inner_text("body")
-    except Exception:
+    except Exception as exc:
+        if is_transient_frame_error(exc):
+            raise
         return body_text
 
 
@@ -634,7 +730,35 @@ class BrowserSession:
 
     def page(self):
         context = self.context
-        return context.pages[0] if context.pages else context.new_page()
+        # Do not retain a page object after the tab has been closed or its
+        # document has been detached. A fresh page gives the next attempt a
+        # live main frame and avoids the misleading "Frame with ID 0 was
+        # removed" error from Playwright.
+        live_pages = []
+        for page in context.pages:
+            try:
+                if page.is_closed():
+                    continue
+                # Accessing url forces Playwright to validate the page's main
+                # frame and catches a detached document before navigation.
+                _ = page.url
+                live_pages.append(page)
+            except Exception:
+                self.discard_page(page)
+        return live_pages[0] if live_pages else context.new_page()
+
+    def discard_page(self, page=None) -> None:
+        target = page
+        if target is None:
+            try:
+                target = self.context.pages[0]
+            except Exception:
+                target = None
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
 
     def cookies(self, urls: str | list[str] | None = None) -> list[dict[str, Any]]:
         if urls is None:
@@ -2171,19 +2295,36 @@ class Provider:
 
     def explore(self, browser: BrowserSession | None = None) -> Path:
         with self.browser_page(browser) as page:
-            page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
+            goto_with_frame_retry(page, self.config.target_url, wait_until="domcontentloaded", timeout=60000)
             wait_for_page_ready(page, DEFAULT_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             return dump_tokens(self.config, page_tokens(page), page.title(), page.url)
 
     @contextmanager
     def browser_page(self, browser: BrowserSession | None = None) -> Iterator[Any]:
         if browser is not None:
-            yield browser.page()
+            auth_session = load_provider_auth_session(self.config)
+            page = browser.context.new_page() if auth_session else browser.page()
+            if auth_session:
+                install_provider_auth_session(page, self.config)
+            try:
+                yield page
+            except Exception as exc:
+                if is_transient_frame_error(exc):
+                    browser.discard_page(page)
+                raise
+            finally:
+                if auth_session:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
             return
         session = BrowserSession(self.config.profile_dir)
         session.start()
         try:
-            yield session.page()
+            page = session.page()
+            install_provider_auth_session(page, self.config)
+            yield page
         finally:
             session.close()
 
@@ -2195,8 +2336,7 @@ class BrowserJsonProvider(Provider):
     ready_pattern: re.Pattern[str] = DEFAULT_READY_PATTERN
 
     def page_api_json(self, page, url: str) -> Any:
-        result = page.evaluate(
-            """
+        script = """
             async (url) => {
               const token = globalThis.localStorage?.getItem("auth_token") || "";
               const headers = { Accept: "application/json" };
@@ -2206,9 +2346,8 @@ class BrowserJsonProvider(Provider):
               try { data = await response.json(); } catch { data = null; }
               return { ok: response.ok, status: response.status, data, hasToken: Boolean(token) };
             }
-            """,
-            url,
-        )
+            """
+        result = evaluate_with_frame_retry(page, script, url)
         if result.get("status") in (401, 403):
             raise NotLoggedInError(self.login_error)
         if not result.get("ok"):
@@ -2251,19 +2390,35 @@ class BrowserJsonProvider(Provider):
     ) -> tuple[str, list[str], list[dict[str, Any]]]:
         responses: list[dict[str, Any]] = []
         self.capture_json_responses(page, responses, host)
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-        body_text = wait_for_page_ready(
-            page,
-            ready_pattern=ready_pattern or self.ready_pattern,
-            timeout_ms=timeout_ms,
-            min_wait_ms=min_wait_ms,
-        )
-        login_probe = page.title() + "\n" + body_text
-        if is_login_html(page.url, login_probe, self.login_hints):
-            raise NotLoggedInError(self.login_error)
-        tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
-        tokens.extend(extract_json_payloads(responses))
-        return page.url, tokens, responses
+        for attempt in range(2):
+            try:
+                goto_with_frame_retry(page, url, wait_until="domcontentloaded", timeout=timeout)
+                body_text = wait_for_page_ready(
+                    page,
+                    ready_pattern=ready_pattern or self.ready_pattern,
+                    timeout_ms=timeout_ms,
+                    min_wait_ms=min_wait_ms,
+                )
+                login_probe = page.title() + "\n" + body_text
+                if is_login_html(page.url, login_probe, self.login_hints):
+                    raise NotLoggedInError(self.login_error)
+                tokens = [line.strip() for line in body_text.splitlines() if line.strip()]
+                tokens.extend(extract_json_payloads(responses))
+                return page.url, tokens, responses
+            except Exception as exc:
+                if not is_transient_frame_error(exc) or attempt:
+                    raise
+                # Keep the same Page object: callers continue using it for the
+                # API calls that follow navigation. The navigation helper has
+                # already attempted a reload; if this retry still fails the
+                # surrounding browser_page/manager layers discard the page and
+                # retry the provider with a fresh one.
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                responses = []
+        raise RuntimeError("unreachable")
 
     def captured_json_response(self, responses: list[dict[str, Any]], path: str) -> Any:
         """Return the newest successful JSON response for a path captured during navigation."""
@@ -2355,7 +2510,7 @@ class GenericPageProvider(Provider):
                     and any(rule.get(name) for name in ("selector", "usedSelector", "limitSelector"))
                 ]
                 try:
-                    page.goto(page_config["url"], wait_until="domcontentloaded", timeout=60000)
+                    goto_with_frame_retry(page, page_config["url"], wait_until="domcontentloaded", timeout=60000)
                     ready_selector = parser_rules.get("readySelector")
                     if ready_selector:
                         try:
@@ -2441,7 +2596,7 @@ class OpenCodeProvider(Provider):
     def refresh_cookies(self, browser: BrowserSession | None = None) -> list[dict[str, Any]]:
         host = urlparse(self.config.target_url).hostname or "opencode.ai"
         with self.browser_page(browser) as page:
-            page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
+            goto_with_frame_retry(page, self.config.target_url, wait_until="domcontentloaded", timeout=60000)
             wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             html = page.content()
             if is_login_html(page.url, html, OPENCODE_LOGIN_HINTS):
@@ -2472,7 +2627,7 @@ class OpenCodeProvider(Provider):
 
     def browser_fetch(self, browser: BrowserSession | None = None) -> dict[str, Any]:
         with self.browser_page(browser) as page:
-            page.goto(self.config.target_url, wait_until="domcontentloaded", timeout=60000)
+            goto_with_frame_retry(page, self.config.target_url, wait_until="domcontentloaded", timeout=60000)
             wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=12000)
             html = page.content()
             if is_login_html(page.url, html, OPENCODE_LOGIN_HINTS):
@@ -2484,7 +2639,7 @@ class OpenCodeProvider(Provider):
     def browser_billing_balances(self, page) -> list[dict[str, Any]]:
         billing_url = derive_opencode_billing_url(self.config.target_url)
         try:
-            page.goto(billing_url, wait_until="domcontentloaded", timeout=60000)
+            goto_with_frame_retry(page, billing_url, wait_until="domcontentloaded", timeout=60000)
             wait_for_page_ready(page, OPENCODE_READY_PATTERN, min_wait_ms=800, timeout_ms=10000)
             tokens = page_tokens(page)
             balances = parse_opencode_balance_tokens(tokens)
@@ -2530,6 +2685,37 @@ class DeepSeekProvider(Provider):
             raise ProviderError(deepseek_http_error_message(exc)) from exc
 
 
+def _available_group_count(payload: Any) -> int:
+    if isinstance(payload, dict):
+        data = payload.get("data", payload)
+    else:
+        data = payload
+    if isinstance(data, list):
+        if any(isinstance(item, dict) and item.get("platform") and not item.get("platforms") for item in data):
+            return len(data)
+        return sum(
+            len(platform.get("groups", []))
+            for category in data
+            if isinstance(category, dict)
+            for platform in category.get("platforms", [])
+            if isinstance(platform, dict)
+        )
+    if not isinstance(data, dict):
+        return 0
+    nested = data.get("items") or data.get("channels") or data.get("groups")
+    if not isinstance(nested, list):
+        return 0
+    return sum(
+        1 if item.get("platform") and not item.get("platforms") else sum(
+            len(platform.get("groups", []))
+            for platform in item.get("platforms", [])
+            if isinstance(platform, dict)
+        )
+        for item in nested
+        if isinstance(item, dict)
+    )
+
+
 class ChannelApiProvider(BrowserJsonProvider):
     def origin_url(self, path: str) -> str:
         parsed = urlparse(self.config.target_url)
@@ -2538,28 +2724,43 @@ class ChannelApiProvider(BrowserJsonProvider):
     def fetch_channel_payloads(
         self,
         page,
-        available_path: str,
+        available_path: str | tuple[str, ...] | list[str],
         timezone_name: str | None = None,
     ) -> tuple[Any, Any, Any, str | None]:
         suffix = f"?timezone={quote(timezone_name, safe='')}" if timezone_name else ""
-        requests = (
-            ("渠道状态", f"/api/v1/channel-monitors{suffix}"),
-            ("渠道分组", available_path),
-            ("用户倍率", "/api/v1/groups/rates"),
-        )
-        payloads = []
+        available_paths = (available_path,) if isinstance(available_path, str) else tuple(available_path)
         errors = []
-        for label, path in requests:
+        try:
+            monitors = self.page_api_json(page, self.origin_url(f"/api/v1/channel-monitors{suffix}"))
+        except NotLoggedInError:
+            raise
+        except Exception as exc:
+            errors.append(f"渠道状态: {exc}")
+            monitors = None
+
+        groups = None
+        for path in available_paths:
             try:
-                payloads.append(self.page_api_json(page, self.origin_url(path)))
+                candidate = self.page_api_json(page, self.origin_url(path))
+                if _available_group_count(candidate) > 0:
+                    groups = candidate
+                    break
             except NotLoggedInError:
                 raise
             except Exception as exc:
-                payloads.append(None)
-                errors.append(f"{label}: {exc}")
+                if "HTTP 404" not in str(exc):
+                    errors.append(f"渠道分组: {exc}")
+
+        try:
+            rates = self.page_api_json(page, self.origin_url("/api/v1/groups/rates"))
+        except NotLoggedInError:
+            raise
+        except Exception as exc:
+            errors.append(f"用户倍率: {exc}")
+            rates = None
         if errors:
             return None, None, None, "; ".join(errors)[:500]
-        return payloads[0], payloads[1], payloads[2], None
+        return monitors, groups, rates, None
 
 
 class NewAPIProvider(BrowserJsonProvider):
@@ -2568,8 +2769,7 @@ class NewAPIProvider(BrowserJsonProvider):
     ready_pattern = DEFAULT_READY_PATTERN
 
     def page_api_json_with_session_refresh(self, page, url: str) -> Any:
-        result = page.evaluate(
-            """
+        script = """
             async (url) => {
               const request = (headers = {}) => fetch(url, {
                 headers: { Accept: "application/json", ...headers },
@@ -2602,9 +2802,8 @@ class NewAPIProvider(BrowserJsonProvider):
               try { data = await response.json(); } catch {}
               return { ok: response.ok, status: response.status, data };
             }
-            """,
-            url,
-        )
+            """
+        result = evaluate_with_frame_retry(page, script, url)
         if result.get("status") in (401, 403):
             raise NotLoggedInError(self.login_error)
         if not result.get("ok"):
@@ -2654,7 +2853,7 @@ class Sub2APIProvider(ChannelApiProvider):
                 stats_payload = None
             monitors, groups, rates, channel_error = self.fetch_channel_payloads(
                 page,
-                "/api/v1/channels/available",
+                ("/api/v1/channels/available", "/api/v1/groups/available"),
             )
             channels = None if channel_error else parse_sub2api_channels(self.config, monitors, groups, rates)
             return sub2api_snapshot(
@@ -2923,7 +3122,16 @@ class ProviderManager:
             providers = self.cache.setdefault("providers", {})
             previous = providers.get(config.id)
         try:
-            snapshot = provider.fetch(browser=browser)
+            try:
+                snapshot = provider.fetch(browser=browser)
+            except Exception as exc:
+                if not is_transient_frame_error(exc):
+                    raise
+                # A SPA can detach the current document between navigation and
+                # the first DOM/API read. browser_page() drops the bad page;
+                # retrying the provider then obtains a live page from the same
+                # BrowserSession without poisoning the cached snapshot.
+                snapshot = provider.fetch(browser=browser)
         except Exception as exc:
             config = provider.config
             stale_metrics = previous.get("metrics", []) if previous else []

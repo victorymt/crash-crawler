@@ -45,7 +45,9 @@ export function classifyCollectionError(error) {
   }
   if (/grant access|permission|权限/i.test(message)) return COLLECTION_ERROR_CODES.PERMISSION_REQUIRED;
   if (/timed out|timeout|aborterror/i.test(message)) return COLLECTION_ERROR_CODES.TIMEOUT;
-  if (/tab was closed|browser tab was closed/i.test(message)) return COLLECTION_ERROR_CODES.TAB_CLOSED;
+  if (/tab was closed|browser tab was closed|frame with id .* was removed|frame was detached|execution context was destroyed/i.test(message)) {
+    return COLLECTION_ERROR_CODES.TAB_CLOSED;
+  }
   if (constructorName === "ParserNeedsFixtureError" || /no .*fields? were recognized|rules matched|schema|shape/i.test(message)) {
     return COLLECTION_ERROR_CODES.SCHEMA_MISMATCH;
   }

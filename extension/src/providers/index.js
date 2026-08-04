@@ -54,6 +54,10 @@ const SUB2API_AUTH_TOKEN_KEY = "auth_token";
 const SUB2API_SESSION_HINT = "authToken";
 const SUB2API_SESSION_TTL_MS = 20 * 60 * 1000;
 const SUB2API_API_TIMEZONE = "Asia/Shanghai";
+const SUB2API_AVAILABLE_GROUP_PATHS = [
+  "/api/v1/channels/available",
+  "/api/v1/groups/available"
+];
 const SILICONFLOW_SUBJECT_PROBE = "sf-subject-id";
 const SILICONFLOW_SESSION_HINT = "subjectId";
 const SILICONFLOW_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
@@ -199,6 +203,63 @@ async function fetchSub2ApiJson(url, token, providerName = "Sub2API") {
   });
 }
 
+function availableGroupCount(payload) {
+  const data = payload?.data ?? payload;
+  if (Array.isArray(data)) {
+    if (data.some((item) => item && typeof item === "object" && item.platform && !item.platforms)) {
+      return data.length;
+    }
+    return data.reduce((count, category) => count + (category?.platforms || []).reduce(
+      (platformCount, platform) => platformCount + (platform?.groups || []).length,
+      0
+    ), 0);
+  }
+  if (!data || typeof data !== "object") return 0;
+  const nested = data.items || data.channels || data.groups;
+  if (Array.isArray(nested)) {
+    return nested.reduce((count, item) => {
+      if (item?.platform && !item?.platforms) return count + 1;
+      return count + (item?.platforms || []).reduce(
+        (platformCount, platform) => platformCount + (platform?.groups || []).length,
+        0
+      );
+    }, 0);
+  }
+  return 0;
+}
+
+async function fetchSub2ApiAvailableGroups(origin, token, providerName) {
+  const failures = [];
+  let hadRequestError = false;
+  for (const path of SUB2API_AVAILABLE_GROUP_PATHS) {
+    try {
+      const payload = await fetchSub2ApiJson(`${origin}${path}`, token, providerName);
+      const count = availableGroupCount(payload);
+      if (count > 0) {
+        return {
+          payload,
+          endpoint: path,
+          fallbackUsed: path !== SUB2API_AVAILABLE_GROUP_PATHS[0],
+          groupCount: count
+        };
+      }
+      failures.push(`${path}: no usable groups`);
+    } catch (error) {
+      hadRequestError = true;
+      failures.push(`${path}: ${error?.message || error}`);
+    }
+  }
+  if (!hadRequestError) {
+    return {
+      payload: null,
+      endpoint: null,
+      fallbackUsed: false,
+      groupCount: 0
+    };
+  }
+  throw new Error(`No usable channel groups (${failures.join("; ")})`);
+}
+
 const RENDER_WAIT_MS = 12000;
 const DEFAULT_RENDER_WAIT_OPTIONS = {
   waitMs: RENDER_WAIT_MS,
@@ -224,6 +285,25 @@ const EZAICLUB_SUBSCRIPTION_WAIT_OPTIONS = {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientFrameError(error) {
+  return /frame with id .* was removed|frame was detached|execution context was destroyed/i
+    .test(String(error?.message || error || ""));
+}
+
+async function executeScriptWithFrameRetry(details, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await chrome.scripting.executeScript(details);
+    } catch (error) {
+      if (!isTransientFrameError(error) || attempt >= retries) throw error;
+      // Let the renderer finish replacing the document before trying the
+      // same script again. The tab itself remains the source of truth.
+      await delay(150);
+    }
+  }
+  throw new Error("unreachable");
 }
 
 async function notifyCollectionContext(context, hook, ...args) {
@@ -303,7 +383,7 @@ export async function extractTokensFromTab(tabId, waitOptions = {}, selectorRule
     maxSelectorValues: MAX_SELECTOR_VALUES,
     maxSelectorValueLength: MAX_SELECTOR_VALUE_LENGTH
   };
-  const [{ result } = {}] = await chrome.scripting.executeScript({
+  const [{ result } = {}] = await executeScriptWithFrameRetry({
     target: { tabId },
     func: async (options) => {
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -607,7 +687,7 @@ async function collectDeepSeek(config) {
 async function readTabLocalStorageKey(tabId, key) {
   if (!chrome.scripting?.executeScript || tabId == null) return "";
   try {
-    const [{ result } = {}] = await chrome.scripting.executeScript({
+    const [{ result } = {}] = await executeScriptWithFrameRetry({
       target: { tabId },
       func: (storageKey) => {
         try {
@@ -622,6 +702,54 @@ async function readTabLocalStorageKey(tabId, key) {
   } catch {
     return "";
   }
+}
+
+async function readTabProviderAuthSession(tabId) {
+  if (!chrome.scripting?.executeScript || tabId == null) return null;
+  try {
+    const [{ result } = {}] = await executeScriptWithFrameRetry({
+      target: { tabId },
+      func: () => {
+        try {
+          return {
+            authToken: globalThis.localStorage?.getItem("auth_token") || "",
+            refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
+            expiresAt: globalThis.localStorage?.getItem("token_expires_at") || ""
+          };
+        } catch {
+          return null;
+        }
+      }
+    });
+    if (!result || (!result.authToken && !result.refreshToken)) return null;
+    return {
+      authToken: String(result.authToken || "").slice(0, 8192),
+      refreshToken: String(result.refreshToken || "").slice(0, 8192),
+      expiresAt: String(result.expiresAt || "").slice(0, 128)
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function collectLocalSyncAuthSessions(configs = []) {
+  if (!chrome.tabs?.query || !chrome.scripting?.executeScript) return [];
+  const sessions = [];
+  for (const config of configs) {
+    if (!["sub2api", "ezaiclub"].includes(config?.type) || !config.targetUrl) continue;
+    const target = new URL(config.targetUrl);
+    const tabs = await chrome.tabs.query({ url: `${target.origin}/*` });
+    const tab = pickBestTab(tabs, config.targetUrl);
+    if (!tab?.id) continue;
+    const session = await readTabProviderAuthSession(tab.id);
+    if (!session) continue;
+    sessions.push({
+      providerId: config.id,
+      origin: target.origin,
+      ...session
+    });
+  }
+  return sessions;
 }
 
 async function getLocalStorageSessionValue(config, context, { storageKey, sessionHint, ttlMs }) {
@@ -823,7 +951,7 @@ async function collectEzaiclub(config, context) {
 async function readTabSiliconflowSubjectId(tabId) {
   if (!chrome.scripting?.executeScript || tabId == null) return "";
   try {
-    const [{ result } = {}] = await chrome.scripting.executeScript({
+    const [{ result } = {}] = await executeScriptWithFrameRetry({
       target: { tabId },
       // SF_SUBJECT_ID is created by the page application. The default isolated
       // world cannot observe page-owned JavaScript globals.
@@ -1137,14 +1265,13 @@ async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
     const authUrl = `${origin}/api/v1/auth/me?timezone=${timezone}`;
     const statsUrl = `${origin}/api/v1/usage/dashboard/stats?timezone=${timezone}`;
     const monitorsUrl = `${origin}/api/v1/channel-monitors`;
-    const availableUrl = `${origin}/api/v1/channels/available`;
     const ratesUrl = `${origin}/api/v1/groups/rates`;
     const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
     if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
     const [statsResult, monitorsResult, availableResult, ratesResult] = await Promise.allSettled([
       fetchSub2ApiJson(statsUrl, token, config.name),
       fetchSub2ApiJson(monitorsUrl, token, config.name),
-      fetchSub2ApiJson(availableUrl, token, config.name),
+      fetchSub2ApiAvailableGroups(origin, token, config.name),
       fetchSub2ApiJson(ratesUrl, token, config.name)
     ]);
     for (const result of [statsResult, monitorsResult, availableResult, ratesResult]) {
@@ -1163,8 +1290,11 @@ async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
       statsResult.status === "fulfilled" ? statsResult.value : null,
       {
         monitorsPayload: !channelCollectionFailed && monitorsResult.status === "fulfilled" ? monitorsResult.value : null,
-        availablePayload: !channelCollectionFailed && availableResult.status === "fulfilled" ? availableResult.value : null,
+        availablePayload: !channelCollectionFailed && availableResult.status === "fulfilled" ? availableResult.value.payload : null,
         ratesPayload: !channelCollectionFailed && ratesResult.status === "fulfilled" ? ratesResult.value : null,
+        availableEndpoint: availableResult.status === "fulfilled" ? availableResult.value.endpoint : null,
+        availableFallbackUsed: availableResult.status === "fulfilled" ? availableResult.value.fallbackUsed : false,
+        availableGroupCount: availableResult.status === "fulfilled" ? availableResult.value.groupCount : 0,
         channelError: channelErrors.length
           ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
           : null

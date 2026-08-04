@@ -49,7 +49,7 @@ uv run python -c 'import sys, playwright; print(sys.executable); print(playwrigh
 
 ```text
 http://127.0.0.1:19765/          Provider 看板
-http://127.0.0.1:19765/channels  最低倍率可用渠道
+http://127.0.0.1:19765/channels  渠道列表与倍率筛选
 http://127.0.0.1:19765/settings  Provider 与刷新设置
 ```
 
@@ -64,7 +64,7 @@ Provider 看板包含：
 - 按用户配置的分组和顺序展示余额、额度、订阅指标及错误状态。
 - 自动、全部、单 Provider 和渠道刷新共享同一个刷新协调器，不会同时争用浏览器会话或覆盖快照。
 
-渠道页汇总 Sub2API 类渠道监控数据，按模型筛选当前可用渠道，并按实际倍率从低到高排序。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率，可选择包含降级渠道。
+渠道页汇总 Sub2API 类渠道监控数据，默认展示全部已采集渠道，并可按模型、状态、可用性、倍率识别情况和 Provider 筛选；已识别倍率的渠道按实际倍率从低到高排序。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率。
 渠道刷新使用独立后台任务，支持进度、取消、失败项重试，并在服务重启后保留中断状态和已完成结果。
 
 设置页支持：
@@ -76,13 +76,15 @@ Provider 看板包含：
 - 在 DeepSeek Provider 编辑器内保存或清除本地 API Key。也可继续使用 `DEEPSEEK_API_KEY` 环境变量，环境变量优先。
 - 添加通用页面 Provider，以插件兼容的 `secondaryUrls` 和 `parserRules` JSON 配置多页面 CSS/正则解析。
 
-扩展设置页的“本地 Web 同步”支持从本地服务预览并拉取配置，或将扩展配置预览并推送到本地服务。配对令牌在 Web 设置页生成，可轮换；同步地址仅允许本机回环地址。应用同步时会校验配置 revision，预览后如果另一侧发生变化会拒绝覆盖。本地 Web 的所有写接口都要求当前配对令牌，内置页面会自动附加；自行调用 API 时需发送 `X-Provider-Sync-Token` 请求头。服务端同时拒绝非回环地址的 `Host` 请求。
+扩展设置页的“本地 Web 同步”支持从本地服务预览并拉取配置，或将扩展配置预览并推送到本地服务。推送配置时，扩展还会检查已打开的同域 Sub2API/EZAIClub 标签页；如果页面已经登录，会把该 Provider 的短期认证会话同步给本地 Web，供后续渠道刷新使用。配对令牌在 Web 设置页生成，可轮换；同步地址仅允许本机回环地址。应用同步时会校验配置 revision，预览后如果另一侧发生变化会拒绝覆盖。本地 Web 的所有写接口都要求当前配对令牌，内置页面会自动附加；自行调用 API 时需发送 `X-Provider-Sync-Token` 请求头。服务端同时拒绝非回环地址的 `Host` 请求。
+
+同步的认证会话只保存在本机 `.provider-secrets.json`，不会写入 Provider 配置、导出文件或刷新快照。会话过期或站点主动注销后，需要先在浏览器中重新登录，保持该 Provider 页面打开，再次点击“推送到 Web”。
 
 设置保存后，已经打开的 Provider 和渠道页面会自动重新读取配置；标签页重新获得焦点时也会检查最新分组和顺序。
 
 ## BrowserOS 登录态
 
-需要页面登录态的后端解析依赖 BrowserOS profile 副本。推荐先在 BrowserOS 里登录相关站点，然后在看板点击“同步登录态”，同步完成后再刷新 provider。
+一般页面采集仍可使用 BrowserOS profile 副本。推荐先在 BrowserOS 里登录相关站点，然后在看板点击“同步登录态”，同步完成后再刷新 Provider。对于使用 Local Storage 令牌的 Sub2API/EZAIClub 渠道，应优先使用扩展设置页的“推送到 Web”同步认证会话；复制一个正在运行的 Chromium profile 不保证能取得最新 Local Storage 内容。
 
 手动同步 fallback：
 
@@ -91,7 +93,7 @@ cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
 rm -f /home/cv/.browseros-crawler-profile/Singleton*
 ```
 
-BrowserOS 关闭时同步最干净。“打开主页”按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
+BrowserOS 关闭时同步 profile 最干净。“打开主页”按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
 
 ## 配置
 
@@ -205,9 +207,10 @@ uv run python crawler.py --provider PROVIDER_ID --explore
 Popup 主页面仍以 Provider 为主；点击“渠道”会打开独立的渠道页。该页面提供：
 
 - 汇总所有支持渠道数据的已配置 Provider。
-- 按模型筛选渠道，并默认按实际倍率从低到高排序。
+- 默认展示所有已采集渠道，并按已识别实际倍率从低到高排序；未识别倍率的渠道排在末尾。
+- 可按模型、监控状态、当前可用性、倍率是否已识别和 Provider 过滤；选择“当前可用”即可得到原来的最低倍率可用渠道视图。
 - 展示当前状态、最近状态时间线、倍率来源和最近检查时间。
-- 可选择是否包含降级渠道，也可只刷新支持渠道数据的 Provider。
+- 可只刷新支持渠道数据的 Provider。
 - 渠道刷新期间显示逐 Provider 进度，可取消当前任务；失败后可只重试异常渠道 Provider，关闭再打开页面也会继续显示仍在运行的任务。
 - 实际倍率按 `渠道显示倍率 / Provider 充值比例` 计算。例如充值比例为 `1:10` 时，配置 `rechargeRatio: 10`，显示倍率会再除以 10。
 

@@ -19,7 +19,12 @@ import {
   saveCurrentProviderSnapshot,
   setSecret
 } from "../shared/storage.js";
-import { channelProviderConfigs, collectProvider, detectProvider } from "../providers/index.js";
+import {
+  channelProviderConfigs,
+  collectLocalSyncAuthSessions,
+  collectProvider,
+  detectProvider
+} from "../providers/index.js";
 import { clearProviderSessionHints } from "../providers/session_cache.js";
 import { getRefreshRun } from "./refresh_job_store.js";
 import { recoverRefreshRun, runRefreshBatch } from "./refresh_runner.js";
@@ -544,6 +549,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "config:get":
         return { configs: await getProviderConfigs() };
+      case "localSync:getAuthSessions": {
+        const configs = await getProviderConfigs();
+        return { sessions: await collectLocalSyncAuthSessions(configs) };
+      }
       case "config:save": {
         const configs = await mutateConfigs(() => saveProviderConfigs(message.configs || []));
         await syncVisitObserver(configs);

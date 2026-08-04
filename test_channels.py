@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from channels import (
     effective_group_rate,
+    list_channels,
     parse_ezaiclub_channels,
     parse_sub2api_channels,
     rank_available_channels,
@@ -106,9 +107,26 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(summary, {
             "providerCount": 1,
             "channelCount": 1,
+            "unrankedCount": 1,
             "failedCount": 0,
             "latestCheckedAt": None,
         })
+
+    def test_channel_listing_keeps_error_and_unknown_rate_channels(self):
+        channels = parse_sub2api_channels(
+            {"id": "fast", "name": "Fast", "targetUrl": "https://fast.example/"},
+            {
+                "data": {"items": [
+                    {"id": 1, "name": "可用", "provider": "openai", "primary_model": "gpt", "primary_status": "operational"},
+                    {"id": 2, "name": "故障", "provider": "openai", "primary_model": "gpt", "primary_status": "error"},
+                ]}
+            },
+            {"data": []},
+        )
+        listed = list_channels([{"id": "fast", "status": "ok", "channels": channels}])
+        self.assertEqual([item["monitorId"] for item in listed], [1, 2])
+        self.assertEqual(list_channels([{"id": "fast", "status": "ok", "channels": channels}], statuses=["error"])[0]["monitorId"], 2)
+        self.assertEqual(list_channels([{"id": "fast", "status": "ok", "channels": channels}], rate_mode="unknown")[0]["monitorId"], 1)
 
 
 if __name__ == "__main__":

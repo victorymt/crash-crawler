@@ -30,3 +30,50 @@ test("local sync settings stay on loopback and requests carry the token", async 
   globalThis.fetch = originalFetch;
   globalThis.chrome = originalChrome;
 });
+
+test("local sync auth reads only open matching channel provider tabs", async () => {
+  const originalChrome = globalThis.chrome;
+  globalThis.chrome = {
+    tabs: {
+      async query({ url }) {
+        assert.equal(url, "https://fluxionai.space/*");
+        return [{ id: 42, url: "https://fluxionai.space/monitor" }];
+      }
+    },
+    scripting: {
+      async executeScript({ target }) {
+        assert.equal(target.tabId, 42);
+        return [{ result: {
+          authToken: "access-token",
+          refreshToken: "refresh-token",
+          expiresAt: "123456"
+        } }];
+      }
+    }
+  };
+  const { collectLocalSyncAuthSessions } = await import(
+    `../extension/src/providers/index.js?local-auth=${Date.now()}`
+  );
+  const sessions = await collectLocalSyncAuthSessions([
+    {
+      id: "fluxion",
+      name: "FluxionAI",
+      type: "sub2api",
+      targetUrl: "https://fluxionai.space/dashboard"
+    },
+    {
+      id: "page",
+      name: "Page",
+      type: "page",
+      targetUrl: "https://page.example/dashboard"
+    }
+  ]);
+  assert.deepEqual(sessions, [{
+    providerId: "fluxion",
+    origin: "https://fluxionai.space",
+    authToken: "access-token",
+    refreshToken: "refresh-token",
+    expiresAt: "123456"
+  }]);
+  globalThis.chrome = originalChrome;
+});

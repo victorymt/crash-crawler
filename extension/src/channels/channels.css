@@ -185,7 +185,7 @@ h2 {
 
 .filters {
   display: grid;
-  grid-template-columns: minmax(260px, 420px) auto minmax(0, 1fr);
+  grid-template-columns: repeat(5, minmax(120px, 1fr)) minmax(200px, auto);
   gap: 14px 22px;
   align-items: end;
   padding: 0 0 20px;
@@ -198,6 +198,21 @@ h2 {
   color: var(--muted);
   font-size: 12px;
   font-weight: 600;
+}
+
+.filter-control {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.filter-control select {
+  width: 100%;
+  min-width: 0;
+  padding: 0 28px 0 10px;
 }
 
 .model-filter select {
@@ -344,6 +359,7 @@ h2 {
 .channel-status.operational { color: var(--ok); }
 .channel-status.degraded { color: var(--warning); }
 .channel-status.error { color: var(--bad); }
+.channel-status.unknown { color: var(--muted); }
 
 .health-summary {
   display: flex;
@@ -425,7 +441,7 @@ h2 {
 
   .toolbar button { flex: 1; }
 
-  .filters { grid-template-columns: minmax(0, 1fr) auto; }
+  .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .channel-meta {
     grid-column: 1 / -1;

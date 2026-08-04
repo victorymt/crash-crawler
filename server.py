@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from channels import available_channel_models, rank_available_channels, summarize_channel_refresh
+from channels import available_channel_models, available_channel_providers, list_channels, summarize_channel_refresh
 from providers import (
     ProviderError,
     ProviderManager,
@@ -29,6 +29,7 @@ from providers import (
     delete_local_secret,
     links_for_config,
     load_local_secret,
+    provider_auth_secret_name,
     set_local_secret,
     sync_browseros_profile,
 )
@@ -530,16 +531,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/channels":
             query = parse_qs(parsed.query)
             selected_model = str(query.get("model", [""])[0])
+            selected_status = str(query.get("status", [""])[0]).strip()
+            rate_mode = str(query.get("rate", ["all"])[0]).strip() or "all"
+            provider_id = str(query.get("provider", [""])[0]).strip()
+            availability = str(query.get("availability", ["all"])[0]).strip() or "all"
+            # Keep the legacy parameter compatible without changing the new default
+            # (all channels). Its presence, including an explicit false value,
+            # means the caller still expects the old operational/degraded view.
+            has_legacy_status_filter = "include_degraded" in query
             include_degraded = str(query.get("include_degraded", [""])[0]).lower() in {"1", "true", "yes"}
+            has_new_channel_filter = any(key in query for key in ("status", "rate", "availability", "provider"))
+            legacy_available_mode = has_legacy_status_filter and not has_new_channel_filter
             snapshots = self.manager.list_snapshots()
-            candidates = rank_available_channels(
+            statuses = [selected_status] if selected_status else (
+                (["operational", "degraded"] if include_degraded else ["operational"])
+                if has_legacy_status_filter else None
+            )
+            effective_rate_mode = "known" if legacy_available_mode else rate_mode
+            candidates = list_channels(
                 snapshots,
                 selected_model,
-                statuses=("operational", "degraded") if include_degraded else ("operational",),
+                statuses=statuses,
+                rate_mode=effective_rate_mode if effective_rate_mode in {"all", "known", "unknown"} else "all",
+                provider_id=provider_id,
+                availability_only=availability == "available",
             )
+            if legacy_available_mode:
+                candidates = [
+                    channel for channel in candidates
+                    if channel.get("providerStatus") == "ok"
+                    and channel.get("channelsStale") is not True
+                    and channel.get("balanceAvailable")
+                ]
             self.send_json({
                 "channels": candidates,
                 "models": available_channel_models(snapshots),
+                "providers": available_channel_providers(snapshots),
                 "summary": summarize_channel_refresh(snapshots),
             })
             return
@@ -616,6 +643,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "summary": summary,
                         "nextRevision": config_revision(next_configs),
                     })
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/local-sync/auth":
+            try:
+                payload = self.read_json()
+                sessions = payload.get("sessions", [])
+                if not isinstance(sessions, list) or len(sessions) > 100:
+                    raise ValueError("sessions must be an array with at most 100 items")
+                configs, _ = self.store.snapshot()
+                configs_by_id = {config.id: config for config in configs}
+                synced = []
+                for item in sessions:
+                    if not isinstance(item, dict):
+                        raise ValueError("auth session must be an object")
+                    provider_id = str(item.get("providerId") or "").strip()
+                    config = configs_by_id.get(provider_id)
+                    if not config or config.type not in {"sub2api", "ezaiclub"}:
+                        raise ValueError(f"unsupported auth session provider: {provider_id}")
+                    expected = urlparse(config.target_url)
+                    supplied = urlparse(str(item.get("origin") or ""))
+                    if (
+                        supplied.scheme not in {"http", "https"}
+                        or supplied.username is not None
+                        or supplied.password is not None
+                        or (supplied.scheme, supplied.netloc) != (expected.scheme, expected.netloc)
+                    ):
+                        raise ValueError(f"auth session origin does not match Provider {provider_id}")
+                    auth_token = str(item.get("authToken") or "").strip()
+                    refresh_token = str(item.get("refreshToken") or "").strip()
+                    expires_at = str(item.get("expiresAt") or "").strip()
+                    if not auth_token and not refresh_token:
+                        continue
+                    if len(auth_token) > 8192 or len(refresh_token) > 8192 or len(expires_at) > 128:
+                        raise ValueError(f"auth session is too large for Provider {provider_id}")
+                    set_local_secret(
+                        provider_auth_secret_name(provider_id),
+                        json.dumps({
+                            "authToken": auth_token,
+                            "refreshToken": refresh_token,
+                            "expiresAt": expires_at,
+                        }, ensure_ascii=False),
+                    )
+                    synced.append(provider_id)
+                self.send_json({"ok": True, "synced": len(synced), "providers": synced})
             except Exception as exc:
                 self.send_api_error(exc)
             return

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   effectiveGroupRate,
+  listChannels,
   parseEzaiclubChannels,
   parseSub2ApiChannels,
   rankAvailableChannels,
@@ -125,6 +126,31 @@ test("FastAIToken channels join to groups and rank the lowest operational multip
   assert.equal(claude[0].effectiveMultiplier, 0.7);
 });
 
+test("channel listing keeps every monitor and supports status/rate/provider filters", () => {
+  const channels = parseSub2ApiChannels(config, monitorsPayload, availablePayload, { data: {} });
+  const all = listChannels([snapshot(channels)]);
+  assert.equal(all.length, 6);
+  assert.equal(all[0].monitorId, 6);
+  assert.equal(all.find((channel) => channel.monitorId === 8).resolvedStatus, "error");
+
+  assert.deepEqual(
+    listChannels([snapshot(channels)], "", { statuses: ["error"] }).map((channel) => channel.monitorId),
+    [8]
+  );
+  assert.deepEqual(
+    listChannels([snapshot(channels)], "", { rateMode: "known" }).map((channel) => channel.monitorId),
+    [6, 3, 4, 5, 7, 8]
+  );
+  assert.deepEqual(
+    listChannels([snapshot(channels)], "", { availabilityOnly: true }).map((channel) => channel.monitorId),
+    [6, 3, 4, 5, 7]
+  );
+  assert.deepEqual(
+    listChannels([snapshot(channels)], "", { providerId: "fastaitoken" }).length,
+    6
+  );
+});
+
 test("EZAIClub flat groups match monitor names and convert 1:10 recharge rates", () => {
   const channels = parseEzaiclubChannels({
     id: "ezaiclub",
@@ -213,6 +239,7 @@ test("channel refresh summaries count channels and partial failures", () => {
   ]), {
     providerCount: 3,
     channelCount: 3,
+    unrankedCount: 3,
     failedCount: 2
   });
 });
