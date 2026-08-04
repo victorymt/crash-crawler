@@ -20,8 +20,12 @@
       </nav>
       <div class="toolbar">
         <button id="refresh-channels" type="button" class="primary">刷新渠道</button>
+        <button id="cancel-channel-refresh" type="button" class="danger" hidden>取消刷新</button>
       </div>
-      <div id="message" class="message" aria-live="polite"></div>
+      <div class="operation-feedback">
+        <div id="message" class="message" aria-live="polite"></div>
+        <progress id="channel-refresh-progress" class="refresh-progress" max="1" value="0" hidden></progress>
+      </div>
     </div>
   </header>
   <main class="page-shell">

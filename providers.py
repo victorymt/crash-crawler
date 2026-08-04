@@ -3020,17 +3020,36 @@ class ProviderManager:
 
         return [results[config.id] for config in enabled]
 
-    def refresh_channels(self) -> list[dict[str, Any]]:
-        channel_configs = [
+    def refresh_channels(
+        self,
+        progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
+        configs: list[ProviderConfig] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[dict[str, Any]]:
+        channel_configs = (
+            self.channel_configs()
+            if configs is None
+            else copy.deepcopy([
+                config for config in configs
+                if config.enabled and config.type in {"ezaiclub", "sub2api"}
+            ])
+        )
+        with self._refresh_operation("channels"):
+            return self._refresh_channel_configs(
+                channel_configs, progress=progress, cancel_event=cancel_event
+            )
+
+    def channel_configs(self) -> list[ProviderConfig]:
+        return [
             config for config in self.enabled_configs()
             if config.type in {"ezaiclub", "sub2api"}
         ]
-        with self._refresh_operation("channels"):
-            return self._refresh_channel_configs(channel_configs)
 
     def _refresh_channel_configs(
         self,
         channel_configs: list[ProviderConfig],
+        progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
         results = []
         browser_groups: dict[str, list[str]] = {}
@@ -3042,7 +3061,33 @@ class ProviderManager:
                     config = next(
                         item for item in channel_configs if item.id == provider_id
                     )
-                    results.append(self._refresh_config(config, browser=session))
+                    if cancel_event and cancel_event.is_set():
+                        snapshot = {
+                            "id": provider_id,
+                            "name": config.name,
+                            "type": config.type,
+                            "status": "cancelled",
+                            "error": "刷新已取消",
+                        }
+                        if progress:
+                            progress("completed", config, snapshot)
+                        results.append(snapshot)
+                        continue
+                    if progress:
+                        progress("started", config, None)
+                    try:
+                        snapshot = self._refresh_config(config, browser=session)
+                    except Exception as exc:
+                        snapshot = {
+                            "id": provider_id,
+                            "name": config.name,
+                            "type": config.type,
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                    if progress:
+                        progress("completed", config, snapshot)
+                    results.append(snapshot)
         return results
 
     def explore(self, provider_id: str) -> Path:

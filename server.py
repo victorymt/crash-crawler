@@ -39,6 +39,9 @@ STATIC_DIR = ROOT / "static"
 DEFAULT_PORT = 19765
 LOCAL_SYNC_TOKEN_SECRET = "local_sync_token"
 REFRESH_JOB_FILE = Path(os.environ.get("PROVIDER_REFRESH_JOB", ROOT / ".refresh-job.json"))
+CHANNEL_REFRESH_JOB_FILE = Path(
+    os.environ.get("PROVIDER_CHANNEL_REFRESH_JOB", ROOT / ".refresh-channel-job.json")
+)
 
 
 def json_bytes(data: object) -> bytes:
@@ -86,9 +89,15 @@ class SyncRevisionConflict(ProviderError):
 class RefreshJobManager:
     """Run one refresh batch in the background and expose its live progress."""
 
-    def __init__(self, manager: ProviderManager, job_file: Path = REFRESH_JOB_FILE) -> None:
+    def __init__(
+        self,
+        manager: ProviderManager,
+        job_file: Path = REFRESH_JOB_FILE,
+        operation: str = "all",
+    ) -> None:
         self.manager = manager
         self.job_file = Path(job_file)
+        self.operation = operation
         self._lock = threading.RLock()
         self._cancel_event: threading.Event | None = None
         self._job: dict[str, object] | None = self._load()
@@ -136,11 +145,14 @@ class RefreshJobManager:
             if active:
                 raise RefreshBusyError(f"refresh already running: {active}")
 
-            configs = (
-                self.manager.enabled_configs()
-                if configs is None
-                else copy.deepcopy([config for config in configs if config.enabled])
-            )
+            if configs is None:
+                configs = (
+                    self.manager.enabled_configs()
+                    if self.operation == "all"
+                    else self.manager.channel_configs()
+                )
+            else:
+                configs = copy.deepcopy([config for config in configs if config.enabled])
             job_id = uuid.uuid4().hex
             self._job = {
                 "id": job_id,
@@ -186,8 +198,13 @@ class RefreshJobManager:
                 for item in self._job.get("providers", [])
                 if item.get("status") == "failed"
             }
+            available_configs = (
+                self.manager.enabled_configs()
+                if self.operation == "all"
+                else self.manager.channel_configs()
+            )
             configs = [
-                config for config in self.manager.enabled_configs()
+                config for config in available_configs
                 if config.id in failed_ids
             ]
             if not configs:
@@ -249,9 +266,10 @@ class RefreshJobManager:
                 ),
                 "configs": configs,
             }
-            if "cancel_event" in inspect.signature(self.manager.refresh_all).parameters:
+            refresh_method = getattr(self.manager, "refresh_channels" if self.operation == "channels" else "refresh_all")
+            if "cancel_event" in inspect.signature(refresh_method).parameters:
                 refresh_kwargs["cancel_event"] = cancel_event
-            self.manager.refresh_all(**refresh_kwargs)
+            refresh_method(**refresh_kwargs)
         except Exception as exc:
             with self._lock:
                 if not self._job or self._job["id"] != job_id:
@@ -321,6 +339,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     store = ConfigStore()
     manager = ProviderManager(configs=store.snapshot()[0])
     refresh_jobs = RefreshJobManager(manager)
+    channel_refresh_jobs = RefreshJobManager(
+        manager, job_file=CHANNEL_REFRESH_JOB_FILE, operation="channels"
+    )
     scheduler: AutoRefreshScheduler | None = None
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -428,6 +449,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/refresh":
             self.send_json({"refresh": self.refresh_jobs.current()})
+            return
+        if path == "/api/refresh-channels":
+            self.send_json({"refresh": self.channel_refresh_jobs.current()})
             return
         if path == "/api/config":
             configs, settings = self.store.snapshot()
@@ -582,8 +606,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/refresh-channels":
             try:
-                providers = self.manager.refresh_channels()
-                self.send_json({"providers": providers, "summary": summarize_channel_refresh(providers)})
+                refresh, created = self.channel_refresh_jobs.start(source="manual")
+                self.send_json(
+                    {"refresh": refresh, "started": created},
+                    HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                )
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/refresh-channels/cancel":
+            try:
+                refresh, cancelled = self.channel_refresh_jobs.cancel()
+                self.send_json({"refresh": refresh, "cancelled": cancelled})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/refresh-channels/retry":
+            try:
+                refresh, created = self.channel_refresh_jobs.retry_failed()
+                self.send_json(
+                    {"refresh": refresh, "started": created},
+                    HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                )
             except Exception as exc:
                 self.send_api_error(exc)
             return

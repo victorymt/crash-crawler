@@ -63,6 +63,9 @@ class ServerApiTests(unittest.TestCase):
         TestHandler.store = store
         TestHandler.manager = manager
         TestHandler.refresh_jobs = RefreshJobManager(manager, job_file=root / "refresh-job.json")
+        TestHandler.channel_refresh_jobs = RefreshJobManager(
+            manager, job_file=root / "channel-refresh-job.json", operation="channels"
+        )
         TestHandler.scheduler = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), TestHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -305,6 +308,41 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(result["refresh"]["status"], "cancelled")
         self.assertEqual(result["refresh"]["failureCount"], 0)
         self.assertEqual(result["refresh"]["cancelledCount"], 2)
+
+    def test_channel_refresh_runs_as_persisted_cancellable_job(self):
+        started = threading.Event()
+
+        def fake_refresh_channels(progress=None, configs=None, cancel_event=None):
+            config = configs[0]
+            progress("started", config, None)
+            started.set()
+            cancel_event.wait(timeout=2)
+            progress("completed", config, {
+                "id": config.id,
+                "status": "cancelled",
+                "error": "刷新已取消",
+            })
+            return []
+
+        self.server.RequestHandlerClass.manager.refresh_channels = fake_refresh_channels
+        status, result = self.request("/api/refresh-channels", "POST")
+        self.assertEqual(status, 202)
+        self.assertTrue(result["started"])
+        self.assertEqual(result["refresh"]["total"], 1)
+        self.assertTrue(started.wait(timeout=1))
+
+        status, result = self.request("/api/refresh-channels/cancel", "POST")
+        self.assertEqual(status, 200)
+        self.assertTrue(result["cancelled"])
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, result = self.request("/api/refresh-channels")
+            if result["refresh"]["status"] == "cancelled":
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["refresh"]["status"], "cancelled")
+        self.assertEqual(result["refresh"]["cancelledCount"], 1)
 
     def test_refresh_job_recovers_interrupted_state(self):
         job_file = Path(self.temporary.name) / "persisted-job.json"

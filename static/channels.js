@@ -31,7 +31,25 @@ function setMessage(message, isError = false) {
 }
 
 function setControlsDisabled(disabled) {
-  document.querySelectorAll("button, select, input").forEach((node) => { node.disabled = disabled; });
+  document.querySelectorAll("button, select, input").forEach((node) => {
+    node.disabled = disabled && node.id !== "cancel-channel-refresh";
+  });
+}
+
+function setCancelVisible(visible) {
+  const button = document.getElementById("cancel-channel-refresh");
+  button.hidden = !visible;
+  button.disabled = !visible;
+}
+
+function showRefreshProgress(job) {
+  const progress = document.getElementById("channel-refresh-progress");
+  progress.hidden = false;
+  progress.max = Math.max(1, Number(job.total || 0));
+  progress.value = Number(job.completed || 0);
+  const active = (job.providers || []).filter((item) => item.status === "refreshing").map((item) => item.name);
+  const current = active.length ? `正在刷新 ${active.slice(0, 2).join("、")}` : "正在准备浏览器";
+  setMessage(`渠道刷新进度 ${job.completed || 0}/${job.total || 0} · ${current}`);
 }
 
 function statusLabel(status) {
@@ -135,25 +153,84 @@ async function refreshChannels() {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
+  setCancelVisible(true);
   setMessage("正在刷新支持渠道监控的 Provider...");
   try {
-    const data = await requestJson("/api/refresh-channels", { method: "POST" });
-    await loadChannels();
-    const result = data.summary || {};
-    const failed = Number(result.failedCount) || 0;
-    setMessage(`已刷新 ${Number(result.providerCount) || 0} 个 Provider · ${Number(result.channelCount) || 0} 个渠道 · ${failed} 个异常`, failed > 0);
+    const data = await requestJson("/api/refresh-channels", { method: "POST", timeout: 20000 });
+    if (data.started) await monitorRefresh(data.refresh);
+    else setMessage("已有渠道刷新任务正在运行");
   } catch (error) {
     setMessage(error.name === "AbortError" ? "刷新超时" : error.message || "刷新失败", true);
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
+    setCancelVisible(false);
+  }
+}
+
+async function monitorRefresh(job) {
+  setCancelVisible(["running", "cancelling"].includes(job?.status));
+  while (["running", "cancelling"].includes(job?.status)) {
+    showRefreshProgress(job);
+    if (job.status === "cancelling") setMessage("正在取消渠道刷新...");
+    await new Promise((resolve) => window.setTimeout(resolve, 800));
+    const data = await requestJson("/api/refresh-channels", { timeout: 20000 });
+    job = data.refresh;
+    if (!job) throw new Error("渠道刷新任务状态已丢失");
+  }
+  await loadChannels();
+  setCancelVisible(false);
+  const failures = Number(job.failureCount || 0);
+  if (job.status === "cancelled") {
+    setMessage(`渠道刷新已取消：完成 ${job.completed}/${job.total}`);
+  } else if (job.status === "interrupted" || job.status === "failed") {
+    setMessage(`渠道刷新中断：${job.error || "后台任务失败"}`, true);
+  } else if (failures) {
+    setMessage(`渠道刷新完成：成功 ${job.successCount}，失败 ${failures}`, true);
+  } else {
+    setMessage(`渠道刷新完成：${job.completed}/${job.total}`);
+  }
+}
+
+async function cancelRefresh() {
+  if (!activeOperation) return;
+  const button = document.getElementById("cancel-channel-refresh");
+  button.disabled = true;
+  try {
+    const data = await requestJson("/api/refresh-channels/cancel", { method: "POST", timeout: 20000 });
+    if (data.cancelled) setMessage("正在取消渠道刷新...");
+  } catch (error) {
+    button.disabled = false;
+    setMessage(error.message || "取消渠道刷新失败", true);
+  }
+}
+
+async function initialize() {
+  await loadChannels();
+  const data = await requestJson("/api/refresh-channels", { timeout: 20000 });
+  if (!["running", "cancelling"].includes(data.refresh?.status)) {
+    if (data.refresh?.status === "interrupted") {
+      setMessage(`上次渠道刷新中断：${data.refresh.error || "服务重启导致任务中断"}`, true);
+    }
+    return;
+  }
+  activeOperation = true;
+  setControlsDisabled(true);
+  setCancelVisible(true);
+  try {
+    await monitorRefresh(data.refresh);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
   }
 }
 
 document.getElementById("channel-model").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("include-degraded").addEventListener("change", () => loadChannels().catch((error) => setMessage(error.message, true)));
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
+document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);
 window.providerConfigEvents?.subscribe(() => reloadChannelsIfVisible(true));
 window.addEventListener("focus", () => reloadChannelsIfVisible());
 document.addEventListener("visibilitychange", () => reloadChannelsIfVisible());
-loadChannels().catch((error) => setMessage(error.message || "读取渠道失败", true));
+initialize().catch((error) => setMessage(error.message || "读取渠道失败", true));
