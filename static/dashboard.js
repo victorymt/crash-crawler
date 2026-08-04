@@ -109,6 +109,12 @@ function setCancelVisible(visible) {
   button.disabled = !visible;
 }
 
+function setRetryVisible(visible) {
+  const button = document.getElementById("retry-failed");
+  button.hidden = !visible;
+  button.disabled = !visible || activeOperation;
+}
+
 function delay(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -190,6 +196,7 @@ async function monitorRefresh(job) {
   await loadStatus();
   const failures = Number(job.failureCount || 0);
   setCancelVisible(false);
+  setRetryVisible(failures > 0);
   if (job.status === "cancelled") {
     setMessage(`刷新已取消：完成 ${job.completed}/${job.total}`);
   } else if (job.status === "interrupted") {
@@ -208,12 +215,36 @@ async function refreshAll() {
   activeOperation = true;
   setControlsDisabled(true);
   setCancelVisible(true);
+  setRetryVisible(false);
   setMessage("正在创建刷新任务...");
   try {
     const data = await requestJson("/api/refresh", { method: "POST", timeout: 20000 });
     await monitorRefresh(data.refresh);
   } catch (error) {
     setMessage(error.name === "AbortError" ? "读取刷新进度超时" : error.message || "刷新失败", true);
+  } finally {
+    activeOperation = false;
+    setControlsDisabled(false);
+    setCancelVisible(false);
+  }
+}
+
+async function retryFailed() {
+  if (activeOperation) return;
+  activeOperation = true;
+  setControlsDisabled(true);
+  setRetryVisible(false);
+  setMessage("正在创建失败项重试任务...");
+  try {
+    const data = await requestJson("/api/refresh/retry", { method: "POST", timeout: 20000 });
+    if (!data.started) {
+      setMessage("当前没有可重试的失败 Provider");
+      return;
+    }
+    setCancelVisible(true);
+    await monitorRefresh(data.refresh);
+  } catch (error) {
+    setMessage(error.name === "AbortError" ? "读取重试进度超时" : error.message || "重试失败", true);
   } finally {
     activeOperation = false;
     setControlsDisabled(false);
@@ -239,6 +270,7 @@ async function initialize() {
   const data = await requestJson("/api/refresh", { timeout: 20000 });
   const persisted = data.refresh;
   if (!["running", "cancelling"].includes(persisted?.status)) {
+    setRetryVisible(Number(persisted?.failureCount || 0) > 0);
     if (persisted?.status === "interrupted" || persisted?.status === "failed") {
       setMessage(`上次刷新中断：${persisted.error || "后台任务失败"}`, true);
     } else if (persisted?.status === "cancelled") {
@@ -263,6 +295,7 @@ async function initialize() {
 }
 
 document.getElementById("refresh-all").addEventListener("click", refreshAll);
+document.getElementById("retry-failed").addEventListener("click", retryFailed);
 document.getElementById("cancel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("sync-auth").addEventListener("click", () => runOperation(
   "正在同步 BrowserOS 登录态...",

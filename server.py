@@ -124,7 +124,11 @@ class RefreshJobManager:
             except FileNotFoundError:
                 pass
 
-    def start(self, source: str = "manual") -> tuple[dict[str, object], bool]:
+    def start(
+        self,
+        source: str = "manual",
+        configs=None,
+    ) -> tuple[dict[str, object], bool]:
         with self._lock:
             if self._job and self._job["status"] in {"running", "cancelling"}:
                 return copy.deepcopy(self._job), False
@@ -132,7 +136,11 @@ class RefreshJobManager:
             if active:
                 raise RefreshBusyError(f"refresh already running: {active}")
 
-            configs = self.manager.enabled_configs()
+            configs = (
+                self.manager.enabled_configs()
+                if configs is None
+                else copy.deepcopy([config for config in configs if config.enabled])
+            )
             job_id = uuid.uuid4().hex
             self._job = {
                 "id": job_id,
@@ -168,6 +176,23 @@ class RefreshJobManager:
             )
             thread.start()
             return copy.deepcopy(self._job), True
+
+    def retry_failed(self) -> tuple[dict[str, object] | None, bool]:
+        with self._lock:
+            if not self._job or self._job.get("status") in {"running", "cancelling"}:
+                return copy.deepcopy(self._job), False
+            failed_ids = {
+                item.get("id")
+                for item in self._job.get("providers", [])
+                if item.get("status") == "failed"
+            }
+            configs = [
+                config for config in self.manager.enabled_configs()
+                if config.id in failed_ids
+            ]
+            if not configs:
+                return copy.deepcopy(self._job), False
+        return self.start(source="retry", configs=configs)
 
     def cancel(self) -> tuple[dict[str, object] | None, bool]:
         with self._lock:
@@ -542,6 +567,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 refresh, cancelled = self.refresh_jobs.cancel()
                 self.send_json({"refresh": refresh, "cancelled": cancelled})
+            except Exception as exc:
+                self.send_api_error(exc)
+            return
+        if path == "/api/refresh/retry":
+            try:
+                refresh, created = self.refresh_jobs.retry_failed()
+                self.send_json(
+                    {"refresh": refresh, "started": created},
+                    HTTPStatus.ACCEPTED if created else HTTPStatus.OK,
+                )
             except Exception as exc:
                 self.send_api_error(exc)
             return

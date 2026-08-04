@@ -220,6 +220,51 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(progress["refresh"]["successCount"], 1)
         self.assertEqual(progress["refresh"]["failureCount"], 0)
 
+    def test_refresh_retry_only_retries_failed_providers(self):
+        calls = []
+
+        def fake_refresh_all(progress=None, configs=None, cancel_event=None):
+            calls.append([config.id for config in configs])
+            for config in configs:
+                progress("started", config, None)
+                status = "error" if len(calls) == 1 and config.id == "deepseek" else "ok"
+                progress("completed", config, {
+                    "id": config.id,
+                    "status": status,
+                    "error": "测试失败" if status == "error" else None,
+                })
+            return []
+
+        self.server.RequestHandlerClass.manager.refresh_all = fake_refresh_all
+        status, result = self.request("/api/refresh", "POST")
+        self.assertEqual(status, 202)
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, result = self.request("/api/refresh")
+            if result["refresh"]["status"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["refresh"]["status"], "completed")
+        self.assertEqual(result["refresh"]["failureCount"], 1)
+
+        status, retry = self.request("/api/refresh/retry", "POST")
+        self.assertEqual(status, 202)
+        self.assertTrue(retry["started"])
+        self.assertEqual(retry["refresh"]["source"], "retry")
+        self.assertEqual(retry["refresh"]["total"], 1)
+        self.assertEqual(retry["refresh"]["providers"][0]["id"], "deepseek")
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            _, retry = self.request("/api/refresh")
+            if retry["refresh"]["status"] != "running":
+                break
+            time.sleep(0.01)
+        self.assertEqual(retry["refresh"]["status"], "completed")
+        self.assertEqual(retry["refresh"]["failureCount"], 0)
+        self.assertEqual(calls, [["deepseek", "channel-test"], ["deepseek"]])
+
     def test_refresh_cancel_marks_unstarted_providers_cancelled(self):
         refresh_started = threading.Event()
 
