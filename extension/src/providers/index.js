@@ -49,11 +49,17 @@ import {
   TAB_POLICIES
 } from "./runtime.js";
 import {
+  PROVIDER_AUTH_SESSION_SOURCES,
+  ProviderAuthSessionError,
+  bindProviderAuthIdentity,
+  mergeProviderAuthSession,
   normalizeProviderAuthSession,
   parseProviderAuthSession,
   providerAuthIsExpired,
+  providerAuthIdentityFromValue,
   providerAuthNeedsRefresh,
   providerAuthSessionChanged,
+  publicProviderAuthState,
   serializeProviderAuthSession,
   withProviderAuthMutation
 } from "./auth_session.js";
@@ -259,11 +265,18 @@ async function refreshSub2ApiTokens(config, session) {
         || !Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) {
       throw new Error("Sub2API token refresh failed");
     }
-    return {
+    return mergeProviderAuthSession(normalized, {
+      ...normalized,
       authToken,
       refreshToken,
-      expiresAt: String(Date.now() + expiresInSeconds * 1000)
-    };
+      expiresAt: String(Date.now() + expiresInSeconds * 1000),
+      source: PROVIDER_AUTH_SESSION_SOURCES.REFRESH,
+      updatedAt: new Date().toISOString()
+    }, {
+      providerId: config.id,
+      origin: new URL(config.targetUrl).origin,
+      source: PROVIDER_AUTH_SESSION_SOURCES.REFRESH
+    });
   });
 }
 
@@ -768,7 +781,7 @@ async function readTabLocalStorageKey(tabId, key) {
   }
 }
 
-async function readTabProviderAuthSession(tabId) {
+async function readTabProviderAuthSession(tabId, config) {
   if (!chrome.scripting?.executeScript || tabId == null) return null;
   try {
     const [{ result } = {}] = await executeScriptWithFrameRetry({
@@ -778,7 +791,8 @@ async function readTabProviderAuthSession(tabId) {
           return {
             authToken: globalThis.localStorage?.getItem("auth_token") || "",
             refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
-            expiresAt: globalThis.localStorage?.getItem("token_expires_at") || ""
+            expiresAt: globalThis.localStorage?.getItem("token_expires_at") || "",
+            authUser: globalThis.localStorage?.getItem("auth_user") || ""
           };
         } catch {
           return null;
@@ -786,11 +800,16 @@ async function readTabProviderAuthSession(tabId) {
       }
     });
     if (!result || (!result.authToken && !result.refreshToken)) return null;
-    return {
+    return normalizeProviderAuthSession({
+      providerId: config.id,
+      origin: new URL(config.targetUrl).origin,
+      ...providerAuthIdentityFromValue(result.authUser),
       authToken: String(result.authToken || "").slice(0, 8192),
       refreshToken: String(result.refreshToken || "").slice(0, 8192),
-      expiresAt: String(result.expiresAt || "").slice(0, 128)
-    };
+      expiresAt: String(result.expiresAt || "").slice(0, 128),
+      source: PROVIDER_AUTH_SESSION_SOURCES.BROWSER_TAB,
+      updatedAt: new Date().toISOString()
+    });
   } catch {
     return null;
   }
@@ -833,16 +852,39 @@ function providerAuthSessionHint(config) {
 async function loadCachedProviderAuthSession(config) {
   const serialized = await getSessionHint(config.id, providerAuthSessionHint(config));
   const session = parseProviderAuthSession(serialized);
-  if (session) return session;
+  const origin = new URL(config.targetUrl).origin;
+  if (session) {
+    return normalizeProviderAuthSession({
+      ...session,
+      providerId: session.providerId || config.id,
+      origin: session.origin || origin,
+      source: session.source || PROVIDER_AUTH_SESSION_SOURCES.LEGACY
+    });
+  }
   const legacyToken = await getSessionHint(
     config.id,
     scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl)
   );
-  return legacyToken ? normalizeProviderAuthSession({ authToken: legacyToken }) : null;
+  return legacyToken ? normalizeProviderAuthSession({
+    providerId: config.id,
+    origin,
+    authToken: legacyToken,
+    source: PROVIDER_AUTH_SESSION_SOURCES.LEGACY
+  }) : null;
 }
 
 async function saveCachedProviderAuthSession(config, session) {
-  const normalized = normalizeProviderAuthSession(session);
+  const current = await loadCachedProviderAuthSession(config);
+  const candidate = normalizeProviderAuthSession({
+    ...session,
+    providerId: session?.providerId || config.id,
+    origin: session?.origin || new URL(config.targetUrl).origin,
+    updatedAt: session?.updatedAt || new Date().toISOString()
+  });
+  const normalized = mergeProviderAuthSession(current, candidate, {
+    providerId: config.id,
+    origin: new URL(config.targetUrl).origin
+  });
   if (!normalized) return null;
   const expiresAt = Number(normalized.expiresAt);
   const ttlMs = Number.isFinite(expiresAt) && expiresAt > Date.now()
@@ -872,7 +914,7 @@ async function deleteCachedProviderAuthSession(config) {
   ]);
 }
 
-async function browserProviderAuthSession(config, context) {
+async function browserProviderAuthSession(config, context, { allowCreate = true } = {}) {
   const browser = globalThis.chrome;
   if (!browser?.scripting?.executeScript) return null;
   const origin = new URL(config.targetUrl).origin;
@@ -883,12 +925,13 @@ async function browserProviderAuthSession(config, context) {
       .filter((tab) => tab.id != null && tab.url)
       .sort((left, right) => tabMatchScore(right.url, target) - tabMatchScore(left.url, target));
     for (const tab of ranked) {
-      const session = await readTabProviderAuthSession(tab.id);
+      const session = await readTabProviderAuthSession(tab.id, config);
       if (session) {
         return { session, tabId: tab.id, close: async () => undefined };
       }
     }
   }
+  if (!allowCreate) return null;
   if (!browser.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return null;
   let tabId = null;
   try {
@@ -898,7 +941,7 @@ async function browserProviderAuthSession(config, context) {
     await notifyCollectionContext(context, "onTabCreated", tabId, config.targetUrl);
     await waitForTabComplete(tabId, 15000);
     for (let attempt = 0; attempt < 8; attempt += 1) {
-      const session = await readTabProviderAuthSession(tabId);
+      const session = await readTabProviderAuthSession(tabId, config);
       if (session) {
         const leasedTabId = tabId;
         return {
@@ -930,14 +973,45 @@ async function browserProviderAuthSession(config, context) {
   return null;
 }
 
-async function resolveProviderAuthSession(config, context, { forceBrowser = false } = {}) {
+async function resolveProviderAuthSession(
+  config,
+  context,
+  { forceBrowser = false, expectedSession = null } = {}
+) {
   if (!forceBrowser) {
     const cached = await loadCachedProviderAuthSession(config);
-    if (cached) return { session: cached, tabId: null, close: async () => undefined };
+    if (cached) {
+      const openBrowserSession = await browserProviderAuthSession(
+        config,
+        context,
+        { allowCreate: false }
+      );
+      if (!openBrowserSession) {
+        return { session: cached, tabId: null, close: async () => undefined };
+      }
+      openBrowserSession.session = mergeProviderAuthSession(
+        cached,
+        openBrowserSession.session,
+        {
+          providerId: config.id,
+          origin: new URL(config.targetUrl).origin,
+          source: PROVIDER_AUTH_SESSION_SOURCES.BROWSER_TAB
+        }
+      );
+      return openBrowserSession;
+    }
   }
   const browserSession = await browserProviderAuthSession(config, context);
   if (!browserSession) return null;
-  await saveCachedProviderAuthSession(config, browserSession.session);
+  browserSession.session = mergeProviderAuthSession(
+    expectedSession,
+    browserSession.session,
+    {
+      providerId: config.id,
+      origin: new URL(config.targetUrl).origin,
+      source: PROVIDER_AUTH_SESSION_SOURCES.BROWSER_TAB
+    }
+  );
   return browserSession;
 }
 
@@ -971,9 +1045,12 @@ export async function collectLocalSyncAuthSessions(configs = []) {
     const target = new URL(config.targetUrl);
     const tabs = await chrome.tabs.query({ url: `${target.origin}/*` });
     const tab = pickBestTab(tabs, config.targetUrl);
-    const tabSession = tab?.id ? await readTabProviderAuthSession(tab.id) : null;
+    const tabSession = tab?.id ? await readTabProviderAuthSession(tab.id, config) : null;
     const session = tabSession
-      ? await saveCachedProviderAuthSession(config, tabSession)
+      ? await withProviderAuthMutation(
+          config.id,
+          () => saveCachedProviderAuthSession(config, tabSession)
+        )
       : await loadCachedProviderAuthSession(config);
     if (!session) continue;
     sessions.push({
@@ -1479,60 +1556,59 @@ async function collectNewApi(config, context) {
 }
 
 async function getSub2ApiAuthSession(config, context) {
-  return withProviderAuthMutation(config.id, async () => {
-    let lease = await resolveProviderAuthSession(config, context);
-    if (!lease?.session) return null;
-    try {
-      let session = normalizeProviderAuthSession(lease.session);
-      if (!session) return null;
-      if (providerAuthNeedsRefresh(session) && session.refreshToken) {
-        try {
-          session = await refreshSub2ApiTokens(config, session);
-          session = await persistRotatedProviderAuthSession(config, session, lease.tabId);
-        } catch {
-          if (providerAuthIsExpired(session)) {
-            await deleteCachedProviderAuthSession(config);
-            await lease.close();
-            lease = await resolveProviderAuthSession(config, context, { forceBrowser: true });
-            session = normalizeProviderAuthSession(lease?.session);
-          }
+  let lease = await resolveProviderAuthSession(config, context);
+  if (!lease?.session) return null;
+  try {
+    let session = normalizeProviderAuthSession(lease.session);
+    if (!session) return null;
+    if (providerAuthNeedsRefresh(session) && session.refreshToken) {
+      try {
+        session = await refreshSub2ApiTokens(config, session);
+      } catch {
+        if (providerAuthIsExpired(session)) {
+          await lease.close();
+          lease = await resolveProviderAuthSession(config, context, {
+            forceBrowser: true,
+            expectedSession: session
+          });
+          session = normalizeProviderAuthSession(lease?.session);
         }
       }
-      return session?.authToken ? session : null;
-    } finally {
-      await lease?.close?.();
     }
-  });
+    return session?.authToken ? { ...session, _tabId: lease.tabId } : null;
+  } finally {
+    await lease?.close?.();
+  }
 }
 
 async function recoverSub2ApiAuthSession(config, context, previousSession) {
-  return withProviderAuthMutation(config.id, async () => {
-    const latest = await loadCachedProviderAuthSession(config);
-    if (latest?.authToken && providerAuthSessionChanged(previousSession, latest)) {
-      return latest;
-    }
-    const candidate = latest || normalizeProviderAuthSession(previousSession);
-    if (candidate?.refreshToken) {
-      try {
-        const refreshed = await refreshSub2ApiTokens(config, candidate);
-        return await persistRotatedProviderAuthSession(config, refreshed);
-      } catch {
-        // A logged-in page may already hold a newer token than the saved refresh token.
-      }
-    }
-
-    await deleteCachedProviderAuthSession(config);
-    const lease = await resolveProviderAuthSession(config, context, { forceBrowser: true });
+  const latest = await loadCachedProviderAuthSession(config);
+  if (latest?.authToken && providerAuthSessionChanged(previousSession, latest)) {
+    return latest;
+  }
+  const candidate = latest || normalizeProviderAuthSession(previousSession);
+  if (candidate?.refreshToken) {
     try {
-      const resynced = normalizeProviderAuthSession(lease?.session);
-      if (!resynced?.authToken || !providerAuthSessionChanged(previousSession, resynced)) {
-        return null;
-      }
-      return await saveCachedProviderAuthSession(config, resynced);
-    } finally {
-      await lease?.close?.();
+      const refreshed = await refreshSub2ApiTokens(config, candidate);
+      return { ...refreshed, _tabId: previousSession?._tabId ?? null };
+    } catch {
+      // A logged-in page may already hold a newer token than the saved refresh token.
     }
+  }
+
+  const lease = await resolveProviderAuthSession(config, context, {
+    forceBrowser: true,
+    expectedSession: candidate
   });
+  try {
+    const resynced = normalizeProviderAuthSession(lease?.session);
+    if (!resynced?.authToken || !providerAuthSessionChanged(previousSession, resynced)) {
+      return null;
+    }
+    return { ...resynced, _tabId: lease.tabId };
+  } finally {
+    await lease?.close?.();
+  }
 }
 
 async function collectSub2ApiWithSession(config, session) {
@@ -1545,6 +1621,16 @@ async function collectSub2ApiWithSession(config, session) {
   const ratesUrl = `${origin}/api/v1/groups/rates`;
   const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
   if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
+  const verifiedSession = bindProviderAuthIdentity(session, authPayload, {
+    providerId: config.id,
+    origin,
+    verifiedAt: new Date().toISOString()
+  });
+  const persistedSession = await persistRotatedProviderAuthSession(
+    config,
+    verifiedSession,
+    session._tabId ?? null
+  );
   const [statsResult, monitorsResult, availableResult, ratesResult] = await Promise.allSettled([
     fetchSub2ApiJson(statsUrl, token, config.name),
     fetchSub2ApiJson(monitorsUrl, token, config.name),
@@ -1572,6 +1658,7 @@ async function collectSub2ApiWithSession(config, session) {
       availableEndpoint: availableResult.status === "fulfilled" ? availableResult.value.endpoint : null,
       availableFallbackUsed: availableResult.status === "fulfilled" ? availableResult.value.fallbackUsed : false,
       availableGroupCount: availableResult.status === "fulfilled" ? availableResult.value.groupCount : 0,
+      authState: publicProviderAuthState(persistedSession || verifiedSession),
       channelError: channelErrors.length
         ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
         : null
@@ -1580,30 +1667,32 @@ async function collectSub2ApiWithSession(config, session) {
 }
 
 async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
-  let session = await getSub2ApiAuthSession(config, context);
-  if (!session?.authToken) {
-    if (probe) return null;
-    throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
-  }
-  try {
-    return await collectSub2ApiWithSession(config, session);
-  } catch (error) {
-    if (!(error instanceof NotLoggedInError)) throw error;
-    session = await recoverSub2ApiAuthSession(config, context, session);
+  return withProviderAuthMutation(config.id, async () => {
+    let session = await getSub2ApiAuthSession(config, context);
     if (!session?.authToken) {
       if (probe) return null;
-      throw error;
+      throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
     }
     try {
       return await collectSub2ApiWithSession(config, session);
-    } catch (retryError) {
-      if (retryError instanceof NotLoggedInError) {
-        await deleteCachedProviderAuthSession(config);
+    } catch (error) {
+      if (!(error instanceof NotLoggedInError)) throw error;
+      session = await recoverSub2ApiAuthSession(config, context, session);
+      if (!session?.authToken) {
         if (probe) return null;
+        throw error;
       }
-      throw retryError;
+      try {
+        return await collectSub2ApiWithSession(config, session);
+      } catch (retryError) {
+        if (retryError instanceof NotLoggedInError) {
+          await deleteCachedProviderAuthSession(config);
+          if (probe) return null;
+        }
+        throw retryError;
+      }
     }
-  }
+  });
 }
 
 async function collectSub2ApiViaPage(config, context) {
@@ -1635,6 +1724,7 @@ async function collectSub2Api(config, context) {
     );
     if (apiSnapshot) return apiSnapshot;
   } catch (error) {
+    if (error instanceof ProviderAuthSessionError) throw error;
     if (error instanceof NotLoggedInError) authenticationError = error;
   }
   try {

@@ -826,6 +826,7 @@ export function sub2ApiSnapshot(config, url, authPayload, statsPayload = null, c
     error: metrics.length ? null : "Sub2API returned an empty dashboard payload",
     raw: {
       source: "sub2api",
+      auth: channelData.authState ?? null,
       balance: balance ?? null,
       today_requests: todayRequests ?? null,
       total_requests: totalRequests ?? null,

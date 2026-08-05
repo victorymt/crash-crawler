@@ -5,6 +5,7 @@ export const COLLECTION_ERROR_CODES = Object.freeze({
   API_REJECTED: "API_REJECTED",
   SCHEMA_MISMATCH: "SCHEMA_MISMATCH",
   NEEDS_VISIT: "NEEDS_VISIT",
+  ACCOUNT_MISMATCH: "ACCOUNT_MISMATCH",
   TAB_CLOSED: "TAB_CLOSED",
   UNKNOWN: "UNKNOWN"
 });
@@ -38,6 +39,9 @@ export class NeedsVisitError extends CollectionError {
 
 export function classifyCollectionError(error) {
   if (KNOWN_ERROR_CODES.has(error?.code)) return error.code;
+  if (error?.code === "account_mismatch") {
+    return COLLECTION_ERROR_CODES.ACCOUNT_MISMATCH;
+  }
   const constructorName = error?.constructor?.name || "";
   const message = String(error?.message || error || "");
   if (constructorName === "NotLoggedInError" || /not logged in|sign in|登录/i.test(message)) {

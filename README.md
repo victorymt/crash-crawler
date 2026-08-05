@@ -107,6 +107,103 @@ rm -f /home/cv/.browseros-crawler-profile/Singleton*
 
 BrowserOS 关闭时同步 profile 最干净。“打开主页”按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
 
+## 登录态契约与手工验收
+
+扩展和本地 Web 使用内部的 Provider 认证会话 v1，结构定义见 [`schemas/provider-auth-session-v1.schema.json`](schemas/provider-auth-session-v1.schema.json)。会话按 `providerId` 和 Origin 隔离，并在 `/api/v1/auth/me` 返回稳定用户 ID 或用户名时绑定账号身份。`generation` 与 `updatedAt` 用于拒绝陈旧写入；已绑定账号收到另一账号的会话时会返回 `account_mismatch`，不会用旧账号凭据覆盖当前页面。
+
+快照只公开安全的 `raw.auth` 元数据，包括 `status`、`source`、`identityBound`、`generation`、`expiresAt` 和 `verifiedAt`。`authToken`、`refreshToken` 和用户名不会进入持久化快照、日志或 Provider 配置导出。完整登录会话只允许出现在扩展的 `chrome.storage.session` 或本地 Web 的 `.provider-secrets.json` 中。
+
+建议用同一个 Sub2API Provider 依次完成以下测试。不要在截图、日志或问题反馈中包含 Local Storage Token。
+
+### 1. 准备环境
+
+1. 使用 `uv run python server.py 19765` 重启本地 Web。
+2. 打开 `chrome://extensions/` 或 `edge://extensions/`，重新加载扩展。
+3. 在安装扩展的浏览器中登录测试 Provider，并保持同源页面打开。
+4. Web 实时会话测试还需要在 BrowserOS 中登录同一个账号；普通 Chrome/Edge 和 BrowserOS 的登录态相互独立。
+
+### 2. 扩展刷新和缓存复用
+
+1. 在扩展 Popup 中刷新测试 Provider。预期状态为 `ok`，余额、账号和用量正常更新，Provider 页面不被导航或关闭。
+2. 关闭 Provider 页面，不重启浏览器，再次刷新。预期扩展复用 `chrome.storage.session` 中的短期会话并成功刷新。
+3. 在 `chrome://extensions/` 的扩展 Service Worker Console 中检查快照：
+
+```js
+chrome.storage.local.get("providerSnapshots").then(({ providerSnapshots }) => {
+  const snapshot = Object.values(providerSnapshots || {})
+    .find((item) => item.type === "sub2api");
+  console.log({
+    id: snapshot?.id,
+    status: snapshot?.status,
+    errorCode: snapshot?.errorCode,
+    auth: snapshot?.raw?.auth,
+    secretLeak: /authToken|refreshToken|Bearer /.test(JSON.stringify(snapshot))
+  });
+});
+```
+
+预期 `auth.status` 为 `authenticated`、`identityBound` 为 `true`、`secretLeak` 为 `false`。如果站点没有提供稳定账号身份，`auth.status` 可能是 `identity_unbound`。
+
+### 3. 到期前主动轮换
+
+在 Provider 页面 DevTools Console 中将过期时间调整到 30 秒后，然后立即从扩展刷新：
+
+```js
+localStorage.setItem("token_expires_at", String(Date.now() + 30000));
+```
+
+预期 `/api/v1/auth/refresh` 请求一次，随后 `/api/v1/auth/me` 和数据接口成功；页面中的过期时间被更新到更远的未来，`raw.auth.generation` 增加，快照中仍没有 Token。真实站点必须兼容本文前述 Sub2API refresh 接口和响应结构。
+
+### 4. 扩展推送到本地 Web
+
+1. 打开 `http://127.0.0.1:19765/settings#local-sync`，复制配对令牌。
+2. 在扩展设置页的“本地 Web 同步”中填写地址 `http://127.0.0.1:19765`、配对令牌，并选择“合并”。
+3. 保持测试 Provider 的登录页面打开，点击“推送到 Web”并确认预览。
+
+预期先显示配置 revision 和变更摘要，完成后显示同步的 Provider 登录会话数量。使用错误令牌时应返回 `invalid local sync token`，且配置和登录态均不改变。认证会话只写入 `.provider-secrets.json`，导出的 Provider JSON 不应包含 Token。
+
+### 5. Web 与 BrowserOS 实时会话
+
+1. 在 BrowserOS 中打开并登录测试 Provider。
+2. 在 Web 看板点击“同步登录态”，预期显示已连接的 Provider 数量或名称。
+3. 刷新对应 Provider，预期状态为“正常”，原有 BrowserOS 标签页不被导航或关闭。
+4. 没有同源标签页时，Web 可以创建临时页；成功后自动关闭，检测到登录失效时则保留并置前。
+
+可在 Web 看板的 DevTools Console 检查公开状态：
+
+```js
+fetch("/api/providers").then((response) => response.json()).then((data) => {
+  const snapshot = data.providers.find((item) => item.type === "sub2api");
+  console.log({
+    id: snapshot?.id,
+    status: snapshot?.status,
+    errorCode: snapshot?.errorCode,
+    auth: snapshot?.raw?.auth,
+    secretLeak: /authToken|refreshToken|Bearer /.test(JSON.stringify(snapshot))
+  });
+});
+```
+
+预期 `secretLeak` 为 `false`。Web 的实时 BrowserOS 刷新只在对应页面的 Local Storage 中轮换凭据，不把 Token 写回本地 secret。
+
+### 6. 账号切换保护
+
+此项会改变测试账号状态，建议最后执行：
+
+1. 使用账号 A 完成一次扩展刷新。
+2. 不清除扩展缓存，在同一站点退出账号 A 并登录账号 B。
+3. 保持账号 B 页面打开，再次刷新同一个 Provider。
+
+预期刷新显示旧数据或失败，`errorCode` 为 `ACCOUNT_MISMATCH`，`raw.auth.status` 为 `account_mismatch`，错误信息包含 `different account`。账号 B 页面中的 Local Storage 不应被账号 A 的缓存覆盖。
+
+确认没有刷新任务运行后，可在扩展 Service Worker Console 清除临时状态，再次刷新以绑定账号 B：
+
+```js
+await chrome.storage.session.clear();
+```
+
+该操作会清除扩展的短期登录会话和临时刷新任务，但不会删除 Provider 配置和持久化快照。
+
 ## 配置
 
 默认不需要配置即可运行。推荐直接通过设置页管理。也可以从示例文件开始手工配置：

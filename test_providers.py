@@ -38,9 +38,11 @@ from providers import (
     refresh_sub2api_auth_session,
     sync_browseros_auth_sessions,
     sync_browseros_profile,
+    verify_provider_auth_session,
     wait_for_page_ready,
     is_transient_frame_error,
 )
+from provider_auth import ProviderAuthSessionError
 
 
 class ProviderParserTests(unittest.TestCase):
@@ -1021,6 +1023,46 @@ class ProviderParserTests(unittest.TestCase):
         saved = json.loads(save_secret.call_args.args[1])
         self.assertEqual(saved["authToken"], "next-access")
         self.assertEqual(saved["refreshToken"], "next-refresh")
+
+    def test_sub2api_verification_rejects_a_different_browseros_account(self):
+        config = ProviderConfig(
+            id="sub2api-account",
+            name="Sub2API Account",
+            type="sub2api",
+            target_url="https://relay.example/dashboard",
+        )
+
+        class FakePage:
+            def evaluate(self, _script, _argument=None):
+                return {
+                    "authToken": "bob-access",
+                    "refreshToken": "bob-refresh",
+                    "expiresAt": "9999999999999",
+                    "authUser": json.dumps({"id": "84", "username": "bob"}),
+                }
+
+        stored = {
+            "providerId": config.id,
+            "origin": "https://relay.example",
+            "userId": "42",
+            "username": "alice",
+            "authToken": "alice-access",
+            "refreshToken": "alice-refresh",
+            "updatedAt": "2020-01-01T00:00:00Z",
+        }
+        with (
+            patch("providers.load_provider_auth_session", return_value=stored),
+            patch("providers.save_provider_auth_session") as save_session,
+            self.assertRaises(ProviderAuthSessionError) as raised,
+        ):
+            verify_provider_auth_session(
+                FakePage(),
+                config,
+                {"data": {"id": "84", "username": "bob"}},
+                persist=False,
+            )
+        self.assertEqual(raised.exception.code, "account_mismatch")
+        save_session.assert_not_called()
 
     def test_sub2api_page_api_forces_refresh_after_unauthorized(self):
         config = ProviderConfig(

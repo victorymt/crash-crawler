@@ -92,6 +92,27 @@ export function errorSnapshot(config, previous, error) {
   const staleUsage = previous?.usage || [];
   const hasStaleData = Boolean(staleMetrics.length || staleBalances.length || staleUsage.length);
   const errorCode = classifyCollectionError(error);
+  const authStatus = {
+    ACCOUNT_MISMATCH: "account_mismatch",
+    NOT_LOGGED_IN: "login_required",
+    PERMISSION_REQUIRED: "permission_required",
+    NEEDS_VISIT: "browser_unavailable",
+    TAB_CLOSED: "browser_unavailable"
+  }[errorCode] || null;
+  const previousRaw = previous?.raw && typeof previous.raw === "object" ? previous.raw : {};
+  const raw = {
+    ...previousRaw,
+    ...(authStatus && providerSupportsCapability(
+      config.type,
+      PROVIDER_CAPABILITIES.LOCAL_SYNC_AUTH
+    ) ? {
+      auth: {
+        ...(previousRaw.auth && typeof previousRaw.auth === "object" ? previousRaw.auth : {}),
+        status: authStatus
+      }
+    } : {}),
+    ...(error?.collection ? { collection: error.collection } : {})
+  };
   return {
     id: config.id,
     name: config.name,
@@ -118,12 +139,7 @@ export function errorSnapshot(config, previous, error) {
     recommendation: previous?.recommendation || "watch",
     error: sanitizeDiagnosticMessage(error?.message || error),
     errorCode,
-    ...(error?.collection ? {
-      raw: {
-        ...(previous?.raw && typeof previous.raw === "object" ? previous.raw : {}),
-        collection: error.collection
-      }
-    } : {})
+    ...(Object.keys(raw).length ? { raw } : {})
   };
 }
 

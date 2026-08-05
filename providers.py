@@ -33,6 +33,23 @@ from provider_definitions import (
     provider_definition_types,
     provider_supports_capability,
 )
+from provider_auth import (
+    AUTH_STATUS_ACCOUNT_MISMATCH,
+    AUTH_STATUS_BROWSER_UNAVAILABLE,
+    AUTH_STATUS_LOGIN_REQUIRED,
+    AUTH_SOURCE_BROWSEROS,
+    AUTH_SOURCE_LEGACY,
+    AUTH_SOURCE_REFRESH,
+    AUTH_SOURCE_SECRET,
+    ProviderAuthSessionError,
+    bind_provider_auth_identity,
+    merge_provider_auth_sessions,
+    normalize_provider_auth_origin,
+    normalize_provider_auth_session,
+    parse_provider_auth_session,
+    provider_auth_identity_from_value,
+    public_provider_auth_state,
+)
 
 
 
@@ -383,6 +400,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def provider_auth_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def default_cookie_cache(provider_id: str) -> str:
     env_name = f"{provider_id.upper().replace('-', '_')}_COOKIE_CACHE"
     if os.environ.get(env_name):
@@ -516,45 +537,63 @@ def provider_auth_session_lock(provider_id: str) -> threading.RLock:
         return _PROVIDER_AUTH_LOCKS.setdefault(normalized, threading.RLock())
 
 
-def load_provider_auth_session(config: ProviderConfig) -> dict[str, str]:
+def provider_auth_origin(config: ProviderConfig) -> str:
+    return normalize_provider_auth_origin(config.target_url)
+
+
+def _normalize_stored_provider_auth_session(
+    config: ProviderConfig,
+    raw: str,
+) -> dict[str, Any]:
+    session = parse_provider_auth_session(raw)
+    if not session:
+        return {}
+    return normalize_provider_auth_session({
+        **session,
+        "providerId": session.get("providerId") or config.id,
+        "origin": session.get("origin") or provider_auth_origin(config),
+        "source": session.get("source") or (
+            AUTH_SOURCE_LEGACY if not raw.lstrip().startswith("{") else AUTH_SOURCE_SECRET
+        ),
+    })
+
+
+def load_provider_auth_session(config: ProviderConfig) -> dict[str, Any]:
     with provider_auth_session_lock(config.id):
         raw = load_local_secret(provider_auth_secret_name(config.id))
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {"authToken": raw}
-    if not isinstance(data, dict):
-        return {}
-    return {
-        key: str(data.get(key) or "").strip()
-        for key in ("authToken", "refreshToken", "expiresAt", "updatedAt")
-        if str(data.get(key) or "").strip()
-    }
+        return _normalize_stored_provider_auth_session(config, raw) if raw else {}
 
 
 def save_provider_auth_session(config: ProviderConfig, session: dict[str, Any]) -> bool:
-    normalized = {
-        key: str(session.get(key) or "").strip()
-        for key in ("authToken", "refreshToken", "expiresAt")
-        if str(session.get(key) or "").strip()
-    }
+    candidate = normalize_provider_auth_session({
+        **session,
+        "providerId": session.get("providerId") or config.id,
+        "origin": session.get("origin") or provider_auth_origin(config),
+        "source": session.get("source") or AUTH_SOURCE_SECRET,
+        "updatedAt": session.get("updatedAt") or provider_auth_now_iso(),
+    })
     with provider_auth_session_lock(config.id):
-        if not normalized.get("authToken") and not normalized.get("refreshToken"):
+        if not candidate:
             delete_local_secret(provider_auth_secret_name(config.id))
             return False
-        normalized["updatedAt"] = now_iso()
+        raw = load_local_secret(provider_auth_secret_name(config.id))
+        current = _normalize_stored_provider_auth_session(config, raw) if raw else {}
+        merged = merge_provider_auth_sessions(
+            current,
+            candidate,
+            provider_id=config.id,
+            origin=provider_auth_origin(config),
+            source=candidate.get("source") or AUTH_SOURCE_SECRET,
+        )
         set_local_secret(
             provider_auth_secret_name(config.id),
-            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
         )
     return True
 
 
-def read_provider_auth_session(page, config: ProviderConfig) -> dict[str, str]:
-    target = urlparse(config.target_url)
-    expected_origin = f"{target.scheme}://{target.netloc}"
+def read_provider_auth_session(page, config: ProviderConfig) -> dict[str, Any]:
+    expected_origin = provider_auth_origin(config)
     script = """
         (expectedOrigin) => {
           try {
@@ -562,7 +601,8 @@ def read_provider_auth_session(page, config: ProviderConfig) -> dict[str, str]:
             return {
               authToken: globalThis.localStorage?.getItem("auth_token") || "",
               refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
-              expiresAt: globalThis.localStorage?.getItem("token_expires_at") || ""
+              expiresAt: globalThis.localStorage?.getItem("token_expires_at") || "",
+              authUser: globalThis.localStorage?.getItem("auth_user") || ""
             };
           } catch {
             return null;
@@ -573,11 +613,19 @@ def read_provider_auth_session(page, config: ProviderConfig) -> dict[str, str]:
     if not isinstance(result, dict):
         return {}
     limits = {"authToken": 8192, "refreshToken": 8192, "expiresAt": 128}
-    return {
+    values = {
         key: str(result.get(key) or "").strip()[:limit]
         for key, limit in limits.items()
         if str(result.get(key) or "").strip()
     }
+    return normalize_provider_auth_session({
+        "providerId": config.id,
+        "origin": expected_origin,
+        **provider_auth_identity_from_value(result.get("authUser")),
+        **values,
+        "source": AUTH_SOURCE_BROWSEROS,
+        "updatedAt": provider_auth_now_iso(),
+    })
 
 
 def persist_provider_auth_session(page, config: ProviderConfig, previous: dict[str, str]) -> bool:
@@ -587,11 +635,14 @@ def persist_provider_auth_session(page, config: ProviderConfig, previous: dict[s
         return False
     if not current:
         return False
-    merged = {
-        key: current.get(key) or previous.get(key, "")
-        for key in ("authToken", "refreshToken", "expiresAt")
-    }
     try:
+        merged = merge_provider_auth_sessions(
+            previous,
+            current,
+            provider_id=config.id,
+            origin=provider_auth_origin(config),
+            source=AUTH_SOURCE_BROWSEROS,
+        )
         return save_provider_auth_session(config, merged)
     except Exception:
         return False
@@ -601,10 +652,9 @@ def install_provider_auth_session(page, config: ProviderConfig, session: dict[st
     session = session or load_provider_auth_session(config)
     if not session.get("authToken") and not session.get("refreshToken"):
         return False
-    target = urlparse(config.target_url)
     session_json = json.dumps({
         **session,
-        "origin": f"{target.scheme}://{target.netloc}",
+        "origin": provider_auth_origin(config),
     }, ensure_ascii=True, separators=(",", ":"))
     page.add_init_script(
         f"""
@@ -633,8 +683,7 @@ def refresh_sub2api_auth_session(
     force: bool = False,
     persist: bool = True,
 ) -> bool:
-    target = urlparse(config.target_url)
-    origin = f"{target.scheme}://{target.netloc}"
+    origin = provider_auth_origin(config)
     script = """
         async ({ origin, force, bufferMs }) => {
           try {
@@ -643,6 +692,7 @@ def refresh_sub2api_auth_session(
               authToken: globalThis.localStorage?.getItem("auth_token") || "",
               refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
               expiresAt: globalThis.localStorage?.getItem("token_expires_at") || "",
+              authUser: globalThis.localStorage?.getItem("auth_user") || "",
             });
             const current = readSession();
             const expiresAt = Number(current.expiresAt);
@@ -691,7 +741,12 @@ def refresh_sub2api_auth_session(
             globalThis.localStorage?.setItem("token_expires_at", expiresAtValue);
             return {
               refreshed: true,
-              session: { authToken, refreshToken, expiresAt: expiresAtValue },
+              session: {
+                authToken,
+                refreshToken,
+                expiresAt: expiresAtValue,
+                authUser: current.authUser,
+              },
             };
           } catch {
             return { refreshed: false };
@@ -708,12 +763,58 @@ def refresh_sub2api_auth_session(
     session = result.get("session")
     if not isinstance(session, dict):
         return False
-    return save_provider_auth_session(config, session) if persist else True
+    expected = load_provider_auth_session(config)
+    merged = merge_provider_auth_sessions(
+        expected,
+        {
+            **provider_auth_identity_from_value(session.get("authUser")),
+            **session,
+            "providerId": config.id,
+            "origin": origin,
+            "source": AUTH_SOURCE_REFRESH,
+            "updatedAt": provider_auth_now_iso(),
+        },
+        provider_id=config.id,
+        origin=origin,
+        source=AUTH_SOURCE_REFRESH,
+    )
+    return save_provider_auth_session(config, merged) if persist else True
+
+
+def verify_provider_auth_session(
+    page,
+    config: ProviderConfig,
+    auth_payload: Any,
+    *,
+    persist: bool,
+) -> dict[str, Any]:
+    expected = load_provider_auth_session(config)
+    try:
+        current = read_provider_auth_session(page, config)
+    except Exception:
+        current = {}
+    session = merge_provider_auth_sessions(
+        expected,
+        current or expected,
+        provider_id=config.id,
+        origin=provider_auth_origin(config),
+        source=current.get("source") if current else expected.get("source", ""),
+    )
+    verified = bind_provider_auth_identity(
+        session,
+        auth_payload,
+        provider_id=config.id,
+        origin=provider_auth_origin(config),
+        source=session.get("source", ""),
+        verified_at=provider_auth_now_iso(),
+    )
+    if persist and verified:
+        save_provider_auth_session(config, verified)
+    return verified
 
 
 def validate_sub2api_browser_session(page, config: ProviderConfig) -> bool:
-    target = urlparse(config.target_url)
-    endpoint = f"{target.scheme}://{target.netloc}/api/v1/auth/me"
+    endpoint = f"{provider_auth_origin(config)}/api/v1/auth/me"
     script = """
         async (url) => {
           const token = globalThis.localStorage?.getItem("auth_token") || "";
@@ -756,6 +857,12 @@ def validate_sub2api_browser_session(page, config: ProviderConfig) -> bool:
         )
     if not result.get("ok"):
         raise ProviderError(f"{config.name} auth check returned HTTP {status}")
+    verify_provider_auth_session(
+        page,
+        config,
+        result.get("data"),
+        persist=False,
+    )
     return True
 
 
@@ -2766,6 +2873,7 @@ def sub2api_snapshot(
     stats_payload: Any = None,
     channels: list[dict[str, Any]] | None = None,
     channel_error: str | None = None,
+    auth_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     user = _payload_data(auth_payload)
     if not user:
@@ -2818,6 +2926,10 @@ def sub2api_snapshot(
         "links": links_for_config(config),
         "recommendation": recommendation_from_usage(usage) if usage else recommendation_from_balances(balances),
         "error": None if metrics else "Sub2API returned an empty dashboard payload",
+        "raw": {
+            "source": "sub2api",
+            "auth": public_provider_auth_state(auth_session),
+        },
     }
 
 
@@ -3503,6 +3615,12 @@ class Sub2APIProvider(ChannelApiProvider):
                         f"/api/v1/auth/me?timezone={timezone_query}"
                     ),
                 )
+                verified_auth_session = verify_provider_auth_session(
+                    page,
+                    self.config,
+                    auth_payload,
+                    persist=not self._live_browseros,
+                )
                 try:
                     stats_payload = self.page_api_json(
                         page,
@@ -3528,6 +3646,7 @@ class Sub2APIProvider(ChannelApiProvider):
                     stats_payload,
                     channels=channels,
                     channel_error=channel_error,
+                    auth_session=verified_auth_session,
                 )
         finally:
             self._live_browseros = previous_live_mode
@@ -3837,6 +3956,29 @@ class ProviderManager:
                 "recommendation": previous.get("recommendation", "watch") if previous else "watch",
                 "error": str(exc),
             }
+            if provider_supports_capability(
+                config.type, PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH
+            ):
+                try:
+                    auth_state = public_provider_auth_state(
+                        load_provider_auth_session(config)
+                    )
+                except Exception:
+                    auth_state = public_provider_auth_state({})
+                if (
+                    isinstance(exc, ProviderAuthSessionError)
+                    and exc.code == AUTH_STATUS_ACCOUNT_MISMATCH
+                ):
+                    auth_state["status"] = AUTH_STATUS_ACCOUNT_MISMATCH
+                elif isinstance(exc, NotLoggedInError):
+                    auth_state["status"] = AUTH_STATUS_LOGIN_REQUIRED
+                elif "BrowserOS" in str(exc):
+                    auth_state["status"] = AUTH_STATUS_BROWSER_UNAVAILABLE
+                previous_raw = previous.get("raw", {}) if previous else {}
+                snapshot["raw"] = {
+                    **(previous_raw if isinstance(previous_raw, dict) else {}),
+                    "auth": auth_state,
+                }
         if snapshot.get("channels") is None:
             previous_channels = previous.get("channels", []) if previous else []
             snapshot["channels"] = previous_channels

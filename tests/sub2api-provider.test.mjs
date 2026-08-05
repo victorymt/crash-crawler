@@ -162,6 +162,10 @@ test("sub2api provider collects dashboard data with localStorage bearer token", 
     assert.equal(snapshot.metrics.some((item) => item.label === "今日请求" && item.value === "199"), true);
     assert.equal(snapshot.usage.some((item) => item.label === "累计消费"), true);
     assert.equal(snapshot.raw.source, "sub2api");
+    assert.equal(snapshot.raw.auth.status, "authenticated");
+    assert.equal(snapshot.raw.auth.identityBound, true);
+    assert.equal("authToken" in snapshot.raw.auth, false);
+    assert.equal("username" in snapshot.raw.auth, false);
     assert.equal(snapshot.channels.length, 1);
     assert.equal(snapshot.channels[0].groupId, 21);
     assert.equal(snapshot.channels[0].effectiveMultiplier, 0.06);
@@ -340,6 +344,58 @@ test("sub2api resyncs a newer browser session when refresh after 401 fails", asy
     assert.deepEqual(authAttempts, ["Bearer stale-access", "Bearer browser-access"]);
     assert.equal(snapshot.status, "ok");
     assert.equal(chromeState.session.authToken, "browser-access");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sub2api rejects a browser session from a different account", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  const chromeState = installSub2ApiChromeStub({
+    authToken: "alice-access",
+    refreshToken: "",
+    expiresAt: String(Date.now() + 60 * 60 * 1000),
+    authUser: JSON.stringify({ id: "42", username: "alice" })
+  });
+  let authRequests = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/api/v1/auth/me") {
+      authRequests += 1;
+      const authorization = options.headers?.Authorization || "";
+      if (authorization === "Bearer alice-access") {
+        return jsonResponse(url, { data: { id: "42", username: "alice", balance: 5 } });
+      }
+      return jsonResponse(url, { message: "expired" }, 401);
+    }
+    return jsonResponse(url, { message: "not found" }, 404);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?sub2api-account=${Date.now()}`);
+    const config = {
+      id: "sub2api-account",
+      name: "Sub2API Account",
+      type: "sub2api",
+      targetUrl: "https://account.example.test/dashboard",
+      enabled: true,
+      secondaryUrls: []
+    };
+    assert.equal((await collectProvider(config)).status, "ok");
+
+    chromeState.setSession({
+      authToken: "bob-access",
+      refreshToken: "",
+      authUser: JSON.stringify({ id: "84", username: "bob" })
+    });
+    await assert.rejects(
+      collectProvider(config),
+      (error) => error?.code === "ACCOUNT_MISMATCH"
+    );
+    assert.equal(authRequests, 1);
+    assert.equal(chromeState.session.authToken, "bob-access");
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;

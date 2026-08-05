@@ -35,10 +35,18 @@ from providers import (
     delete_local_secret,
     links_for_config,
     load_local_secret,
+    load_provider_auth_session,
+    provider_auth_origin,
     provider_auth_session_lock,
-    provider_auth_secret_name,
+    save_provider_auth_session,
     set_local_secret,
     sync_browseros_auth_sessions,
+)
+from provider_auth import (
+    AUTH_SOURCE_LOCAL_SYNC,
+    normalize_provider_auth_origin,
+    normalize_provider_auth_session,
+    provider_auth_session_is_stale,
 )
 from web_store import ConfigStore, providers_from_import_document
 
@@ -404,20 +412,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return data
 
     def send_api_error(self, exc: Exception) -> None:
+        payload = {"error": str(exc)}
+        error_code = str(getattr(exc, "code", "") or "").strip()
+        if error_code:
+            payload["code"] = error_code
         if isinstance(exc, HostValidationError):
-            self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+            self.send_json(payload, HTTPStatus.FORBIDDEN)
         elif isinstance(exc, SyncAuthError):
-            self.send_json({"error": str(exc)}, HTTPStatus.UNAUTHORIZED)
+            self.send_json(payload, HTTPStatus.UNAUTHORIZED)
         elif isinstance(exc, SyncRevisionConflict):
-            self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            self.send_json(payload, HTTPStatus.CONFLICT)
         elif isinstance(exc, RefreshBusyError):
-            self.send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            self.send_json(payload, HTTPStatus.CONFLICT)
         elif isinstance(exc, KeyError):
-            self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            self.send_json(payload, HTTPStatus.NOT_FOUND)
         elif isinstance(exc, (ValueError, ProviderError, json.JSONDecodeError)):
-            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            self.send_json(payload, HTTPStatus.BAD_REQUEST)
         else:
-            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_json(payload, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def require_sync_token(self) -> None:
         expected = get_or_create_local_sync_token()
@@ -664,6 +676,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/local-sync/auth":
             try:
+                self.require_sync_token()
                 payload = self.read_json()
                 sessions = payload.get("sessions", [])
                 if not isinstance(sessions, list) or len(sessions) > 100:
@@ -671,6 +684,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 configs, _ = self.store.snapshot()
                 configs_by_id = {config.id: config for config in configs}
                 synced = []
+                stale = []
                 for item in sessions:
                     if not isinstance(item, dict):
                         raise ValueError("auth session must be an object")
@@ -680,13 +694,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         config.type, PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH
                     ):
                         raise ValueError(f"unsupported auth session provider: {provider_id}")
-                    expected = urlparse(config.target_url)
                     supplied = urlparse(str(item.get("origin") or ""))
+                    expected_origin = provider_auth_origin(config)
+                    supplied_origin = normalize_provider_auth_origin(
+                        str(item.get("origin") or "")
+                    )
                     if (
-                        supplied.scheme not in {"http", "https"}
+                        not supplied_origin
                         or supplied.username is not None
                         or supplied.password is not None
-                        or (supplied.scheme, supplied.netloc) != (expected.scheme, expected.netloc)
+                        or supplied_origin != expected_origin
                     ):
                         raise ValueError(f"auth session origin does not match Provider {provider_id}")
                     auth_token = str(item.get("authToken") or "").strip()
@@ -696,18 +713,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         continue
                     if len(auth_token) > 8192 or len(refresh_token) > 8192 or len(expires_at) > 128:
                         raise ValueError(f"auth session is too large for Provider {provider_id}")
+                    user_id = str(item.get("userId") or "").strip()
+                    username = str(item.get("username") or "").strip()
+                    if len(user_id) > 256 or len(username) > 256:
+                        raise ValueError(f"auth identity is too large for Provider {provider_id}")
+                    incoming = normalize_provider_auth_session({
+                        **item,
+                        "providerId": provider_id,
+                        "origin": expected_origin,
+                        "userId": user_id,
+                        "username": username,
+                        "authToken": auth_token,
+                        "refreshToken": refresh_token,
+                        "expiresAt": expires_at,
+                        "source": AUTH_SOURCE_LOCAL_SYNC,
+                        "updatedAt": item.get("updatedAt") or utc_now(),
+                    })
                     with provider_auth_session_lock(provider_id):
-                        set_local_secret(
-                            provider_auth_secret_name(provider_id),
-                            json.dumps({
-                                "authToken": auth_token,
-                                "refreshToken": refresh_token,
-                                "expiresAt": expires_at,
-                                "updatedAt": utc_now(),
-                            }, ensure_ascii=False),
-                        )
+                        current = load_provider_auth_session(config)
+                        if provider_auth_session_is_stale(current, incoming):
+                            stale.append(provider_id)
+                            continue
+                        save_provider_auth_session(config, incoming)
                     synced.append(provider_id)
-                self.send_json({"ok": True, "synced": len(synced), "providers": synced})
+                self.send_json({
+                    "ok": True,
+                    "synced": len(synced),
+                    "stale": len(stale),
+                    "providers": synced,
+                    "staleProviders": stale,
+                })
             except Exception as exc:
                 self.send_api_error(exc)
             return

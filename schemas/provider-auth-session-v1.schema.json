@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://provider-usage-hub.local/schemas/provider-auth-session-v1.schema.json",
+  "title": "Provider Usage Hub internal authentication session v1",
+  "type": "object",
+  "required": [
+    "schemaVersion", "providerId", "origin", "userId", "username",
+    "authToken", "refreshToken", "expiresAt", "source", "generation",
+    "updatedAt", "verifiedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "providerId": { "type": "string", "maxLength": 100 },
+    "origin": {
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^(|https?://[^/]+)$"
+    },
+    "userId": { "type": "string", "maxLength": 256 },
+    "username": { "type": "string", "maxLength": 256 },
+    "authToken": { "type": "string", "maxLength": 8192 },
+    "refreshToken": { "type": "string", "maxLength": 8192 },
+    "expiresAt": { "type": "string", "maxLength": 128 },
+    "source": {
+      "enum": ["", "browser_tab", "browseros", "local_sync", "refresh", "secret", "legacy"]
+    },
+    "generation": { "type": "integer", "minimum": 0 },
+    "updatedAt": { "type": "string", "maxLength": 128 },
+    "verifiedAt": { "type": "string", "maxLength": 128 }
+  },
+  "anyOf": [
+    { "properties": { "authToken": { "minLength": 1 } } },
+    { "properties": { "refreshToken": { "minLength": 1 } } }
+  ],
+  "additionalProperties": false
+}

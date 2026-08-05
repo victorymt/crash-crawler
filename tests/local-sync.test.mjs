@@ -46,7 +46,8 @@ test("local sync auth reads only open matching channel provider tabs", async () 
         return [{ result: {
           authToken: "access-token",
           refreshToken: "refresh-token",
-          expiresAt: "123456"
+          expiresAt: "123456",
+          authUser: JSON.stringify({ id: "user-42", username: "alice" })
         } }];
       }
     }
@@ -68,12 +69,15 @@ test("local sync auth reads only open matching channel provider tabs", async () 
       targetUrl: "https://page.example/dashboard"
     }
   ]);
-  assert.deepEqual(sessions, [{
-    providerId: "fluxion",
-    origin: "https://fluxionai.space",
-    authToken: "access-token",
-    refreshToken: "refresh-token",
-    expiresAt: "123456"
-  }]);
+  assert.equal(sessions.length, 1);
+  assert.equal(sessions[0].schemaVersion, 1);
+  assert.equal(sessions[0].providerId, "fluxion");
+  assert.equal(sessions[0].origin, "https://fluxionai.space");
+  assert.equal(sessions[0].userId, "user-42");
+  assert.equal(sessions[0].username, "alice");
+  assert.equal(sessions[0].authToken, "access-token");
+  assert.equal(sessions[0].refreshToken, "refresh-token");
+  assert.equal(sessions[0].source, "browser_tab");
+  assert.ok(sessions[0].updatedAt);
   globalThis.chrome = originalChrome;
 });

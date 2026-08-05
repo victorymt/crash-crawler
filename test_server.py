@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from providers import ProviderManager
+from provider_auth import ProviderAuthSessionError
 from server import DashboardHandler, RefreshJobManager
 from web_store import ConfigStore
 
@@ -591,21 +592,30 @@ class ServerApiTests(unittest.TestCase):
             self.assertEqual(applied["revision"], current["revision"])
 
     def test_local_sync_auth_sessions_are_origin_scoped_and_secret(self):
-        with patch("server.set_local_secret") as save_secret:
+        with (
+            patch("server.load_provider_auth_session", return_value={}),
+            patch("server.save_provider_auth_session", return_value=True) as save_session,
+        ):
             status, result = self.request("/api/local-sync/auth", "POST", {
                 "sessions": [{
                     "providerId": "channel-test",
                     "origin": "https://channel.example",
+                    "userId": "user-42",
+                    "username": "alice",
                     "authToken": "access-token",
                     "refreshToken": "refresh-token",
                     "expiresAt": "123456",
+                    "generation": 3,
+                    "updatedAt": "2026-08-05T10:00:00Z",
                 }]
             })
         self.assertEqual(status, 200)
         self.assertEqual(result["synced"], 1)
-        secret_name, secret_value = save_secret.call_args.args
-        self.assertEqual(secret_name, "provider_auth_session:channel-test")
-        self.assertEqual(json.loads(secret_value)["authToken"], "access-token")
+        saved_config, saved_session = save_session.call_args.args
+        self.assertEqual(saved_config.id, "channel-test")
+        self.assertEqual(saved_session["authToken"], "access-token")
+        self.assertEqual(saved_session["userId"], "user-42")
+        self.assertEqual(saved_session["source"], "local_sync")
 
         status, result = self.request("/api/local-sync/auth", "POST", {
             "sessions": [{
@@ -616,6 +626,63 @@ class ServerApiTests(unittest.TestCase):
         })
         self.assertEqual(status, 400)
         self.assertIn("origin", result["error"])
+
+    def test_local_sync_auth_skips_stale_sessions(self):
+        current = {
+            "schemaVersion": 1,
+            "providerId": "channel-test",
+            "origin": "https://channel.example",
+            "userId": "user-42",
+            "username": "alice",
+            "authToken": "current-access",
+            "refreshToken": "current-refresh",
+            "expiresAt": "999999",
+            "source": "local_sync",
+            "generation": 4,
+            "updatedAt": "2026-08-05T10:02:00+00:00",
+            "verifiedAt": "",
+        }
+        with (
+            patch("server.load_provider_auth_session", return_value=current),
+            patch("server.save_provider_auth_session") as save_session,
+        ):
+            status, result = self.request("/api/local-sync/auth", "POST", {
+                "sessions": [{
+                    **current,
+                    "authToken": "stale-access",
+                    "updatedAt": "2026-08-05T10:01:00Z",
+                }]
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["stale"], 1)
+        self.assertEqual(result["staleProviders"], ["channel-test"])
+        save_session.assert_not_called()
+
+    def test_local_sync_auth_returns_structured_account_mismatch(self):
+        with (
+            patch("server.load_provider_auth_session", return_value={}),
+            patch(
+                "server.save_provider_auth_session",
+                side_effect=ProviderAuthSessionError(
+                    "account_mismatch",
+                    "Authentication session belongs to a different account",
+                ),
+            ),
+        ):
+            status, result = self.request("/api/local-sync/auth", "POST", {
+                "sessions": [{
+                    "providerId": "channel-test",
+                    "origin": "https://channel.example",
+                    "userId": "84",
+                    "username": "bob",
+                    "authToken": "bob-access",
+                    "updatedAt": "2026-08-05T10:03:00Z",
+                }]
+            })
+        self.assertEqual(status, 400)
+        self.assertEqual(result["code"], "account_mismatch")
+        self.assertIn("different account", result["error"])
 
     def test_sync_auth_reads_live_browseros_sessions_without_copying_profile(self):
         auth_result = {

@@ -244,6 +244,15 @@ test("channel refresh summaries count channels and partial failures", () => {
     failedCount: 3
   });
   assert.equal(errorSnapshot({ id: "fluxion", name: "Fluxion", type: "sub2api", targetUrl: "https://fluxion.example" }, null, new Error("not logged in")).status, "needs_login");
+  const mismatch = new Error("Authentication session belongs to a different account");
+  mismatch.code = "ACCOUNT_MISMATCH";
+  const mismatchSnapshot = errorSnapshot(
+    { id: "fluxion", name: "Fluxion", type: "sub2api", targetUrl: "https://fluxion.example" },
+    null,
+    mismatch
+  );
+  assert.equal(mismatchSnapshot.errorCode, "ACCOUNT_MISMATCH");
+  assert.equal(mismatchSnapshot.raw.auth.status, "account_mismatch");
   assert.equal(errorSnapshot(
     { id: "fluxion", name: "Fluxion", type: "sub2api", targetUrl: "https://fluxion.example" },
     { balances: [{ key: "balance", value: "1" }] },
