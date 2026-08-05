@@ -20,7 +20,7 @@ function sendMessage(message) {
 }
 
 function statusLabel(status) {
-  return ({ ok: "ok", stale: "stale", error: "error", idle: "idle", unconfigured: "unconfigured", needs_visit: "needs visit" })[status] || status || "idle";
+  return ({ ok: "ok", stale: "stale", error: "error", idle: "idle", unconfigured: "unconfigured", needs_login: "needs login", needs_visit: "needs visit" })[status] || status || "idle";
 }
 
 function recommendationLabel(value) {

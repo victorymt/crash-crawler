@@ -37,12 +37,26 @@ import {
 import { blankSnapshot } from "../shared/snapshots.js";
 import { getSecret } from "../shared/storage.js";
 import {
+  PROVIDER_CAPABILITIES,
+  providerDefinitionTypes,
+  providerSupportsCapability
+} from "../shared/provider_definitions.js";
+import {
   attachCollectionDiagnostics,
   createCollectionContext,
   decorateCollectionError,
   NeedsVisitError,
   TAB_POLICIES
 } from "./runtime.js";
+import {
+  normalizeProviderAuthSession,
+  parseProviderAuthSession,
+  providerAuthIsExpired,
+  providerAuthNeedsRefresh,
+  providerAuthSessionChanged,
+  serializeProviderAuthSession,
+  withProviderAuthMutation
+} from "./auth_session.js";
 import { deleteSessionHint, getSessionHint, setSessionHint } from "./session_cache.js";
 import { createProviderRegistry } from "./registry.js";
 
@@ -50,9 +64,10 @@ const EZAICLUB_AUTH_TOKEN_KEY = "auth_token";
 const EZAICLUB_SESSION_HINT = "authToken";
 const EZAICLUB_SESSION_TTL_MS = 20 * 60 * 1000;
 const EZAICLUB_API_TIMEZONE = "Asia/Shanghai";
-const SUB2API_AUTH_TOKEN_KEY = "auth_token";
 const SUB2API_SESSION_HINT = "authToken";
+const SUB2API_AUTH_SESSION_HINT = "authSession";
 const SUB2API_SESSION_TTL_MS = 20 * 60 * 1000;
+const SUB2API_AUTH_SESSION_MAX_TTL_MS = 24 * 60 * 60 * 1000;
 const SUB2API_API_TIMEZONE = "Asia/Shanghai";
 const SUB2API_AVAILABLE_GROUP_PATHS = [
   "/api/v1/channels/available",
@@ -200,6 +215,55 @@ async function fetchSub2ApiJson(url, token, providerName = "Sub2API") {
       throw new Error(payload?.message || `${providerName} API returned HTTP ${response.status}`);
     }
     return payload;
+  });
+}
+
+async function refreshSub2ApiTokens(config, session) {
+  const normalized = normalizeProviderAuthSession(session);
+  if (!normalized?.refreshToken) {
+    throw new Error("Sub2API refresh token is unavailable");
+  }
+  const refreshUrl = sameOriginUrl(config, "/api/v1/auth/refresh");
+  return requestWithTimeout(refreshUrl, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(normalized.authToken
+        ? { Authorization: `Bearer ${normalized.authToken}` }
+        : {})
+    },
+    body: JSON.stringify({ refresh_token: normalized.refreshToken })
+  }, async (response) => {
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    const data = payload?.data;
+    const successCode = payload?.success !== false && (
+      payload?.code == null
+      || payload.code === 0
+      || payload.code === "SUCCESS"
+    );
+    const authToken = typeof data?.access_token === "string"
+      ? data.access_token.trim()
+      : "";
+    const refreshToken = typeof data?.refresh_token === "string"
+      ? data.refresh_token.trim()
+      : "";
+    const expiresInSeconds = Number(data?.expires_in);
+    if (!response.ok || !successCode || !authToken || !refreshToken
+        || !Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) {
+      throw new Error("Sub2API token refresh failed");
+    }
+    return {
+      authToken,
+      refreshToken,
+      expiresAt: String(Date.now() + expiresInSeconds * 1000)
+    };
   });
 }
 
@@ -732,16 +796,185 @@ async function readTabProviderAuthSession(tabId) {
   }
 }
 
+async function writeTabProviderAuthSession(tabId, session) {
+  const normalized = normalizeProviderAuthSession(session);
+  if (!normalized || !chrome.scripting?.executeScript || tabId == null) return false;
+  try {
+    const [{ result } = {}] = await executeScriptWithFrameRetry({
+      target: { tabId },
+      func: (nextSession) => {
+        try {
+          const values = {
+            auth_token: nextSession.authToken,
+            refresh_token: nextSession.refreshToken,
+            token_expires_at: nextSession.expiresAt
+          };
+          for (const [key, value] of Object.entries(values)) {
+            if (value) globalThis.localStorage?.setItem(key, value);
+            else globalThis.localStorage?.removeItem(key);
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      args: [normalized]
+    });
+    return result === true;
+  } catch {
+    return false;
+  }
+}
+
+function providerAuthSessionHint(config) {
+  return scopedSessionHint(SUB2API_AUTH_SESSION_HINT, config.targetUrl);
+}
+
+async function loadCachedProviderAuthSession(config) {
+  const serialized = await getSessionHint(config.id, providerAuthSessionHint(config));
+  const session = parseProviderAuthSession(serialized);
+  if (session) return session;
+  const legacyToken = await getSessionHint(
+    config.id,
+    scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl)
+  );
+  return legacyToken ? normalizeProviderAuthSession({ authToken: legacyToken }) : null;
+}
+
+async function saveCachedProviderAuthSession(config, session) {
+  const normalized = normalizeProviderAuthSession(session);
+  if (!normalized) return null;
+  const expiresAt = Number(normalized.expiresAt);
+  const ttlMs = Number.isFinite(expiresAt) && expiresAt > Date.now()
+    ? Math.min(SUB2API_AUTH_SESSION_MAX_TTL_MS, Math.max(1000, expiresAt - Date.now()))
+    : SUB2API_SESSION_TTL_MS;
+  await setSessionHint(
+    config.id,
+    providerAuthSessionHint(config),
+    serializeProviderAuthSession(normalized),
+    ttlMs
+  );
+  if (normalized.authToken) {
+    await setSessionHint(
+      config.id,
+      scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl),
+      normalized.authToken,
+      ttlMs
+    );
+  }
+  return normalized;
+}
+
+async function deleteCachedProviderAuthSession(config) {
+  await Promise.all([
+    deleteSessionHint(config.id, providerAuthSessionHint(config)),
+    deleteSessionHint(config.id, scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl))
+  ]);
+}
+
+async function browserProviderAuthSession(config, context) {
+  const browser = globalThis.chrome;
+  if (!browser?.scripting?.executeScript) return null;
+  const origin = new URL(config.targetUrl).origin;
+  const target = new URL(config.targetUrl);
+  if (browser.tabs?.query && context.tabPolicy !== TAB_POLICIES.API_ONLY) {
+    const tabs = await browser.tabs.query({ url: `${origin}/*` });
+    const ranked = [...tabs]
+      .filter((tab) => tab.id != null && tab.url)
+      .sort((left, right) => tabMatchScore(right.url, target) - tabMatchScore(left.url, target));
+    for (const tab of ranked) {
+      const session = await readTabProviderAuthSession(tab.id);
+      if (session) {
+        return { session, tabId: tab.id, close: async () => undefined };
+      }
+    }
+  }
+  if (!browser.tabs?.create || context.tabPolicy !== TAB_POLICIES.ALLOW_HIDDEN_TABS) return null;
+  let tabId = null;
+  try {
+    const tab = await browser.tabs.create({ url: config.targetUrl, active: false });
+    tabId = tab.id ?? null;
+    if (tabId == null) return null;
+    await notifyCollectionContext(context, "onTabCreated", tabId, config.targetUrl);
+    await waitForTabComplete(tabId, 15000);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const session = await readTabProviderAuthSession(tabId);
+      if (session) {
+        const leasedTabId = tabId;
+        return {
+          session,
+          tabId: leasedTabId,
+          async close() {
+            try {
+              await browser.tabs.remove(leasedTabId);
+            } catch {
+              // Tab may already be closed.
+            }
+            await notifyCollectionContext(context, "onTabClosed", leasedTabId);
+          }
+        };
+      }
+      await delay(300);
+    }
+  } catch {
+    // Cleanup below owns the temporary tab when navigation or extraction fails.
+  }
+  if (tabId != null) {
+    try {
+      await browser.tabs.remove(tabId);
+    } catch {
+      // Tab may already be closed.
+    }
+    await notifyCollectionContext(context, "onTabClosed", tabId);
+  }
+  return null;
+}
+
+async function resolveProviderAuthSession(config, context, { forceBrowser = false } = {}) {
+  if (!forceBrowser) {
+    const cached = await loadCachedProviderAuthSession(config);
+    if (cached) return { session: cached, tabId: null, close: async () => undefined };
+  }
+  const browserSession = await browserProviderAuthSession(config, context);
+  if (!browserSession) return null;
+  await saveCachedProviderAuthSession(config, browserSession.session);
+  return browserSession;
+}
+
+async function persistRotatedProviderAuthSession(config, session, tabId = null) {
+  const normalized = await saveCachedProviderAuthSession(config, session);
+  if (!normalized) return null;
+  let targetTabId = tabId;
+  if (targetTabId == null && chrome.tabs?.query) {
+    try {
+      const target = new URL(config.targetUrl);
+      const tabs = await chrome.tabs.query({ url: `${target.origin}/*` });
+      targetTabId = pickBestTab(tabs, config.targetUrl)?.id ?? null;
+    } catch {
+      targetTabId = null;
+    }
+  }
+  if (targetTabId != null) {
+    await writeTabProviderAuthSession(targetTabId, normalized);
+  }
+  return normalized;
+}
+
 export async function collectLocalSyncAuthSessions(configs = []) {
   if (!chrome.tabs?.query || !chrome.scripting?.executeScript) return [];
   const sessions = [];
   for (const config of configs) {
-    if (!["sub2api", "ezaiclub"].includes(config?.type) || !config.targetUrl) continue;
+    if (!providerSupportsCapability(
+      config?.type,
+      PROVIDER_CAPABILITIES.LOCAL_SYNC_AUTH
+    ) || !config.targetUrl) continue;
     const target = new URL(config.targetUrl);
     const tabs = await chrome.tabs.query({ url: `${target.origin}/*` });
     const tab = pickBestTab(tabs, config.targetUrl);
-    if (!tab?.id) continue;
-    const session = await readTabProviderAuthSession(tab.id);
+    const tabSession = tab?.id ? await readTabProviderAuthSession(tab.id) : null;
+    const session = tabSession
+      ? await saveCachedProviderAuthSession(config, tabSession)
+      : await loadCachedProviderAuthSession(config);
     if (!session) continue;
     sessions.push({
       providerId: config.id,
@@ -1245,67 +1478,131 @@ async function collectNewApi(config, context) {
   }
 }
 
-async function getSub2ApiAuthToken(config, context) {
-  return getLocalStorageSessionValue(config, context, {
-    storageKey: SUB2API_AUTH_TOKEN_KEY,
-    sessionHint: SUB2API_SESSION_HINT,
-    ttlMs: SUB2API_SESSION_TTL_MS
+async function getSub2ApiAuthSession(config, context) {
+  return withProviderAuthMutation(config.id, async () => {
+    let lease = await resolveProviderAuthSession(config, context);
+    if (!lease?.session) return null;
+    try {
+      let session = normalizeProviderAuthSession(lease.session);
+      if (!session) return null;
+      if (providerAuthNeedsRefresh(session) && session.refreshToken) {
+        try {
+          session = await refreshSub2ApiTokens(config, session);
+          session = await persistRotatedProviderAuthSession(config, session, lease.tabId);
+        } catch {
+          if (providerAuthIsExpired(session)) {
+            await deleteCachedProviderAuthSession(config);
+            await lease.close();
+            lease = await resolveProviderAuthSession(config, context, { forceBrowser: true });
+            session = normalizeProviderAuthSession(lease?.session);
+          }
+        }
+      }
+      return session?.authToken ? session : null;
+    } finally {
+      await lease?.close?.();
+    }
   });
 }
 
+async function recoverSub2ApiAuthSession(config, context, previousSession) {
+  return withProviderAuthMutation(config.id, async () => {
+    const latest = await loadCachedProviderAuthSession(config);
+    if (latest?.authToken && providerAuthSessionChanged(previousSession, latest)) {
+      return latest;
+    }
+    const candidate = latest || normalizeProviderAuthSession(previousSession);
+    if (candidate?.refreshToken) {
+      try {
+        const refreshed = await refreshSub2ApiTokens(config, candidate);
+        return await persistRotatedProviderAuthSession(config, refreshed);
+      } catch {
+        // A logged-in page may already hold a newer token than the saved refresh token.
+      }
+    }
+
+    await deleteCachedProviderAuthSession(config);
+    const lease = await resolveProviderAuthSession(config, context, { forceBrowser: true });
+    try {
+      const resynced = normalizeProviderAuthSession(lease?.session);
+      if (!resynced?.authToken || !providerAuthSessionChanged(previousSession, resynced)) {
+        return null;
+      }
+      return await saveCachedProviderAuthSession(config, resynced);
+    } finally {
+      await lease?.close?.();
+    }
+  });
+}
+
+async function collectSub2ApiWithSession(config, session) {
+  const token = session.authToken;
+  const timezone = encodeURIComponent(SUB2API_API_TIMEZONE);
+  const origin = new URL(config.targetUrl).origin;
+  const authUrl = `${origin}/api/v1/auth/me?timezone=${timezone}`;
+  const statsUrl = `${origin}/api/v1/usage/dashboard/stats?timezone=${timezone}`;
+  const monitorsUrl = `${origin}/api/v1/channel-monitors`;
+  const ratesUrl = `${origin}/api/v1/groups/rates`;
+  const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
+  if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
+  const [statsResult, monitorsResult, availableResult, ratesResult] = await Promise.allSettled([
+    fetchSub2ApiJson(statsUrl, token, config.name),
+    fetchSub2ApiJson(monitorsUrl, token, config.name),
+    fetchSub2ApiAvailableGroups(origin, token, config.name),
+    fetchSub2ApiJson(ratesUrl, token, config.name)
+  ]);
+  for (const result of [statsResult, monitorsResult, availableResult, ratesResult]) {
+    if (result.status === "rejected" && result.reason instanceof NotLoggedInError) throw result.reason;
+  }
+  const channelErrors = [
+    ["渠道状态", monitorsResult],
+    ["渠道分组", availableResult],
+    ["用户倍率", ratesResult]
+  ].filter(([, result]) => result.status === "rejected");
+  const channelCollectionFailed = channelErrors.length > 0;
+  return sub2ApiSnapshot(
+    config,
+    sameOriginUrl(config, "/dashboard"),
+    authPayload,
+    statsResult.status === "fulfilled" ? statsResult.value : null,
+    {
+      monitorsPayload: !channelCollectionFailed && monitorsResult.status === "fulfilled" ? monitorsResult.value : null,
+      availablePayload: !channelCollectionFailed && availableResult.status === "fulfilled" ? availableResult.value.payload : null,
+      ratesPayload: !channelCollectionFailed && ratesResult.status === "fulfilled" ? ratesResult.value : null,
+      availableEndpoint: availableResult.status === "fulfilled" ? availableResult.value.endpoint : null,
+      availableFallbackUsed: availableResult.status === "fulfilled" ? availableResult.value.fallbackUsed : false,
+      availableGroupCount: availableResult.status === "fulfilled" ? availableResult.value.groupCount : 0,
+      channelError: channelErrors.length
+        ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
+        : null
+    }
+  );
+}
+
 async function collectSub2ApiViaApi(config, context, { probe = false } = {}) {
-  const token = await getSub2ApiAuthToken(config, context);
-  if (!token) {
+  let session = await getSub2ApiAuthSession(config, context);
+  if (!session?.authToken) {
     if (probe) return null;
     throw new NotLoggedInError(`Current browser is not logged in to ${config.name}`);
   }
   try {
-    const timezone = encodeURIComponent(SUB2API_API_TIMEZONE);
-    const origin = new URL(config.targetUrl).origin;
-    const authUrl = `${origin}/api/v1/auth/me?timezone=${timezone}`;
-    const statsUrl = `${origin}/api/v1/usage/dashboard/stats?timezone=${timezone}`;
-    const monitorsUrl = `${origin}/api/v1/channel-monitors`;
-    const ratesUrl = `${origin}/api/v1/groups/rates`;
-    const authPayload = await fetchSub2ApiJson(authUrl, token, config.name);
-    if (!authPayload || !isSub2ApiAuthPayload(authPayload)) return null;
-    const [statsResult, monitorsResult, availableResult, ratesResult] = await Promise.allSettled([
-      fetchSub2ApiJson(statsUrl, token, config.name),
-      fetchSub2ApiJson(monitorsUrl, token, config.name),
-      fetchSub2ApiAvailableGroups(origin, token, config.name),
-      fetchSub2ApiJson(ratesUrl, token, config.name)
-    ]);
-    for (const result of [statsResult, monitorsResult, availableResult, ratesResult]) {
-      if (result.status === "rejected" && result.reason instanceof NotLoggedInError) throw result.reason;
-    }
-    const channelErrors = [
-      ["渠道状态", monitorsResult],
-      ["渠道分组", availableResult],
-      ["用户倍率", ratesResult]
-    ].filter(([, result]) => result.status === "rejected");
-    const channelCollectionFailed = channelErrors.length > 0;
-    return sub2ApiSnapshot(
-      config,
-      sameOriginUrl(config, "/dashboard"),
-      authPayload,
-      statsResult.status === "fulfilled" ? statsResult.value : null,
-      {
-        monitorsPayload: !channelCollectionFailed && monitorsResult.status === "fulfilled" ? monitorsResult.value : null,
-        availablePayload: !channelCollectionFailed && availableResult.status === "fulfilled" ? availableResult.value.payload : null,
-        ratesPayload: !channelCollectionFailed && ratesResult.status === "fulfilled" ? ratesResult.value : null,
-        availableEndpoint: availableResult.status === "fulfilled" ? availableResult.value.endpoint : null,
-        availableFallbackUsed: availableResult.status === "fulfilled" ? availableResult.value.fallbackUsed : false,
-        availableGroupCount: availableResult.status === "fulfilled" ? availableResult.value.groupCount : 0,
-        channelError: channelErrors.length
-          ? channelErrors.map(([label, result]) => `${label}: ${result.reason?.message || result.reason}`).join("; ")
-          : null
-      }
-    );
+    return await collectSub2ApiWithSession(config, session);
   } catch (error) {
-    if (error instanceof NotLoggedInError) {
-      await deleteSessionHint(config.id, scopedSessionHint(SUB2API_SESSION_HINT, config.targetUrl));
+    if (!(error instanceof NotLoggedInError)) throw error;
+    session = await recoverSub2ApiAuthSession(config, context, session);
+    if (!session?.authToken) {
       if (probe) return null;
+      throw error;
     }
-    throw error;
+    try {
+      return await collectSub2ApiWithSession(config, session);
+    } catch (retryError) {
+      if (retryError instanceof NotLoggedInError) {
+        await deleteCachedProviderAuthSession(config);
+        if (probe) return null;
+      }
+      throw retryError;
+    }
   }
 }
 
@@ -1485,18 +1782,25 @@ const providerAdapters = createProviderRegistry([
       () => collectDeepSeek(config)
     )
   }],
-  ["ezaiclub", { collect: collectEzaiclub, supportsChannels: true }],
+  ["ezaiclub", { collect: collectEzaiclub }],
   ["siliconflow", { collect: collectSiliconFlow }],
   ["newapi", { collect: collectNewApi }],
-  ["sub2api", { collect: collectSub2Api, supportsChannels: true }]
+  ["sub2api", { collect: collectSub2Api }]
 ]);
+
+const registeredTypes = providerAdapters.types();
+const definedTypes = providerDefinitionTypes();
+if (registeredTypes.length !== definedTypes.length ||
+    registeredTypes.some((type, index) => type !== definedTypes[index])) {
+  throw new Error("Provider adapters do not match Provider definitions");
+}
 
 export function providerAdapterTypes() {
   return providerAdapters.types();
 }
 
 export function providerSupportsChannels(type) {
-  return providerAdapters.get(type)?.supportsChannels === true;
+  return providerSupportsCapability(type, PROVIDER_CAPABILITIES.CHANNELS);
 }
 
 export function channelProviderConfigs(configs) {
@@ -1509,7 +1813,9 @@ export async function detectProvider(config, contextInput = {}) {
   await ensureProviderPermission(config);
   const snapshot = await probeKnownPageProvider(config, context);
   const type = snapshot?.raw?.source;
-  if (!snapshot || !["newapi", "sub2api"].includes(type)) return null;
+  if (!snapshot || !providerSupportsCapability(type, PROVIDER_CAPABILITIES.AUTO_DETECT)) {
+    return null;
+  }
   return { type, snapshot: attachCollectionDiagnostics(snapshot, context) };
 }
 

@@ -1,5 +1,6 @@
 let configs = [];
 let settings = {};
+let providerDefinitions = [];
 let hasDeepseekKey = false;
 let editingId = "";
 let activeOperation = false;
@@ -59,6 +60,7 @@ async function loadConfig() {
   const data = await requestJson("/api/config");
   configs = data.configs || [];
   settings = data.settings || {};
+  providerDefinitions = data.providerDefinitions || [];
   hasDeepseekKey = Boolean(data.has_deepseek_key);
   lastConfigLoadAt = Date.now();
   for (const id of [...selectedIds]) if (!configs.some((config) => config.id === id)) selectedIds.delete(id);
@@ -170,11 +172,8 @@ function editorProvider() {
   const type = document.getElementById("provider-type").value;
   const previous = configs.find((config) => config.id === editingId) || {};
   const sameType = previous.type === type;
-  const defaultMode = type === "deepseek"
-    ? "api"
-    : type === "newapi" || type === "sub2api"
-      ? "api_then_page"
-      : "browser";
+  const defaultMode = providerDefinitions.find((definition) => definition.type === type)
+    ?.defaultMode || "page";
   const provider = {
     ...previous,
     id: document.getElementById("provider-id").value.trim(),

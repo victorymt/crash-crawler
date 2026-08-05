@@ -144,6 +144,7 @@ test("channel ranking lives on a dedicated extension page", async () => {
   const popupScript = await readFile(new URL("../extension/src/popup/popup.js", import.meta.url), "utf8");
   const channelsHtml = await readFile(new URL("../extension/src/channels/channels.html", import.meta.url), "utf8");
   const channelsScript = await readFile(new URL("../extension/src/channels/channels.js", import.meta.url), "utf8");
+  const localChannelsScript = await readFile(new URL("../static/channels.js", import.meta.url), "utf8");
 
   assert.match(popupHtml, /id="channels"/);
   assert.match(popupHtml, /id="retry-failed"/);
@@ -166,6 +167,11 @@ test("channel ranking lives on a dedicated extension page", async () => {
   assert.match(channelsScript, /providers:refreshFailedChannels/);
   assert.match(channelsScript, /providers:cancelRefresh/);
   assert.match(channelsScript, /providers:refreshStatus/);
+  assert.match(channelsScript, /data-provider-id/);
+  assert.match(channelsScript, /retryPendingProviders/);
+  assert.match(localChannelsScript, /data-provider-id/);
+  assert.match(localChannelsScript, /retryPendingProviders/);
+  assert.match(localChannelsScript, /\/api\/sync-auth/);
 });
 
 test("popup can detect and add the current relay site", async () => {

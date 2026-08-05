@@ -431,7 +431,7 @@ export function summarizeChannelRefresh(providers) {
     failedCount: snapshots.filter((snapshot) => (
       snapshot?.channelError
       || snapshot?.channelsStale === true
-      || ["error", "stale", "needs_visit"].includes(snapshot?.status)
+      || ["error", "stale", "needs_login", "needs_visit"].includes(snapshot?.status)
     )).length
   };
 }

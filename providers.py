@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.cookiejar import Cookie, CookieJar
@@ -24,8 +24,30 @@ from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from channels import parse_ezaiclub_channels, parse_sub2api_channels
+from provider_definitions import (
+    PROVIDER_CAPABILITY_API_ONLY,
+    PROVIDER_CAPABILITY_CHANNELS,
+    PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH,
+    default_provider_mode,
+    get_provider_definition,
+    provider_definition_types,
+    provider_supports_capability,
+)
 
-BROWSEROS_BIN = os.environ.get("BROWSEROS_BIN", "/usr/bin/browseros")
+
+
+def resolve_browser_executable() -> str:
+    configured = os.environ.get("PROVIDER_BROWSER_BIN") or os.environ.get("BROWSEROS_BIN")
+    if configured:
+        return configured
+    for candidate in ("chromium", "chromium-browser", "google-chrome"):
+        executable = shutil.which(candidate)
+        if executable:
+            return executable
+    return ""
+
+
+BROWSER_EXECUTABLE = resolve_browser_executable()
 DEFAULT_PROFILE_DIR = os.environ.get(
     "BROWSEROS_PROFILE_DIR", str(Path.home() / ".browseros-crawler-profile")
 )
@@ -47,6 +69,10 @@ CACHE_FILE = Path(os.environ.get("PROVIDER_CACHE", ROOT / ".provider-cache.json"
 SECRET_FILE = Path(os.environ.get("PROVIDER_SECRETS", ROOT / ".provider-secrets.json"))
 DEFAULT_DUMP_DIR = Path(os.environ.get("PROVIDER_DUMP_DIR", ROOT / "dumps"))
 PROVIDER_SCHEMA_VERSION = 4
+SUB2API_TOKEN_REFRESH_BUFFER_MS = 2 * 60 * 1000
+
+_PROVIDER_AUTH_LOCKS_GUARD = threading.Lock()
+_PROVIDER_AUTH_LOCKS: dict[str, threading.RLock] = {}
 
 # Chromium may detach the main document while a single-page app replaces its
 # root document. Playwright reports this as a low-level frame error; callers
@@ -300,11 +326,7 @@ class ProviderConfig:
             cookie_cache=os.path.expanduser(str(cookie_cache)) if cookie_cache else None,
             api_key_env=str(data.get("api_key_env", data.get("apiKeyEnv"))) if data.get("api_key_env", data.get("apiKeyEnv")) else None,
             secondary_urls=secondary_urls,
-            mode=str(data.get("mode") or (
-                "api" if provider_type == "deepseek"
-                else "api_then_page" if provider_type in {"newapi", "sub2api"}
-                else "page"
-            )),
+            mode=str(data.get("mode") or default_provider_mode(provider_type)),
             group=str(data.get("group") or "").strip(),
             recharge_ratio=float(data.get("recharge_ratio", data.get("rechargeRatio", 1)) or 1),
             parser_rules=normalize_parser_rules(data.get("parser_rules", data.get("parserRules"))),
@@ -488,8 +510,15 @@ def provider_auth_secret_name(provider_id: str) -> str:
     return f"provider_auth_session:{provider_id}"
 
 
+def provider_auth_session_lock(provider_id: str) -> threading.RLock:
+    normalized = str(provider_id or "").strip()
+    with _PROVIDER_AUTH_LOCKS_GUARD:
+        return _PROVIDER_AUTH_LOCKS.setdefault(normalized, threading.RLock())
+
+
 def load_provider_auth_session(config: ProviderConfig) -> dict[str, str]:
-    raw = load_local_secret(provider_auth_secret_name(config.id))
+    with provider_auth_session_lock(config.id):
+        raw = load_local_secret(provider_auth_secret_name(config.id))
     if not raw:
         return {}
     try:
@@ -500,20 +529,88 @@ def load_provider_auth_session(config: ProviderConfig) -> dict[str, str]:
         return {}
     return {
         key: str(data.get(key) or "").strip()
-        for key in ("authToken", "refreshToken", "expiresAt")
+        for key in ("authToken", "refreshToken", "expiresAt", "updatedAt")
         if str(data.get(key) or "").strip()
     }
 
 
-def install_provider_auth_session(page, config: ProviderConfig) -> bool:
-    session = load_provider_auth_session(config)
+def save_provider_auth_session(config: ProviderConfig, session: dict[str, Any]) -> bool:
+    normalized = {
+        key: str(session.get(key) or "").strip()
+        for key in ("authToken", "refreshToken", "expiresAt")
+        if str(session.get(key) or "").strip()
+    }
+    with provider_auth_session_lock(config.id):
+        if not normalized.get("authToken") and not normalized.get("refreshToken"):
+            delete_local_secret(provider_auth_secret_name(config.id))
+            return False
+        normalized["updatedAt"] = now_iso()
+        set_local_secret(
+            provider_auth_secret_name(config.id),
+            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+        )
+    return True
+
+
+def read_provider_auth_session(page, config: ProviderConfig) -> dict[str, str]:
+    target = urlparse(config.target_url)
+    expected_origin = f"{target.scheme}://{target.netloc}"
+    script = """
+        (expectedOrigin) => {
+          try {
+            if (globalThis.location?.origin !== expectedOrigin) return null;
+            return {
+              authToken: globalThis.localStorage?.getItem("auth_token") || "",
+              refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
+              expiresAt: globalThis.localStorage?.getItem("token_expires_at") || ""
+            };
+          } catch {
+            return null;
+          }
+        }
+    """
+    result = evaluate_with_frame_retry(page, script, expected_origin)
+    if not isinstance(result, dict):
+        return {}
+    limits = {"authToken": 8192, "refreshToken": 8192, "expiresAt": 128}
+    return {
+        key: str(result.get(key) or "").strip()[:limit]
+        for key, limit in limits.items()
+        if str(result.get(key) or "").strip()
+    }
+
+
+def persist_provider_auth_session(page, config: ProviderConfig, previous: dict[str, str]) -> bool:
+    try:
+        current = read_provider_auth_session(page, config)
+    except Exception:
+        return False
+    if not current:
+        return False
+    merged = {
+        key: current.get(key) or previous.get(key, "")
+        for key in ("authToken", "refreshToken", "expiresAt")
+    }
+    try:
+        return save_provider_auth_session(config, merged)
+    except Exception:
+        return False
+
+
+def install_provider_auth_session(page, config: ProviderConfig, session: dict[str, str] | None = None) -> bool:
+    session = session or load_provider_auth_session(config)
     if not session.get("authToken") and not session.get("refreshToken"):
         return False
-    session_json = json.dumps(session, ensure_ascii=True, separators=(",", ":"))
+    target = urlparse(config.target_url)
+    session_json = json.dumps({
+        **session,
+        "origin": f"{target.scheme}://{target.netloc}",
+    }, ensure_ascii=True, separators=(",", ":"))
     page.add_init_script(
         f"""
         (() => {{
           const session = {session_json};
+          if (globalThis.location?.origin !== session.origin) return;
           const values = {{
             auth_token: session.authToken,
             refresh_token: session.refreshToken,
@@ -529,6 +626,139 @@ def install_provider_auth_session(page, config: ProviderConfig) -> bool:
     return True
 
 
+def refresh_sub2api_auth_session(
+    page,
+    config: ProviderConfig,
+    *,
+    force: bool = False,
+    persist: bool = True,
+) -> bool:
+    target = urlparse(config.target_url)
+    origin = f"{target.scheme}://{target.netloc}"
+    script = """
+        async ({ origin, force, bufferMs }) => {
+          try {
+            if (globalThis.location?.origin !== origin) return { refreshed: false };
+            const readSession = () => ({
+              authToken: globalThis.localStorage?.getItem("auth_token") || "",
+              refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
+              expiresAt: globalThis.localStorage?.getItem("token_expires_at") || "",
+            });
+            const current = readSession();
+            const expiresAt = Number(current.expiresAt);
+            const shouldRefresh = force || (
+              Number.isFinite(expiresAt)
+              && expiresAt > 0
+              && expiresAt - Date.now() <= bufferMs
+            );
+            if (!shouldRefresh || !current.refreshToken) {
+              return { refreshed: false, session: current };
+            }
+            const response = await fetch(`${origin}/api/v1/auth/refresh`, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                ...(current.authToken
+                  ? { Authorization: `Bearer ${current.authToken}` }
+                  : {}),
+              },
+              body: JSON.stringify({ refresh_token: current.refreshToken }),
+            });
+            let payload = null;
+            try { payload = await response.json(); } catch {}
+            const data = payload?.data;
+            const successCode = payload?.success !== false && (
+              payload?.code == null
+              || payload.code === 0
+              || payload.code === "SUCCESS"
+            );
+            const authToken = typeof data?.access_token === "string"
+              ? data.access_token.trim()
+              : "";
+            const refreshToken = typeof data?.refresh_token === "string"
+              ? data.refresh_token.trim()
+              : "";
+            const expiresIn = Number(data?.expires_in);
+            if (!response.ok || !successCode || !authToken || !refreshToken
+                || !Number.isFinite(expiresIn) || expiresIn <= 0) {
+              return { refreshed: false, session: current };
+            }
+            const expiresAtValue = String(Date.now() + expiresIn * 1000);
+            globalThis.localStorage?.setItem("auth_token", authToken);
+            globalThis.localStorage?.setItem("refresh_token", refreshToken);
+            globalThis.localStorage?.setItem("token_expires_at", expiresAtValue);
+            return {
+              refreshed: true,
+              session: { authToken, refreshToken, expiresAt: expiresAtValue },
+            };
+          } catch {
+            return { refreshed: false };
+          }
+        }
+    """
+    result = evaluate_with_frame_retry(page, script, {
+        "origin": origin,
+        "force": bool(force),
+        "bufferMs": SUB2API_TOKEN_REFRESH_BUFFER_MS,
+    })
+    if not isinstance(result, dict) or not result.get("refreshed"):
+        return False
+    session = result.get("session")
+    if not isinstance(session, dict):
+        return False
+    return save_provider_auth_session(config, session) if persist else True
+
+
+def validate_sub2api_browser_session(page, config: ProviderConfig) -> bool:
+    target = urlparse(config.target_url)
+    endpoint = f"{target.scheme}://{target.netloc}/api/v1/auth/me"
+    script = """
+        async (url) => {
+          const token = globalThis.localStorage?.getItem("auth_token") || "";
+          const response = await fetch(url, {
+            credentials: "include",
+            headers: {
+              Accept: "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+          });
+          let data = null;
+          try { data = await response.json(); } catch {}
+          return { ok: response.ok, status: response.status, data };
+        }
+    """
+
+    def request() -> dict[str, Any]:
+        result = evaluate_with_frame_retry(page, script, endpoint)
+        return result if isinstance(result, dict) else {}
+
+    result = request()
+    if result.get("status") in (401, 403):
+        if refresh_sub2api_auth_session(
+            page, config, force=True, persist=False
+        ):
+            result = request()
+
+    status = result.get("status")
+    if status in (401, 403):
+        payload = result.get("data")
+        details = []
+        if isinstance(payload, dict):
+            for key in ("code", "message", "detail"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    details.append(value.strip())
+        suffix = f": {' - '.join(details)[:300]}" if details else ""
+        raise NotLoggedInError(
+            f"BrowserOS is not logged in to {config.name}{suffix}"
+        )
+    if not result.get("ok"):
+        raise ProviderError(f"{config.name} auth check returned HTTP {status}")
+    return True
+
+
 def build_browser(profile_dir: str):
     try:
         from playwright.sync_api import sync_playwright
@@ -539,13 +769,19 @@ def build_browser(profile_dir: str):
             "then start the service with `uv run python server.py 19765`."
         ) from exc
 
+    if not BROWSER_EXECUTABLE or not Path(BROWSER_EXECUTABLE).is_file():
+        raise ProviderError(
+            "A Chromium executable is required for browser collection. "
+            "Install Chromium or set PROVIDER_BROWSER_BIN to its executable path."
+        )
+
     profile_path = Path(profile_dir).expanduser()
     remove_profile_singletons(profile_path)
 
     pw = sync_playwright().start()
     context = pw.chromium.launch_persistent_context(
         str(profile_path),
-        executable_path=BROWSEROS_BIN,
+        executable_path=BROWSER_EXECUTABLE,
         headless=True,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
@@ -570,6 +806,16 @@ def profile_fingerprint(source: Path) -> dict[str, Any]:
         source / "Local State",
         source / "Default" / "Preferences",
     ]
+    # Login tokens for several relay sites live in Chromium Local Storage rather
+    # than cookies. Include the live LevelDB files so a login performed in
+    # BrowserOS invalidates the sync marker immediately.
+    for relative in (
+        Path("Default") / "Local Storage" / "leveldb",
+        Path("Default") / "Session Storage",
+    ):
+        directory = source / relative
+        if directory.is_dir():
+            candidates.extend(path for path in sorted(directory.rglob("*")) if path.is_file())
     files = []
     for path in candidates:
         if not path.is_file():
@@ -621,6 +867,21 @@ def sync_browseros_profile(
         dirs_exist_ok=True,
         ignore=shutil.ignore_patterns(*PROFILE_SYNC_IGNORE),
     )
+    # PROFILE_SYNC_IGNORE excludes generic log files to keep normal profile
+    # syncs small. Chromium's Local/Session Storage logs are authoritative for
+    # freshly written auth tokens, so copy those stores explicitly.
+    for relative in (
+        Path("Default") / "Local Storage",
+        Path("Default") / "Session Storage",
+    ):
+        storage = source / relative
+        if storage.is_dir():
+            shutil.copytree(
+                storage,
+                target / relative,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("LOCK"),
+            )
     remove_profile_singletons(target)
     synced_at = now_iso()
     marker.write_text(
@@ -634,6 +895,188 @@ def sync_browseros_profile(
         "target": str(target),
         "synced_at": synced_at,
     }
+
+
+def browseros_cdp_endpoint(config_path: str | Path | None = None) -> str:
+    path = Path(config_path).expanduser() if config_path else (
+        Path(BROWSEROS_SOURCE_PROFILE_DIR).expanduser() / ".browseros" / "config.json"
+    )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        port = int(data["ports"]["cdp"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProviderError(f"BrowserOS CDP configuration is unavailable: {path}") from exc
+    if not 1 <= port <= 65535:
+        raise ProviderError(f"BrowserOS CDP port is invalid: {port}")
+    return f"http://127.0.0.1:{port}"
+
+
+def normalized_http_origin(value: str) -> str:
+    try:
+        parsed = urlparse(str(value or ""))
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 80 if scheme == "http" else 443
+    authority = f"{host}:{port}" if port and port != default_port else host
+    return f"{scheme}://{authority}"
+
+
+def _start_browseros_cdp_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError as exc:
+        raise ProviderError(
+            "Playwright is required to read the live BrowserOS login session"
+        ) from exc
+    return sync_playwright().start()
+
+
+def sync_browseros_auth_sessions(
+    configs: list[ProviderConfig],
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    eligible = [
+        config
+        for config in configs
+        if config.enabled
+        and provider_supports_capability(
+            config.type, PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH
+        )
+        and normalized_http_origin(config.target_url)
+    ]
+    result: dict[str, Any] = {
+        "available": False,
+        "eligible": len(eligible),
+        "matched": 0,
+        "synced": 0,
+        "providers": [],
+        "failures": [],
+    }
+    if not eligible:
+        return result
+
+    session = BrowserOSSession(config_path=config_path)
+    try:
+        session.start()
+        result["available"] = True
+
+        synced: list[str] = []
+        failures: list[dict[str, str]] = []
+        matched = 0
+        for config in eligible:
+            origin = normalized_http_origin(config.target_url)
+            pages = session.existing_pages_for_url(config.target_url)
+            created_page = None
+            if not pages and uses_live_browseros(config):
+                try:
+                    created_page, _created = session.page_for_url(
+                        config.target_url
+                    )
+                    pages = [created_page]
+                except Exception as exc:
+                    failures.append({
+                        "id": config.id,
+                        "error": (str(exc).splitlines()[0] or exc.__class__.__name__)[:300],
+                    })
+            if not pages:
+                continue
+            matched += 1
+            try:
+                for page in pages:
+                    try:
+                        page_session = page.evaluate(
+                            """
+                            (expectedOrigin) => {
+                              try {
+                                if (globalThis.location?.origin !== expectedOrigin) return null;
+                                return {
+                                  authToken: globalThis.localStorage?.getItem("auth_token") || "",
+                                  refreshToken: globalThis.localStorage?.getItem("refresh_token") || "",
+                                  expiresAt: globalThis.localStorage?.getItem("token_expires_at") || ""
+                                };
+                              } catch {
+                                return null;
+                              }
+                            }
+                            """,
+                            origin,
+                        )
+                    except Exception:
+                        continue
+                    if not isinstance(page_session, dict):
+                        continue
+                    limits = {
+                        "authToken": 8192,
+                        "refreshToken": 8192,
+                        "expiresAt": 128,
+                    }
+                    values = {
+                        key: str(page_session.get(key) or "").strip()
+                        for key in limits
+                    }
+                    if any(
+                        len(values[key]) > limit
+                        for key, limit in limits.items()
+                    ):
+                        continue
+                    normalized = {
+                        key: value for key, value in values.items() if value
+                    }
+                    if not normalized.get("authToken") and not normalized.get(
+                        "refreshToken"
+                    ):
+                        continue
+                    if config.type == "sub2api":
+                        try:
+                            validate_sub2api_browser_session(page, config)
+                        except Exception as exc:
+                            if (
+                                isinstance(exc, NotLoggedInError)
+                                and created_page is page
+                            ):
+                                session.keep_page_open(created_page)
+                                created_page = None
+                            failures.append({
+                                "id": config.id,
+                                "error": (
+                                    str(exc).splitlines()[0]
+                                    or exc.__class__.__name__
+                                )[:300],
+                            })
+                            continue
+                    synced.append(config.id)
+                    break
+            finally:
+                if created_page is not None:
+                    session.release_page(created_page)
+
+        result.update({
+            "matched": matched,
+            "synced": len(synced),
+            "providers": synced,
+            "failures": failures,
+            "mode": "live_browseros",
+        })
+    except Exception as exc:
+        result["error"] = (str(exc).splitlines()[0] or exc.__class__.__name__)[:300]
+    finally:
+        session.close()
+    return result
 
 
 def wait_for_page_ready(
@@ -766,6 +1209,130 @@ class BrowserSession:
         if isinstance(urls, str):
             return self.context.cookies(urls)
         return self.context.cookies(urls)
+
+
+class BrowserOSSession(BrowserSession):
+    """Attach to the running BrowserOS without owning its contexts or user tabs."""
+
+    is_live_browseros = True
+
+    def __init__(self, config_path: str | Path | None = None) -> None:
+        self.config_path = config_path
+        self._pw = None
+        self._browser = None
+        self._created_pages: list[Any] = []
+
+    def start(self) -> "BrowserOSSession":
+        if self._browser is not None:
+            return self
+        try:
+            endpoint = browseros_cdp_endpoint(self.config_path)
+            self._pw = _start_browseros_cdp_playwright()
+            self._browser = self._pw.chromium.connect_over_cdp(
+                endpoint, timeout=10000
+            )
+            if not self._browser.contexts:
+                raise ProviderError("BrowserOS has no available browser context")
+        except Exception as exc:
+            self.close()
+            if isinstance(exc, ProviderError):
+                raise
+            raise ProviderError(
+                "Unable to connect to the running BrowserOS CDP session"
+            ) from exc
+        return self
+
+    def __enter__(self) -> "BrowserOSSession":
+        # Keep connection failures inside ProviderManager._refresh_config so one
+        # unavailable browser is reported as a Provider error, not a lost job.
+        return self
+
+    @property
+    def contexts(self) -> list[Any]:
+        if self._browser is None:
+            self.start()
+        return list(self._browser.contexts)
+
+    @property
+    def context(self):
+        contexts = self.contexts
+        if not contexts:
+            raise ProviderError("BrowserOS has no available browser context")
+        return contexts[0]
+
+    def existing_pages_for_url(self, target_url: str) -> list[Any]:
+        origin = normalized_http_origin(target_url)
+        if not origin:
+            raise ProviderError(f"Invalid Provider URL: {target_url}")
+        pages = []
+        for context in self.contexts:
+            for page in context.pages:
+                try:
+                    if page.is_closed():
+                        continue
+                    if normalized_http_origin(page.url) == origin:
+                        pages.append(page)
+                except Exception:
+                    continue
+        normalized_target = str(target_url).rstrip("/")
+        return sorted(
+            pages,
+            key=lambda page: 0
+            if str(getattr(page, "url", "")).rstrip("/") == normalized_target
+            else 1,
+        )
+
+    def page_for_url(self, target_url: str) -> tuple[Any, bool]:
+        pages = self.existing_pages_for_url(target_url)
+        if pages:
+            return pages[0], False
+
+        page = self.context.new_page()
+        self._created_pages.append(page)
+        try:
+            goto_with_frame_retry(
+                page,
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        except Exception:
+            self.release_page(page)
+            raise
+        return page, True
+
+    def release_page(self, page) -> None:
+        if page not in self._created_pages:
+            return
+        self._created_pages.remove(page)
+        try:
+            page.close()
+        except Exception:
+            pass
+
+    def keep_page_open(self, page) -> None:
+        """Hand a temporary page back to the user for an interactive login."""
+        if page not in self._created_pages:
+            return
+        self._created_pages.remove(page)
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+    def discard_page(self, page=None) -> None:
+        if page is not None:
+            self.release_page(page)
+
+    def close(self) -> None:
+        for page in list(self._created_pages):
+            self.release_page(page)
+        self._browser = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            finally:
+                self._pw = None
 
 
 def html_tokens(html: str) -> list[str]:
@@ -2282,8 +2849,13 @@ class Provider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
 
+    def supports(self, capability: str) -> bool:
+        return provider_supports_capability(self.config.type, capability)
+
     def uses_browser(self) -> bool:
-        return self.config.mode != "api" and self.config.type != "deepseek"
+        return self.config.mode != "api" and not self.supports(
+            PROVIDER_CAPABILITY_API_ONLY
+        )
 
     def fetch(
         self,
@@ -2301,32 +2873,74 @@ class Provider:
 
     @contextmanager
     def browser_page(self, browser: BrowserSession | None = None) -> Iterator[Any]:
-        if browser is not None:
-            auth_session = load_provider_auth_session(self.config)
-            page = browser.context.new_page() if auth_session else browser.page()
-            if auth_session:
-                install_provider_auth_session(page, self.config)
-            try:
-                yield page
-            except Exception as exc:
-                if is_transient_frame_error(exc):
-                    browser.discard_page(page)
-                raise
-            finally:
-                if auth_session:
+        auth_enabled = self.supports(PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH)
+        auth_scope = (
+            provider_auth_session_lock(self.config.id)
+            if auth_enabled
+            else nullcontext()
+        )
+        with auth_scope:
+            if browser is not None:
+                if getattr(browser, "is_live_browseros", False):
+                    page, created = browser.page_for_url(self.config.target_url)
                     try:
-                        page.close()
-                    except Exception:
-                        pass
-            return
-        session = BrowserSession(self.config.profile_dir)
-        session.start()
-        try:
-            page = session.page()
-            install_provider_auth_session(page, self.config)
-            yield page
-        finally:
-            session.close()
+                        yield page
+                    except NotLoggedInError:
+                        if created:
+                            browser.keep_page_open(page)
+                        raise
+                    except Exception as exc:
+                        if is_transient_frame_error(exc):
+                            browser.discard_page(page)
+                        raise
+                    finally:
+                        browser.release_page(page)
+                    return
+                auth_session = load_provider_auth_session(self.config) if auth_enabled else {}
+                page = browser.context.new_page() if auth_session else browser.page()
+                if auth_session:
+                    install_provider_auth_session(page, self.config, auth_session)
+                auth_failed = False
+                try:
+                    yield page
+                except NotLoggedInError:
+                    auth_failed = True
+                    if auth_enabled:
+                        delete_local_secret(provider_auth_secret_name(self.config.id))
+                    raise
+                except Exception as exc:
+                    if is_transient_frame_error(exc):
+                        browser.discard_page(page)
+                    raise
+                finally:
+                    if auth_enabled and not auth_failed:
+                        persist_provider_auth_session(page, self.config, auth_session)
+                    if auth_session:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                return
+            session = BrowserSession(self.config.profile_dir)
+            session.start()
+            try:
+                page = session.page()
+                auth_session = load_provider_auth_session(self.config) if auth_enabled else {}
+                if auth_session:
+                    install_provider_auth_session(page, self.config, auth_session)
+                auth_failed = False
+                try:
+                    yield page
+                except NotLoggedInError:
+                    auth_failed = True
+                    if auth_enabled:
+                        delete_local_secret(provider_auth_secret_name(self.config.id))
+                    raise
+                finally:
+                    if auth_enabled and not auth_failed:
+                        persist_provider_auth_session(page, self.config, auth_session)
+            finally:
+                session.close()
 
 
 class BrowserJsonProvider(Provider):
@@ -2346,10 +2960,18 @@ class BrowserJsonProvider(Provider):
               try { data = await response.json(); } catch { data = null; }
               return { ok: response.ok, status: response.status, data, hasToken: Boolean(token) };
             }
-            """
+        """
         result = evaluate_with_frame_retry(page, script, url)
         if result.get("status") in (401, 403):
-            raise NotLoggedInError(self.login_error)
+            payload = result.get("data")
+            details = []
+            if isinstance(payload, dict):
+                for key in ("code", "message", "detail"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        details.append(value.strip())
+            suffix = f": {' - '.join(details)[:300]}" if details else ""
+            raise NotLoggedInError(f"{self.login_error}{suffix}")
         if not result.get("ok"):
             raise ProviderError(f"{self.config.name} API returned HTTP {result.get('status')}")
         return result.get("data")
@@ -2831,8 +3453,22 @@ class NewAPIProvider(BrowserJsonProvider):
 
 class Sub2APIProvider(ChannelApiProvider):
     login_hints = SUB2API_LOGIN_HINTS
-    login_error = "BrowserOS profile is not logged in to this Sub2API provider"
+    login_error = "BrowserOS is not logged in to this Sub2API provider"
     ready_pattern = DEFAULT_READY_PATTERN
+
+    def _refresh_auth_session(self, page, *, force: bool = False) -> bool:
+        options: dict[str, Any] = {"force": True} if force else {}
+        if getattr(self, "_live_browseros", False):
+            options["persist"] = False
+        return refresh_sub2api_auth_session(page, self.config, **options)
+
+    def page_api_json(self, page, url: str) -> Any:
+        try:
+            return super().page_api_json(page, url)
+        except NotLoggedInError:
+            if not self._refresh_auth_session(page, force=True):
+                raise
+            return super().page_api_json(page, url)
 
     def fetch(
         self,
@@ -2840,30 +3476,61 @@ class Sub2APIProvider(ChannelApiProvider):
         browser_fallback: bool = True,
         browser: BrowserSession | None = None,
     ) -> dict[str, Any]:
-        with self.browser_page(browser) as page:
-            page_url, _, _ = self.goto_with_json(page, self.config.target_url, min_wait_ms=1000)
-            timezone_query = quote("Asia/Shanghai", safe="")
-            auth_payload = self.page_api_json(page, self.origin_url(f"/api/v1/auth/me?timezone={timezone_query}"))
-            try:
-                stats_payload = self.page_api_json(
+        previous_live_mode = getattr(self, "_live_browseros", False)
+        self._live_browseros = bool(
+            browser is not None and getattr(browser, "is_live_browseros", False)
+        )
+        try:
+            with self.browser_page(browser) as page:
+                if self._live_browseros:
+                    page_url = page.url
+                else:
+                    try:
+                        page_url, _, _ = self.goto_with_json(
+                            page, self.config.target_url, min_wait_ms=1000
+                        )
+                    except NotLoggedInError:
+                        if not self._refresh_auth_session(page, force=True):
+                            raise
+                        page_url, _, _ = self.goto_with_json(
+                            page, self.config.target_url, min_wait_ms=1000
+                        )
+                self._refresh_auth_session(page)
+                timezone_query = quote("Asia/Shanghai", safe="")
+                auth_payload = self.page_api_json(
                     page,
-                    self.origin_url(f"/api/v1/usage/dashboard/stats?timezone={timezone_query}"),
+                    self.origin_url(
+                        f"/api/v1/auth/me?timezone={timezone_query}"
+                    ),
                 )
-            except Exception:
-                stats_payload = None
-            monitors, groups, rates, channel_error = self.fetch_channel_payloads(
-                page,
-                ("/api/v1/channels/available", "/api/v1/groups/available"),
-            )
-            channels = None if channel_error else parse_sub2api_channels(self.config, monitors, groups, rates)
-            return sub2api_snapshot(
-                self.config,
-                page_url,
-                auth_payload,
-                stats_payload,
-                channels=channels,
-                channel_error=channel_error,
-            )
+                try:
+                    stats_payload = self.page_api_json(
+                        page,
+                        self.origin_url(
+                            f"/api/v1/usage/dashboard/stats?timezone={timezone_query}"
+                        ),
+                    )
+                except Exception:
+                    stats_payload = None
+                monitors, groups, rates, channel_error = self.fetch_channel_payloads(
+                    page,
+                    ("/api/v1/channels/available", "/api/v1/groups/available"),
+                )
+                channels = (
+                    None
+                    if channel_error
+                    else parse_sub2api_channels(self.config, monitors, groups, rates)
+                )
+                return sub2api_snapshot(
+                    self.config,
+                    page_url,
+                    auth_payload,
+                    stats_payload,
+                    channels=channels,
+                    channel_error=channel_error,
+                )
+        finally:
+            self._live_browseros = previous_live_mode
 
 
 class EZAICLUBProvider(ChannelApiProvider):
@@ -2986,9 +3653,18 @@ PROVIDER_TYPES: dict[str, type[Provider]] = {
     "sub2api": Sub2APIProvider,
 }
 
+if tuple(PROVIDER_TYPES) != provider_definition_types():
+    raise RuntimeError("Provider implementations do not match Provider definitions")
+
 
 def is_api_provider(config: ProviderConfig) -> bool:
-    return config.mode == "api" or config.type == "deepseek"
+    return config.mode == "api" or provider_supports_capability(
+        config.type, PROVIDER_CAPABILITY_API_ONLY
+    )
+
+
+def uses_live_browseros(config: ProviderConfig) -> bool:
+    return config.type == "sub2api"
 
 
 class ProviderManager:
@@ -3048,7 +3724,8 @@ class ProviderManager:
         return self._provider_for_config(config)
 
     def _provider_for_config(self, config: ProviderConfig) -> Provider:
-        provider_class = PROVIDER_TYPES.get(config.type)
+        definition = get_provider_definition(config.type)
+        provider_class = PROVIDER_TYPES.get(definition.type) if definition else None
         if provider_class:
             return provider_class(config)
         raise ValueError(f"unsupported provider type: {config.type}")
@@ -3110,6 +3787,9 @@ class ProviderManager:
                 config = copy.deepcopy(config)
             if not config:
                 raise KeyError(f"unknown provider: {provider_id}")
+            if browser is None and uses_live_browseros(config):
+                with BrowserOSSession() as session:
+                    return self._refresh_config(config, browser=session)
             return self._refresh_config(config, browser=browser)
 
     def _refresh_config(
@@ -3137,11 +3817,15 @@ class ProviderManager:
             stale_metrics = previous.get("metrics", []) if previous else []
             stale_balances = previous.get("balances", []) if previous else []
             stale_usage = previous.get("usage", []) if previous else []
+            if isinstance(exc, NotLoggedInError):
+                failure_status = "needs_login"
+            else:
+                failure_status = "error" if not (stale_metrics or stale_balances or stale_usage) else "stale"
             snapshot = {
                 "id": config.id,
                 "name": config.name,
                 "type": config.type,
-                "status": "error" if not (stale_metrics or stale_balances or stale_usage) else "stale",
+                "status": failure_status,
                 "url": config.target_url,
                 "updated_at": previous.get("updated_at") if previous else None,
                 "checked_at": now_iso(),
@@ -3191,9 +3875,12 @@ class ProviderManager:
     ) -> list[dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}
         api_ids = [config.id for config in enabled if is_api_provider(config)]
+        live_browseros_ids = [
+            config.id for config in enabled if uses_live_browseros(config)
+        ]
         browser_groups: dict[str, list[str]] = {}
         for config in enabled:
-            if is_api_provider(config):
+            if is_api_provider(config) or uses_live_browseros(config):
                 continue
             browser_groups.setdefault(config.profile_dir, []).append(config.id)
 
@@ -3234,6 +3921,12 @@ class ProviderManager:
         max_workers = max(1, len(api_ids))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(refresh_one, provider_id): provider_id for provider_id in api_ids}
+            if live_browseros_ids:
+                with BrowserOSSession() as session:
+                    for provider_id in live_browseros_ids:
+                        results[provider_id] = refresh_one(
+                            provider_id, browser=session
+                        )
             for profile_dir, provider_ids in browser_groups.items():
                 with BrowserSession(profile_dir) as session:
                     for provider_id in provider_ids:
@@ -3255,7 +3948,9 @@ class ProviderManager:
             if configs is None
             else copy.deepcopy([
                 config for config in configs
-                if config.enabled and config.type in {"ezaiclub", "sub2api"}
+                if config.enabled and provider_supports_capability(
+                    config.type, PROVIDER_CAPABILITY_CHANNELS
+                )
             ])
         )
         with self._refresh_operation("channels"):
@@ -3266,7 +3961,9 @@ class ProviderManager:
     def channel_configs(self) -> list[ProviderConfig]:
         return [
             config for config in self.enabled_configs()
-            if config.type in {"ezaiclub", "sub2api"}
+            if provider_supports_capability(
+                config.type, PROVIDER_CAPABILITY_CHANNELS
+            )
         ]
 
     def _refresh_channel_configs(
@@ -3275,44 +3972,58 @@ class ProviderManager:
         progress: Callable[[str, ProviderConfig, dict[str, Any] | None], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> list[dict[str, Any]]:
-        results = []
+        results: dict[str, dict[str, Any]] = {}
+        live_browseros_ids = [
+            config.id
+            for config in channel_configs
+            if uses_live_browseros(config)
+        ]
         browser_groups: dict[str, list[str]] = {}
         for config in channel_configs:
+            if uses_live_browseros(config):
+                continue
             browser_groups.setdefault(config.profile_dir, []).append(config.id)
-        for profile_dir, provider_ids in browser_groups.items():
-            with BrowserSession(profile_dir) as session:
-                for provider_id in provider_ids:
-                    config = next(
-                        item for item in channel_configs if item.id == provider_id
-                    )
-                    if cancel_event and cancel_event.is_set():
-                        snapshot = {
-                            "id": provider_id,
-                            "name": config.name,
-                            "type": config.type,
-                            "status": "cancelled",
-                            "error": "刷新已取消",
-                        }
-                        if progress:
-                            progress("completed", config, snapshot)
-                        results.append(snapshot)
-                        continue
-                    if progress:
-                        progress("started", config, None)
-                    try:
-                        snapshot = self._refresh_config(config, browser=session)
-                    except Exception as exc:
-                        snapshot = {
-                            "id": provider_id,
-                            "name": config.name,
-                            "type": config.type,
-                            "status": "error",
-                            "error": str(exc),
-                        }
+
+        def refresh_group(provider_ids: list[str], session: BrowserSession) -> None:
+            for provider_id in provider_ids:
+                config = next(
+                    item for item in channel_configs if item.id == provider_id
+                )
+                if cancel_event and cancel_event.is_set():
+                    snapshot = {
+                        "id": provider_id,
+                        "name": config.name,
+                        "type": config.type,
+                        "status": "cancelled",
+                        "error": "刷新已取消",
+                    }
                     if progress:
                         progress("completed", config, snapshot)
-                    results.append(snapshot)
-        return results
+                    results[provider_id] = snapshot
+                    continue
+                if progress:
+                    progress("started", config, None)
+                try:
+                    snapshot = self._refresh_config(config, browser=session)
+                except Exception as exc:
+                    snapshot = {
+                        "id": provider_id,
+                        "name": config.name,
+                        "type": config.type,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                if progress:
+                    progress("completed", config, snapshot)
+                results[provider_id] = snapshot
+
+        if live_browseros_ids:
+            with BrowserOSSession() as session:
+                refresh_group(live_browseros_ids, session)
+        for profile_dir, provider_ids in browser_groups.items():
+            with BrowserSession(profile_dir) as session:
+                refresh_group(provider_ids, session)
+        return [results[config.id] for config in channel_configs]
 
     def explore(self, provider_id: str) -> Path:
         return self.get_provider(provider_id).explore()

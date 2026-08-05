@@ -157,6 +157,9 @@ class ServerApiTests(unittest.TestCase):
         self.assertIsNone(channels["channels"][2]["effectiveMultiplier"])
         self.assertEqual(channels["summary"]["providerCount"], 1)
         self.assertEqual(channels["summary"]["latestCheckedAt"], "2026-08-03T12:00:00+08:00")
+        self.assertEqual(channels["providers"][0]["id"], "channel-test")
+        self.assertEqual(channels["providers"][0]["channelCount"], 3)
+        self.assertEqual(channels["providers"][0]["status"], "ok")
 
         status, legacy_operational = self.request("/api/channels?model=model-a&include_degraded=0")
         self.assertEqual(status, 200)
@@ -168,6 +171,26 @@ class ServerApiTests(unittest.TestCase):
             [item["resolvedStatus"] for item in legacy_degraded["channels"]],
             ["operational", "degraded"],
         )
+
+    def test_channel_endpoint_exposes_provider_without_channel_rows(self):
+        manager = self.server.RequestHandlerClass.manager
+        manager.cache["providers"]["channel-test"] = {
+            "id": "channel-test",
+            "name": "Channel Test",
+            "type": "sub2api",
+            "status": "needs_login",
+            "url": "https://channel.example/dashboard",
+            "error": "login required",
+            "channels": [],
+            "channelCheckedAt": None,
+            "channelsStale": False,
+        }
+        status, result = self.request("/api/channels")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["channels"], [])
+        self.assertEqual(result["providers"][0]["id"], "channel-test")
+        self.assertEqual(result["providers"][0]["status"], "needs_login")
+        self.assertEqual(result["providers"][0]["channelCount"], 0)
 
     def test_provider_update_order_settings_and_validation(self):
         status, result = self.request("/api/config/provider", "POST", {"provider": {
@@ -244,6 +267,12 @@ class ServerApiTests(unittest.TestCase):
         self.assertIn('id="local-sync-token"', settings)
         self.assertIn('/static/config-events.js', settings)
         self.assertIn('/static/api.js', settings)
+
+        status, health = self.request("/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["service"], "provider-usage-hub")
+        self.assertEqual(health["schemaVersion"], 4)
 
     def test_refresh_all_runs_in_background_and_reports_progress(self):
         refresh_started = threading.Event()
@@ -587,6 +616,26 @@ class ServerApiTests(unittest.TestCase):
         })
         self.assertEqual(status, 400)
         self.assertIn("origin", result["error"])
+
+    def test_sync_auth_reads_live_browseros_sessions_without_copying_profile(self):
+        auth_result = {
+            "available": True,
+            "eligible": 1,
+            "matched": 1,
+            "synced": 1,
+            "providers": ["channel-test"],
+        }
+        with patch(
+            "server.sync_browseros_auth_sessions", return_value=auth_result
+        ) as sync_sessions:
+            status, result = self.request("/api/sync-auth", "POST")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "live_browseros")
+        self.assertEqual(result["authSessions"], auth_result)
+        synced_configs = sync_sessions.call_args.args[0]
+        self.assertEqual([config.id for config in synced_configs], ["deepseek", "channel-test"])
 
 
 if __name__ == "__main__":

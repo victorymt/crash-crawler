@@ -1,4 +1,8 @@
 import { linksForConfig } from "./config.js";
+import {
+  PROVIDER_CAPABILITIES,
+  providerSupportsCapability
+} from "./provider_definitions.js";
 import { classifyCollectionError, sanitizeDiagnosticMessage } from "../providers/runtime.js";
 
 export function nowIso() {
@@ -77,7 +81,7 @@ export function blankSnapshot(config, status = "idle", error = null) {
     channelsStale: false,
     channelError: null,
     links: linksForConfig(config),
-    recommendation: ["error", "unconfigured", "needs_visit"].includes(status) ? "watch" : "ok",
+    recommendation: ["error", "unconfigured", "needs_login", "needs_visit"].includes(status) ? "watch" : "ok",
     error
   };
 }
@@ -92,7 +96,13 @@ export function errorSnapshot(config, previous, error) {
     id: config.id,
     name: config.name,
     type: config.type,
-    status: hasStaleData ? "stale" : errorCode === "NEEDS_VISIT" ? "needs_visit" : "error",
+    status: errorCode === "NOT_LOGGED_IN"
+      ? "needs_login"
+      : hasStaleData
+        ? "stale"
+        : errorCode === "NEEDS_VISIT"
+          ? "needs_visit"
+          : "error",
     url: config.targetUrl,
     updatedAt: previous?.updatedAt || null,
     checkedAt: nowIso(),
@@ -132,8 +142,11 @@ export function preservePreviousChannels(snapshot, previous) {
 
 export function snapshotNeedsRetry(snapshot, { channelsOnly = false } = {}) {
   if (!snapshot || typeof snapshot !== "object") return false;
-  if (channelsOnly && !["ezaiclub", "sub2api"].includes(snapshot.type)) return false;
-  if (["error", "stale", "needs_visit"].includes(snapshot.status)) return true;
+  if (channelsOnly && !providerSupportsCapability(
+    snapshot.type,
+    PROVIDER_CAPABILITIES.CHANNELS
+  )) return false;
+  if (["error", "stale", "needs_login", "needs_visit"].includes(snapshot.status)) return true;
   return channelsOnly && (Boolean(snapshot.channelError) || snapshot.channelsStale === true);
 }
 
@@ -146,7 +159,7 @@ export function badgeFromSnapshots(snapshots) {
   let recharge = 0;
   let watch = 0;
   for (const snapshot of list) {
-    if (snapshot.status === "error" || snapshot.status === "stale" || snapshot.status === "unconfigured") {
+    if (["error", "stale", "unconfigured", "needs_login"].includes(snapshot.status)) {
       errors += 1;
     } else if (snapshot.recommendation === "recharge") {
       recharge += 1;

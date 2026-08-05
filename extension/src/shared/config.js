@@ -1,3 +1,8 @@
+import {
+  defaultProviderMode,
+  providerDefinitionTypes
+} from "./provider_definitions.js";
+
 export const DEFAULT_OPENCODE_URL = "https://opencode.ai/workspace/wrk_01KW9MTABWQ0DNJ014CV528WC2/go";
 export const DEFAULT_DEEPSEEK_URL = "https://platform.deepseek.com/usage";
 export const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
@@ -59,7 +64,7 @@ export const DEFAULT_PROVIDER_CONFIGS = [
 ];
 
 export const PROVIDER_SCHEMA_VERSION = 4;
-export const SUPPORTED_PROVIDER_TYPES = ["page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"];
+export const SUPPORTED_PROVIDER_TYPES = providerDefinitionTypes();
 export const BUILTIN_PROVIDER_IDS = DEFAULT_PROVIDER_CONFIGS.map((config) => config.id);
 
 const MAX_PROVIDERS = 64;
@@ -546,7 +551,7 @@ export function normalizeProviderConfig(raw) {
     enabled: raw.enabled !== false,
     refreshOnVisit: (raw.refreshOnVisit ?? raw.refresh_on_visit) === true,
     secondaryUrls: normalizeSecondaryUrls(raw),
-    mode: String(raw.mode || "page"),
+    mode: String(raw.mode || defaultProviderMode(requestedType)),
     ...(parserRules ? { parserRules } : {}),
     ...((raw.quotaPerUnit ?? raw.quota_per_unit) != null
       ? { quotaPerUnit: Number(raw.quotaPerUnit ?? raw.quota_per_unit) }

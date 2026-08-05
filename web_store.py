@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from provider_definitions import provider_definition_types
 from providers import CONFIG_FILE, ProviderConfig, default_config
 
-SUPPORTED_PROVIDER_TYPES = {"page", "opencode", "deepseek", "ezaiclub", "siliconflow", "newapi", "sub2api"}
+SUPPORTED_PROVIDER_TYPES = frozenset(provider_definition_types())
 DEFAULT_SETTINGS = {"auto_refresh_minutes": 0}
 MAX_PROVIDERS = 64
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "provider-config-v4.schema.json"

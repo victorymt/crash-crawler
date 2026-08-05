@@ -5,6 +5,8 @@ let providers = [];
 let activeOperation = false;
 let lastChannelLoadAt = 0;
 let channelReloadPromise = null;
+const pendingProviderIds = new Set();
+let pendingProviderRetryPromise = null;
 const requestJson = window.providerApi.requestJson;
 
 function escapeHtml(value) {
@@ -105,6 +107,37 @@ function channelRowHtml(channel, index) {
     : `<div class="${className}">${body}</div>`;
 }
 
+function providerHealthState(provider) {
+  if (provider.status === "needs_login") return { label: "需要登录", tone: "needs-login" };
+  if (provider.status === "needs_visit") return { label: "需要访问", tone: "warning" };
+  if (provider.channelsStale || provider.status === "stale") return { label: "使用旧数据", tone: "warning" };
+  if (provider.error || provider.status === "error") return { label: "采集失败", tone: "error" };
+  if (provider.status === "idle") return { label: "尚未刷新", tone: "idle" };
+  if (!Number(provider.channelCount)) return { label: "暂无渠道", tone: "idle" };
+  return { label: "正常", tone: "ok" };
+}
+
+function renderProviderHealth() {
+  const root = document.getElementById("channel-provider-health");
+  const issues = providers.filter((provider) => {
+    const state = providerHealthState(provider);
+    return state.tone !== "ok";
+  });
+  root.hidden = issues.length === 0;
+  root.innerHTML = issues.map((provider) => {
+    const state = providerHealthState(provider);
+    const checkedAt = Date.parse(provider.channelCheckedAt || "");
+    const fallback = Number.isFinite(checkedAt)
+      ? `上次成功 ${new Date(checkedAt).toLocaleString()}`
+      : "尚无成功记录";
+    const detail = String(provider.error || fallback).slice(0, 180);
+    const content = `<strong>${escapeHtml(provider.name)}</strong><span class="provider-health-status ${state.tone}">${escapeHtml(state.label)}</span><small>${escapeHtml(detail)}</small>`;
+    return provider.url
+      ? `<a href="${escapeHtml(provider.url)}" data-provider-id="${escapeHtml(provider.id)}" target="_blank" rel="noopener noreferrer">${content}</a>`
+      : `<div>${content}</div>`;
+  }).join("");
+}
+
 function render() {
   const select = document.getElementById("channel-model");
   const selected = select.value;
@@ -126,6 +159,7 @@ function render() {
     ...providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`)
   ].join("");
   providerSelect.value = providers.some((provider) => String(provider.id) === String(selectedProvider)) ? selectedProvider : "";
+  renderProviderHealth();
   document.getElementById("channel-results").innerHTML = channels.length
     ? channels.map(channelRowHtml).join("")
     : '<div class="empty">当前没有符合筛选条件的渠道</div>';
@@ -163,6 +197,67 @@ async function loadChannels() {
   summary = data.summary || {};
   lastChannelLoadAt = Date.now();
   render();
+}
+
+function queueProviderRetry(providerId) {
+  const normalized = String(providerId || "").trim();
+  if (normalized) pendingProviderIds.add(normalized);
+}
+
+function providerNeedsRetryAfterLogin(providerId) {
+  const provider = providers.find((item) => String(item.id) === String(providerId));
+  return !provider
+    || ["needs_login", "needs_visit", "stale", "error"].includes(provider.status)
+    || Boolean(provider.error)
+    || provider.channelsStale === true;
+}
+
+async function retryPendingProviders() {
+  if (
+    !pendingProviderIds.size
+    || activeOperation
+    || document.visibilityState === "hidden"
+    || pendingProviderRetryPromise
+  ) return;
+
+  const providerIds = [...pendingProviderIds];
+  pendingProviderIds.clear();
+  pendingProviderRetryPromise = (async () => {
+    activeOperation = true;
+    setControlsDisabled(true);
+    setRetryVisible(false);
+    setMessage("登录已返回，正在同步登录态并重新采集 Provider...");
+    let refreshed = 0;
+    try {
+      await requestJson("/api/sync-auth", { method: "POST", timeout: 120000 });
+      for (const providerId of providerIds) {
+        await requestJson(
+          `/api/providers/${encodeURIComponent(providerId)}/refresh`,
+          { method: "POST", timeout: 120000 }
+        );
+        refreshed += 1;
+      }
+      await loadChannels();
+      const stillPending = providerIds.filter(providerNeedsRetryAfterLogin);
+      stillPending.forEach(queueProviderRetry);
+      if (stillPending.length) {
+        setMessage(`已重新采集 ${refreshed} 个 Provider，${stillPending.length} 个仍需登录或重试`, true);
+      } else {
+        setMessage(`登录后已重新采集 ${refreshed} 个 Provider`);
+      }
+    } catch (error) {
+      providerIds.forEach(queueProviderRetry);
+      await loadChannels().catch(() => undefined);
+      setMessage(error.message || "登录后重新采集失败", true);
+    } finally {
+      activeOperation = false;
+      setControlsDisabled(false);
+      setRetryVisible(Number(summary.failedCount || 0) > 0);
+    }
+  })().finally(() => {
+    pendingProviderRetryPromise = null;
+  });
+  await pendingProviderRetryPromise;
 }
 
 function reloadChannelsIfVisible(force = false) {
@@ -286,7 +381,19 @@ document.getElementById("channel-provider").addEventListener("change", () => loa
 document.getElementById("refresh-channels").addEventListener("click", refreshChannels);
 document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
 document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);
+document.getElementById("channel-provider-health").addEventListener("click", (event) => {
+  const link = event.target.closest("a[data-provider-id]");
+  if (link) queueProviderRetry(link.dataset.providerId);
+});
 window.providerConfigEvents?.subscribe(() => reloadChannelsIfVisible(true));
-window.addEventListener("focus", () => reloadChannelsIfVisible());
-document.addEventListener("visibilitychange", () => reloadChannelsIfVisible());
+function reloadAfterProviderLogin() {
+  if (document.visibilityState !== "hidden") {
+    window.setTimeout(() => {
+      retryPendingProviders().catch((error) => setMessage(error.message, true));
+      reloadChannelsIfVisible();
+    }, 0);
+  }
+}
+window.addEventListener("focus", reloadAfterProviderLogin);
+document.addEventListener("visibilitychange", reloadAfterProviderLogin);
 initialize().catch((error) => setMessage(error.message || "读取渠道失败", true));

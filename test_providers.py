@@ -2,10 +2,12 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 from providers import (
+    BrowserOSSession,
     DeepSeekProvider,
     EZAICLUBProvider,
     GenericPageProvider,
@@ -20,6 +22,8 @@ from providers import (
     evaluate_with_frame_retry,
     goto_with_frame_retry,
     install_provider_auth_session,
+    persist_provider_auth_session,
+    provider_auth_session_lock,
     parse_deepseek_balance,
     parse_ezaiclub_balance_tokens,
     parse_ezaiclub_subscription_tokens,
@@ -30,6 +34,9 @@ from providers import (
     parse_siliconflow_balance_tokens,
     parse_siliconflow_metric_tokens,
     profile_fingerprint,
+    resolve_browser_executable,
+    refresh_sub2api_auth_session,
+    sync_browseros_auth_sessions,
     sync_browseros_profile,
     wait_for_page_ready,
     is_transient_frame_error,
@@ -37,6 +44,19 @@ from providers import (
 
 
 class ProviderParserTests(unittest.TestCase):
+    def test_browser_executable_prefers_config_then_system_chromium(self):
+        with patch.dict("providers.os.environ", {"PROVIDER_BROWSER_BIN": "/custom/chromium"}, clear=True):
+            self.assertEqual(resolve_browser_executable(), "/custom/chromium")
+
+        with (
+            patch.dict("providers.os.environ", {}, clear=True),
+            patch("providers.shutil.which", side_effect=lambda name: "/usr/bin/chromium" if name == "chromium" else None),
+        ):
+            self.assertEqual(resolve_browser_executable(), "/usr/bin/chromium")
+
+        with patch.dict("providers.os.environ", {"BROWSEROS_BIN": "/legacy/browser"}, clear=True):
+            self.assertEqual(resolve_browser_executable(), "/legacy/browser")
+
     def test_provider_cache_save_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_file = Path(tmp) / "cache.json"
@@ -507,11 +527,325 @@ class ProviderParserTests(unittest.TestCase):
             self.assertTrue(second.get("skipped"))
             self.assertEqual(profile_fingerprint(source)["source"], str(source.resolve()))
 
+    def test_sync_browseros_profile_detects_and_copies_local_storage_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            storage = source / "Default" / "Local Storage" / "leveldb"
+            storage.mkdir(parents=True)
+            token_log = storage / "000003.log"
+            token_log.write_text("before-login", encoding="utf-8")
+
+            first = sync_browseros_profile(source, target)
+            second = sync_browseros_profile(source, target)
+            token_log.write_text("after-login-with-new-token", encoding="utf-8")
+            third = sync_browseros_profile(source, target)
+
+            self.assertFalse(first.get("skipped"))
+            self.assertTrue(second.get("skipped"))
+            self.assertFalse(third.get("skipped"))
+            self.assertEqual(
+                (target / "Default" / "Local Storage" / "leveldb" / "000003.log").read_text(
+                    encoding="utf-8"
+                ),
+                "after-login-with-new-token",
+            )
+
     def test_sync_browseros_profile_rejects_missing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with self.assertRaises(Exception):
                 sync_browseros_profile(root / "missing", root / "target")
+
+    def test_sync_browseros_auth_sessions_reads_only_matching_open_pages(self):
+        fluxion = ProviderConfig(
+            id="fluxionai",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        other = ProviderConfig(
+            id="other-relay",
+            name="Other Relay",
+            type="sub2api",
+            target_url="https://other.example/dashboard",
+        )
+        unsupported = ProviderConfig(
+            id="generic",
+            name="Generic",
+            type="page",
+            target_url="https://fluxionai.space/dashboard",
+        )
+
+        class FakePage:
+            def __init__(self, url, session):
+                self.url = url
+                self.session = session
+                self.arguments = []
+
+            def is_closed(self):
+                return False
+
+            def evaluate(self, _script, argument=None):
+                self.arguments.append(argument)
+                return self.session
+
+        fluxion_page = FakePage("https://fluxionai.space/console/keys", {
+            "authToken": "live-access-token",
+            "refreshToken": "live-refresh-token",
+            "expiresAt": "123456",
+        })
+        unrelated_page = FakePage("https://attacker.example/dashboard", {
+            "authToken": "attacker-token",
+        })
+
+        class FakeBrowser:
+            contexts = [type("Context", (), {"pages": [fluxion_page, unrelated_page]})()]
+
+        class FakeChromium:
+            endpoint = ""
+
+            def connect_over_cdp(self, endpoint, timeout):
+                self.endpoint = endpoint
+                self.timeout = timeout
+                return FakeBrowser()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        fake_playwright = FakePlaywright()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps({"ports": {"cdp": 9144}}), encoding="utf-8")
+            with (
+                patch("providers._start_browseros_cdp_playwright", return_value=fake_playwright),
+                patch("providers.save_provider_auth_session", return_value=True) as save_session,
+                patch(
+                    "providers.validate_sub2api_browser_session",
+                    return_value=True,
+                ) as validate_session,
+            ):
+                result = sync_browseros_auth_sessions(
+                    [fluxion, other, unsupported], config_path=config_path
+                )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["eligible"], 2)
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["synced"], 1)
+        self.assertEqual(result["providers"], ["fluxionai"])
+        self.assertEqual(fake_playwright.chromium.endpoint, "http://127.0.0.1:9144")
+        self.assertTrue(fake_playwright.stopped)
+        self.assertEqual(fluxion_page.arguments, ["https://fluxionai.space"])
+        self.assertEqual(unrelated_page.arguments, [])
+        self.assertEqual(result["mode"], "live_browseros")
+        save_session.assert_not_called()
+        validate_session.assert_called_once_with(fluxion_page, fluxion)
+        self.assertNotIn("live-access-token", json.dumps(result))
+
+    def test_browseros_session_reuses_existing_page_without_closing_it(self):
+        class FakePage:
+            url = "https://fluxionai.space/console/keys"
+
+            def __init__(self):
+                self.closed = False
+
+            def is_closed(self):
+                return self.closed
+
+            def close(self):
+                self.closed = True
+
+        page = FakePage()
+        context = type("Context", (), {"pages": [page]})()
+
+        class FakeChromium:
+            def connect_over_cdp(self, _endpoint, timeout):
+                self.timeout = timeout
+                return type("Browser", (), {"contexts": [context]})()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        playwright = FakePlaywright()
+        with (
+            patch("providers.browseros_cdp_endpoint", return_value="http://127.0.0.1:9144"),
+            patch("providers._start_browseros_cdp_playwright", return_value=playwright),
+        ):
+            with BrowserOSSession() as session:
+                selected, created = session.page_for_url(
+                    "https://fluxionai.space/dashboard"
+                )
+                session.release_page(selected)
+
+        self.assertIs(selected, page)
+        self.assertFalse(created)
+        self.assertFalse(page.closed)
+        self.assertTrue(playwright.stopped)
+
+    def test_browseros_session_closes_only_its_temporary_page(self):
+        class FakePage:
+            url = "about:blank"
+
+            def __init__(self):
+                self.closed = False
+                self.goto_urls = []
+
+            def is_closed(self):
+                return self.closed
+
+            def goto(self, url, **_kwargs):
+                self.goto_urls.append(url)
+                self.url = url
+
+            def close(self):
+                self.closed = True
+
+        page = FakePage()
+
+        class FakeContext:
+            pages = []
+
+            def new_page(self):
+                return page
+
+        context = FakeContext()
+
+        class FakeChromium:
+            def connect_over_cdp(self, _endpoint, timeout):
+                self.timeout = timeout
+                return type("Browser", (), {"contexts": [context]})()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+
+            def stop(self):
+                return None
+
+        with (
+            patch("providers.browseros_cdp_endpoint", return_value="http://127.0.0.1:9144"),
+            patch(
+                "providers._start_browseros_cdp_playwright",
+                return_value=FakePlaywright(),
+            ),
+        ):
+            with BrowserOSSession() as session:
+                selected, created = session.page_for_url(
+                    "https://fluxionai.space/dashboard"
+                )
+                self.assertFalse(selected.closed)
+
+        self.assertTrue(created)
+        self.assertEqual(page.goto_urls, ["https://fluxionai.space/dashboard"])
+        self.assertTrue(page.closed)
+
+    def test_browseros_session_keeps_login_page_open_for_the_user(self):
+        class FakePage:
+            def __init__(self):
+                self.closed = False
+                self.front = False
+
+            def close(self):
+                self.closed = True
+
+            def bring_to_front(self):
+                self.front = True
+
+        page = FakePage()
+        session = BrowserOSSession()
+        session._created_pages.append(page)
+
+        session.keep_page_open(page)
+        session.close()
+
+        self.assertTrue(page.front)
+        self.assertFalse(page.closed)
+        self.assertEqual(session._created_pages, [])
+
+    def test_sync_browseros_auth_sessions_keeps_rejected_login_page_open(self):
+        config = ProviderConfig(
+            id="fluxionai",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+
+        class FakePage:
+            url = config.target_url
+
+            def evaluate(self, _script, _argument=None):
+                return {
+                    "authToken": "rejected-access",
+                    "refreshToken": "rejected-refresh",
+                    "expiresAt": "123456",
+                }
+
+        page = FakePage()
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                self.kept = []
+                self.released = []
+
+            def start(self):
+                return self
+
+            def existing_pages_for_url(self, _url):
+                return []
+
+            def page_for_url(self, _url):
+                return page, True
+
+            def keep_page_open(self, selected):
+                self.kept.append(selected)
+
+            def release_page(self, selected):
+                self.released.append(selected)
+
+            def close(self):
+                return None
+
+        session = FakeSession()
+        with (
+            patch("providers.BrowserOSSession", return_value=session),
+            patch(
+                "providers.validate_sub2api_browser_session",
+                side_effect=NotLoggedInError("SESSION_BINDING_MISMATCH"),
+            ),
+        ):
+            result = sync_browseros_auth_sessions([config])
+
+        self.assertEqual(session.kept, [page])
+        self.assertEqual(session.released, [])
+        self.assertEqual(result["synced"], 0)
+        self.assertEqual(result["failures"][0]["id"], config.id)
+
+    def test_sync_browseros_auth_sessions_reports_unavailable_cdp_without_secrets(self):
+        config = ProviderConfig(
+            id="fluxionai",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            result = sync_browseros_auth_sessions(
+                [config], config_path=Path(tmp) / "missing.json"
+            )
+        self.assertFalse(result["available"])
+        self.assertEqual(result["synced"], 0)
+        self.assertIn("configuration is unavailable", result["error"])
 
     def test_is_api_provider(self):
         api = ProviderConfig(
@@ -613,6 +947,359 @@ class ProviderParserTests(unittest.TestCase):
             self.assertTrue(install_provider_auth_session(page, config))
         self.assertIn("access-token", page.script)
         self.assertIn("localStorage", page.script)
+        self.assertIn("https://fluxionai.space", page.script)
+        self.assertIn("location?.origin", page.script)
+
+    def test_provider_auth_session_persists_rotated_tokens(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+
+        class FakePage:
+            argument = None
+
+            def evaluate(self, _script, _argument=None):
+                self.argument = _argument
+                return {
+                    "authToken": "rotated-access",
+                    "refreshToken": "rotated-refresh",
+                    "expiresAt": "654321",
+                }
+
+        page = FakePage()
+        with patch("providers.set_local_secret") as save_secret:
+            self.assertTrue(persist_provider_auth_session(page, config, {
+                "authToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": "123456",
+            }))
+        self.assertEqual(page.argument, "https://fluxionai.space")
+        secret_name, secret_value = save_secret.call_args.args
+        self.assertEqual(secret_name, "provider_auth_session:fluxion")
+        saved = json.loads(secret_value)
+        self.assertEqual(saved["authToken"], "rotated-access")
+        self.assertEqual(saved["refreshToken"], "rotated-refresh")
+        self.assertTrue(saved["updatedAt"])
+
+    def test_sub2api_auth_refresh_updates_page_storage_and_secret(self):
+        config = ProviderConfig(
+            id="sub2api-refresh",
+            name="Sub2API Refresh",
+            type="sub2api",
+            target_url="https://relay.example/dashboard",
+        )
+
+        class FakePage:
+            script = ""
+            argument = None
+
+            def evaluate(self, script, argument=None):
+                self.script = script
+                self.argument = argument
+                return {
+                    "refreshed": True,
+                    "session": {
+                        "authToken": "next-access",
+                        "refreshToken": "next-refresh",
+                        "expiresAt": "987654321",
+                    },
+                }
+
+        page = FakePage()
+        with patch("providers.set_local_secret") as save_secret:
+            self.assertTrue(refresh_sub2api_auth_session(page, config, force=True))
+
+        self.assertEqual(page.argument["origin"], "https://relay.example")
+        self.assertTrue(page.argument["force"])
+        self.assertGreater(page.argument["bufferMs"], 0)
+        self.assertIn("/api/v1/auth/refresh", page.script)
+        self.assertIn("payload?.success !== false", page.script)
+        self.assertIn('localStorage?.setItem("refresh_token"', page.script)
+        saved = json.loads(save_secret.call_args.args[1])
+        self.assertEqual(saved["authToken"], "next-access")
+        self.assertEqual(saved["refreshToken"], "next-refresh")
+
+    def test_sub2api_page_api_forces_refresh_after_unauthorized(self):
+        config = ProviderConfig(
+            id="sub2api-retry",
+            name="Sub2API Retry",
+            type="sub2api",
+            target_url="https://relay.example/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+        page = object()
+        with (
+            patch(
+                "providers.BrowserJsonProvider.page_api_json",
+                side_effect=[NotLoggedInError("expired"), {"data": "ok"}],
+            ) as request,
+            patch("providers.refresh_sub2api_auth_session", return_value=True) as refresh,
+        ):
+            result = provider.page_api_json(page, "https://relay.example/api/v1/auth/me")
+
+        self.assertEqual(result, {"data": "ok"})
+        self.assertEqual(request.call_count, 2)
+        refresh.assert_called_once_with(page, config, force=True)
+
+    def test_sub2api_fetch_recovers_navigation_and_checks_expiry(self):
+        config = ProviderConfig(
+            id="sub2api-navigation-retry",
+            name="Sub2API Navigation Retry",
+            type="sub2api",
+            target_url="https://relay.example/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+        page = object()
+        auth_payload = {"data": {"username": "alice", "balance": 3.5}}
+        with (
+            patch.object(provider, "browser_page", return_value=nullcontext(page)),
+            patch.object(
+                provider,
+                "goto_with_json",
+                side_effect=[
+                    NotLoggedInError("expired"),
+                    (config.target_url, [], []),
+                ],
+            ) as navigate,
+            patch.object(
+                provider,
+                "page_api_json",
+                side_effect=[auth_payload, {"data": {"today_requests": 2}}],
+            ),
+            patch.object(
+                provider,
+                "fetch_channel_payloads",
+                return_value=(None, None, None, "not collected"),
+            ),
+            patch(
+                "providers.refresh_sub2api_auth_session",
+                side_effect=[True, False],
+            ) as refresh,
+        ):
+            snapshot = provider.fetch()
+
+        self.assertEqual(navigate.call_count, 2)
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(
+            [call.kwargs for call in refresh.call_args_list],
+            [{"force": True}, {}],
+        )
+        self.assertTrue(all(call.args == (page, config) for call in refresh.call_args_list))
+
+    def test_sub2api_live_browseros_fetch_does_not_navigate_or_export_tokens(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+        page = type("Page", (), {"url": "https://fluxionai.space/console/keys"})()
+        browser = type("Browser", (), {"is_live_browseros": True})()
+        auth_payload = {"data": {"username": "alice", "balance": 3.5}}
+        with (
+            patch.object(provider, "browser_page", return_value=nullcontext(page)),
+            patch.object(provider, "goto_with_json") as navigate,
+            patch.object(
+                provider,
+                "page_api_json",
+                side_effect=[auth_payload, {"data": {"today_requests": 2}}],
+            ),
+            patch.object(
+                provider,
+                "fetch_channel_payloads",
+                return_value=(None, None, None, "not collected"),
+            ),
+            patch(
+                "providers.refresh_sub2api_auth_session", return_value=False
+            ) as refresh,
+        ):
+            snapshot = provider.fetch(browser=browser)
+
+        navigate.assert_not_called()
+        refresh.assert_called_once_with(page, config, persist=False)
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["url"], page.url)
+
+    def test_live_browseros_login_failure_hands_temporary_page_to_user(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+        page = object()
+
+        class FakeLiveSession:
+            is_live_browseros = True
+
+            def __init__(self):
+                self.kept = []
+                self.released = []
+
+            def page_for_url(self, _url):
+                return page, True
+
+            def keep_page_open(self, selected):
+                self.kept.append(selected)
+
+            def release_page(self, selected):
+                self.released.append(selected)
+
+            def discard_page(self, _selected):
+                return None
+
+        browser = FakeLiveSession()
+        with self.assertRaises(NotLoggedInError):
+            with provider.browser_page(browser):
+                raise NotLoggedInError("login required")
+
+        self.assertEqual(browser.kept, [page])
+        self.assertEqual(browser.released, [page])
+
+    def test_provider_auth_session_lock_is_scoped_by_provider(self):
+        self.assertIs(
+            provider_auth_session_lock("provider-a"),
+            provider_auth_session_lock("provider-a"),
+        )
+        self.assertIsNot(
+            provider_auth_session_lock("provider-a"),
+            provider_auth_session_lock("provider-b"),
+        )
+
+    def test_provider_auth_session_is_cleared_after_login_failure(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        provider = Sub2APIProvider(config)
+
+        class FakePage:
+            def add_init_script(self, _script):
+                return None
+
+            def close(self):
+                return None
+
+        class FakeContext:
+            def new_page(self):
+                return FakePage()
+
+        class FakeBrowser:
+            context = FakeContext()
+
+        with (
+            patch("providers.load_provider_auth_session", return_value={
+                "authToken": "expired-access",
+                "refreshToken": "expired-refresh",
+            }),
+            patch("providers.delete_local_secret") as delete_secret,
+        ):
+            with self.assertRaises(NotLoggedInError):
+                with provider.browser_page(FakeBrowser()):
+                    raise NotLoggedInError("login required")
+        delete_secret.assert_called_once_with("provider_auth_session:fluxion")
+
+    def test_provider_manager_classifies_login_failure(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+
+        class FailingProvider:
+            def __init__(self, provider_config):
+                self.config = provider_config
+
+            def fetch(self, browser=None):
+                raise NotLoggedInError("login required")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ProviderManager(configs=[config], cache_file=Path(tmp) / "cache.json")
+            with patch.object(manager, "_provider_for_config", return_value=FailingProvider(config)):
+                snapshot = manager._refresh_config(config)
+        self.assertEqual(snapshot["status"], "needs_login")
+        self.assertEqual(snapshot["channels"], [])
+
+    def test_provider_manager_routes_sub2api_refresh_to_live_browseros(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ProviderManager(
+                configs=[config], cache_file=Path(tmp) / "cache.json"
+            )
+
+            class FakeLiveSession:
+                is_live_browseros = True
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+            live_session = FakeLiveSession()
+            expected = {"id": config.id, "status": "ok"}
+            with (
+                patch("providers.BrowserOSSession", return_value=live_session),
+                patch.object(
+                    manager, "_refresh_config", return_value=expected
+                ) as refresh,
+            ):
+                result = manager.refresh(config.id)
+
+        self.assertEqual(result, expected)
+        refresh.assert_called_once_with(config, browser=live_session)
+
+    def test_refresh_all_routes_sub2api_away_from_headless_session(self):
+        config = ProviderConfig(
+            id="fluxion",
+            name="FluxionAI",
+            type="sub2api",
+            target_url="https://fluxionai.space/dashboard",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ProviderManager(
+                configs=[config], cache_file=Path(tmp) / "cache.json"
+            )
+
+            class FakeLiveSession:
+                is_live_browseros = True
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+            live_session = FakeLiveSession()
+            seen = []
+
+            def fake_refresh(current, browser=None):
+                seen.append((current.id, browser))
+                return {"id": current.id, "status": "ok"}
+
+            manager._refresh_config = fake_refresh  # type: ignore[method-assign]
+            with (
+                patch("providers.BrowserOSSession", return_value=live_session),
+                patch("providers.BrowserSession") as headless_session,
+            ):
+                result = manager.refresh_all()
+
+        self.assertEqual(result, [{"id": "fluxion", "status": "ok"}])
+        self.assertEqual(seen, [("fluxion", live_session)])
+        headless_session.assert_not_called()
 
     def test_refresh_all_reuses_browser_session_and_runs_api(self):
         with tempfile.TemporaryDirectory() as tmp:

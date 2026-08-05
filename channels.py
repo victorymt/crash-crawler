@@ -6,6 +6,11 @@ import math
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+from provider_definitions import (
+    PROVIDER_CAPABILITY_CHANNELS,
+    provider_supports_capability,
+)
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -355,18 +360,29 @@ def available_channel_models(snapshots: list[dict[str, Any]]) -> list[str]:
     ]))
 
 
-def available_channel_providers(snapshots: list[dict[str, Any]]) -> list[dict[str, str]]:
-    providers = {
-        str(channel.get("providerId") or snapshot.get("id")): str(
-            channel.get("providerName") or snapshot.get("name") or channel.get("providerId") or snapshot.get("id")
-        )
-        for snapshot in snapshots
-        for channel in snapshot.get("channels", []) or []
-    }
-    return [
-        {"id": provider_id, "name": name}
-        for provider_id, name in sorted(providers.items(), key=lambda item: item[1])
-    ]
+def available_channel_providers(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    providers: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        if not provider_supports_capability(
+            str(snapshot.get("type") or ""), PROVIDER_CAPABILITY_CHANNELS
+        ):
+            continue
+        channels = snapshot.get("channels", []) or []
+        provider_id = str(snapshot.get("id") or "")
+        if not provider_id:
+            continue
+        first_channel = channels[0] if channels else {}
+        providers[provider_id] = {
+            "id": provider_id,
+            "name": str(snapshot.get("name") or first_channel.get("providerName") or provider_id),
+            "url": str(snapshot.get("url") or ""),
+            "status": str(snapshot.get("status") or "unknown"),
+            "error": str(snapshot.get("error") or snapshot.get("channelError") or ""),
+            "channelCount": len(channels),
+            "channelCheckedAt": snapshot.get("channelCheckedAt"),
+            "channelsStale": snapshot.get("channelsStale") is True,
+        }
+    return sorted(providers.values(), key=lambda item: item["name"])
 
 
 def list_channels(
@@ -428,7 +444,9 @@ def list_channels(
 def summarize_channel_refresh(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     channel_snapshots = [
         snapshot for snapshot in snapshots
-        if snapshot.get("type") in {"ezaiclub", "sub2api"}
+        if provider_supports_capability(
+            str(snapshot.get("type") or ""), PROVIDER_CAPABILITY_CHANNELS
+        )
     ]
     timestamps = [
         str(snapshot.get("channelCheckedAt"))
@@ -448,7 +466,7 @@ def summarize_channel_refresh(snapshots: list[dict[str, Any]]) -> dict[str, Any]
         "failedCount": sum(bool(
             snapshot.get("channelError")
             or snapshot.get("channelsStale") is True
-            or snapshot.get("status") in {"error", "stale", "needs_visit"}
+            or snapshot.get("status") in {"error", "stale", "needs_login", "needs_visit"}
         ) for snapshot in channel_snapshots),
         "latestCheckedAt": max(timestamps, default=None),
     }

@@ -1,10 +1,16 @@
 import { availableChannelModels, listChannels } from "../shared/channels.js";
+import {
+  PROVIDER_CAPABILITIES,
+  providerSupportsCapability
+} from "../shared/provider_definitions.js";
 import { snapshotNeedsRetry } from "../shared/snapshots.js";
 
 let snapshots = [];
 let settings = {};
 let activeOperation = false;
 let failedChannelRunCount = 0;
+const pendingProviderIds = new Set();
+let pendingProviderRetryPromise = null;
 
 function sendMessage(message) {
   return chrome.runtime.sendMessage(message).then((response) => {
@@ -149,6 +155,52 @@ function latestChannelCheck() {
   return timestamps.length ? new Date(Math.max(...timestamps)).toLocaleString() : "--";
 }
 
+function providerHealthState(provider) {
+  if (provider.status === "needs_login") return { label: "需要登录", tone: "needs-login" };
+  if (provider.status === "needs_visit") return { label: "需要访问", tone: "warning" };
+  if (provider.channelsStale || provider.status === "stale") return { label: "使用旧数据", tone: "warning" };
+  if (provider.error || provider.status === "error") return { label: "采集失败", tone: "error" };
+  if (provider.status === "idle") return { label: "尚未刷新", tone: "idle" };
+  if (!Number(provider.channelCount)) return { label: "暂无渠道", tone: "idle" };
+  return { label: "正常", tone: "ok" };
+}
+
+function providerHealthRows() {
+  return snapshots
+    .filter((snapshot) => providerSupportsCapability(
+      snapshot.type,
+      PROVIDER_CAPABILITIES.CHANNELS
+    ))
+    .map((snapshot) => ({
+      id: snapshot.id,
+      name: snapshot.name || snapshot.id,
+      url: snapshot.url || "",
+      status: snapshot.status || "unknown",
+      error: snapshot.error || snapshot.channelError || "",
+      channelCount: (snapshot.channels || []).length,
+      channelCheckedAt: snapshot.channelCheckedAt || null,
+      channelsStale: snapshot.channelsStale === true
+    }));
+}
+
+function renderProviderHealth(providers) {
+  const root = document.getElementById("channel-provider-health");
+  const issues = providers.filter((provider) => providerHealthState(provider).tone !== "ok");
+  root.hidden = issues.length === 0;
+  root.innerHTML = issues.map((provider) => {
+    const state = providerHealthState(provider);
+    const checkedAt = Date.parse(provider.channelCheckedAt || "");
+    const fallback = Number.isFinite(checkedAt)
+      ? `上次成功 ${new Date(checkedAt).toLocaleString()}`
+      : "尚无成功记录";
+    const detail = String(provider.error || fallback).slice(0, 180);
+    const content = `<strong>${escapeHtml(provider.name)}</strong><span class="provider-health-status ${state.tone}">${escapeHtml(state.label)}</span><small>${escapeHtml(detail)}</small>`;
+    return provider.url
+      ? `<a href="${escapeHtml(provider.url)}" data-provider-id="${escapeHtml(provider.id)}" target="_blank" rel="noopener noreferrer">${content}</a>`
+      : `<div>${content}</div>`;
+  }).join("");
+}
+
 function render() {
   const modelSelect = document.getElementById("channel-model");
   const resultRoot = document.getElementById("channel-results");
@@ -167,16 +219,13 @@ function render() {
     ...models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)
   ].join("");
   modelSelect.value = selectedModel;
-  const providers = [...new Map(snapshots.flatMap((snapshot) => (snapshot.channels || []).map((channel) => {
-    const id = channel.providerId || snapshot.id;
-    return [id, { id, name: channel.providerName || snapshot.name || id }];
-  }))).values()]
-    .sort((left, right) => left.name.localeCompare(right.name));
+  const providers = providerHealthRows().sort((left, right) => left.name.localeCompare(right.name));
   providerSelect.innerHTML = [
     '<option value="">全部 Provider</option>',
     ...providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`)
   ].join("");
   providerSelect.value = providers.some((provider) => String(provider.id) === String(selectedProvider)) ? selectedProvider : "";
+  renderProviderHealth(providers);
   const candidates = listChannels(snapshots, selectedModel, {
     statuses: selectedStatus ? [selectedStatus] : null,
     availabilityOnly: selectedAvailability === "available",
@@ -211,6 +260,58 @@ async function loadStatus() {
   snapshots = data.providers || [];
   settings = data.settings || {};
   render();
+}
+
+function queueProviderRetry(providerId) {
+  const normalized = String(providerId || "").trim();
+  if (normalized) pendingProviderIds.add(normalized);
+}
+
+async function retryPendingProviders() {
+  if (
+    !pendingProviderIds.size
+    || activeOperation
+    || document.visibilityState === "hidden"
+    || pendingProviderRetryPromise
+  ) return;
+
+  const providerIds = [...pendingProviderIds];
+  pendingProviderIds.clear();
+  pendingProviderRetryPromise = (async () => {
+    activeOperation = true;
+    setControlsDisabled(true);
+    setRetryVisible(false);
+    setMessage("登录已返回，正在重新采集 Provider...");
+    let refreshed = 0;
+    try {
+      for (const providerId of providerIds) {
+        await sendMessage({ type: "providers:refresh", providerId });
+        refreshed += 1;
+      }
+      await loadStatus();
+      const stillPending = providerIds.filter((providerId) => {
+        const snapshot = snapshots.find((item) => String(item.id) === String(providerId));
+        return !snapshot || snapshotNeedsRetry(snapshot, { channelsOnly: true });
+      });
+      stillPending.forEach(queueProviderRetry);
+      if (stillPending.length) {
+        setMessage(`已重新采集 ${refreshed} 个 Provider，${stillPending.length} 个仍需登录或重试`, true);
+      } else {
+        setMessage(`登录后已重新采集 ${refreshed} 个 Provider`);
+      }
+    } catch (error) {
+      providerIds.forEach(queueProviderRetry);
+      await loadStatus().catch(() => undefined);
+      setMessage(error.message || "登录后重新采集失败", true);
+    } finally {
+      activeOperation = false;
+      setControlsDisabled(false);
+      setRetryVisible(hasFailedChannelSnapshots() || failedChannelRunCount > 0);
+    }
+  })().finally(() => {
+    pendingProviderRetryPromise = null;
+  });
+  await pendingProviderRetryPromise;
 }
 
 async function pollChannelRunUntilRequestSettles(request) {
@@ -362,6 +463,10 @@ document.getElementById("refresh-channels").addEventListener("click", refreshCha
 document.getElementById("retry-channel-failed").addEventListener("click", retryFailedChannels);
 document.getElementById("cancel-channel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("options").addEventListener("click", () => chrome.runtime.openOptionsPage());
+document.getElementById("channel-provider-health").addEventListener("click", (event) => {
+  const link = event.target.closest("a[data-provider-id]");
+  if (link) queueProviderRetry(link.dataset.providerId);
+});
 
 if (chrome.storage?.onChanged) {
   chrome.storage.onChanged.addListener((changes, area) => {
@@ -369,5 +474,14 @@ if (chrome.storage?.onChanged) {
     if (changes.providerSnapshots) loadStatus().catch((error) => setMessage(error.message, true));
   });
 }
+
+function retryQueuedProviderOnReturn() {
+  if (document.visibilityState !== "hidden") {
+    window.setTimeout(() => retryPendingProviders().catch((error) => setMessage(error.message, true)), 0);
+  }
+}
+
+window.addEventListener("focus", retryQueuedProviderOnReturn);
+document.addEventListener("visibilitychange", retryQueuedProviderOnReturn);
 
 initialize().catch((error) => setMessage(error.message, true));

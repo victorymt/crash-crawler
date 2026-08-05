@@ -9,7 +9,7 @@ import {
   rankAvailableChannels,
   summarizeChannelRefresh
 } from "../extension/src/shared/channels.js";
-import { preservePreviousChannels, snapshotNeedsRetry } from "../extension/src/shared/snapshots.js";
+import { errorSnapshot, preservePreviousChannels, snapshotNeedsRetry } from "../extension/src/shared/snapshots.js";
 
 const config = {
   id: "fastaitoken",
@@ -235,13 +235,20 @@ test("channel refresh summaries count channels and partial failures", () => {
   assert.deepEqual(summarizeChannelRefresh([
     { status: "ok", channels: [{}, {}] },
     { status: "ok", channels: [{}], channelError: "timeout", channelsStale: true },
-    { status: "needs_visit", channels: [] }
+    { status: "needs_visit", channels: [] },
+    { status: "needs_login", channels: [] }
   ]), {
-    providerCount: 3,
+    providerCount: 4,
     channelCount: 3,
     unrankedCount: 3,
-    failedCount: 2
+    failedCount: 3
   });
+  assert.equal(errorSnapshot({ id: "fluxion", name: "Fluxion", type: "sub2api", targetUrl: "https://fluxion.example" }, null, new Error("not logged in")).status, "needs_login");
+  assert.equal(errorSnapshot(
+    { id: "fluxion", name: "Fluxion", type: "sub2api", targetUrl: "https://fluxion.example" },
+    { balances: [{ key: "balance", value: "1" }] },
+    new Error("not logged in")
+  ).status, "needs_login");
 });
 
 test("user group rates override base rates without breaking monitor matching", () => {
@@ -301,6 +308,7 @@ test("partial channel failures retain previous data but exclude it from live ran
 
 test("snapshot retry detection includes channel-only failures and needs-visit states", () => {
   assert.equal(snapshotNeedsRetry({ status: "needs_visit" }), true);
+  assert.equal(snapshotNeedsRetry({ status: "needs_login" }), true);
   assert.equal(snapshotNeedsRetry({ type: "sub2api", status: "ok", channelError: "monitor failed" }), false);
   assert.equal(snapshotNeedsRetry({ type: "sub2api", status: "ok", channelError: "monitor failed" }, { channelsOnly: true }), true);
   assert.equal(snapshotNeedsRetry({ type: "ezaiclub", status: "ok", channelsStale: true }, { channelsOnly: true }), true);

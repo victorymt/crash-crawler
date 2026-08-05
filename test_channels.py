@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from channels import (
+    available_channel_providers,
     effective_group_rate,
     list_channels,
     parse_ezaiclub_channels,
@@ -111,6 +112,36 @@ class ChannelTests(unittest.TestCase):
             "failedCount": 0,
             "latestCheckedAt": None,
         })
+
+    def test_channel_provider_list_keeps_empty_and_login_required_providers(self):
+        providers = available_channel_providers([
+            {
+                "id": "fluxion",
+                "name": "FluxionAI",
+                "type": "sub2api",
+                "status": "needs_login",
+                "url": "https://fluxionai.space/dashboard",
+                "error": "login required",
+                "channels": [],
+                "channelCheckedAt": None,
+                "channelsStale": False,
+            },
+            {
+                "id": "fast",
+                "name": "Fast",
+                "type": "sub2api",
+                "status": "ok",
+                "channels": [{"providerName": "Fast"}],
+                "channelCheckedAt": "2026-08-04T12:00:00Z",
+                "channelsStale": False,
+            },
+            {"id": "deepseek", "name": "DeepSeek", "type": "deepseek", "channels": []},
+        ])
+        self.assertEqual([provider["id"] for provider in providers], ["fast", "fluxion"])
+        fluxion = next(provider for provider in providers if provider["id"] == "fluxion")
+        self.assertEqual(fluxion["status"], "needs_login")
+        self.assertEqual(fluxion["channelCount"], 0)
+        self.assertEqual(fluxion["url"], "https://fluxionai.space/dashboard")
 
     def test_channel_listing_keeps_error_and_unknown_rate_channels(self):
         channels = parse_sub2api_channels(

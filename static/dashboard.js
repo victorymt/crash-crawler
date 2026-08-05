@@ -1,6 +1,7 @@
 let providers = [];
 let snapshots = [];
 let activeOperation = false;
+let refreshingProviderId = "";
 let lastStatusLoadAt = 0;
 let statusReloadPromise = null;
 const requestJson = window.providerApi.requestJson;
@@ -12,7 +13,7 @@ function escapeHtml(value) {
 }
 
 function statusLabel(value) {
-  return ({ ok: "正常", stale: "已过期", error: "失败", idle: "未刷新", unconfigured: "未配置" })[value] || value || "未刷新";
+  return ({ ok: "正常", stale: "已过期", error: "失败", idle: "未刷新", unconfigured: "未配置", needs_login: "需要登录", refreshing: "刷新中" })[value] || value || "未刷新";
 }
 
 function recommendationLabel(value) {
@@ -26,6 +27,8 @@ function formatMetric(metric) {
 
 function providerRow(config) {
   const snapshot = snapshots.find((item) => item.id === config.id) || {};
+  const isRefreshing = config.id === refreshingProviderId;
+  const currentStatus = isRefreshing ? "refreshing" : (snapshot.status || "idle");
   const balances = snapshot.balances || [];
   const balanceKeys = new Set(balances.map((item) => `${item.key}|${item.label}|${item.value}`));
   const details = (snapshot.usage?.length ? snapshot.usage : (snapshot.metrics || []).filter((item) => (
@@ -38,7 +41,7 @@ function providerRow(config) {
       <small>${escapeHtml(config.target_url)}</small>
     </div>
     <div class="provider-state">
-      <span class="status ${escapeHtml(snapshot.status || "idle")}">${escapeHtml(statusLabel(snapshot.status))}</span>
+      <span class="status ${escapeHtml(currentStatus)}">${escapeHtml(statusLabel(currentStatus))}</span>
       <small class="recommendation ${escapeHtml(snapshot.recommendation || "watch")}">${escapeHtml(recommendationLabel(snapshot.recommendation))}</small>
     </div>
     <div class="provider-metrics">
@@ -47,7 +50,7 @@ function providerRow(config) {
     </div>
     <div class="row-actions">
       ${links.map((link) => `<a class="button" href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)}</a>`).join("")}
-      <button type="button" data-refresh>刷新</button>
+      <button type="button" data-refresh>${isRefreshing ? "刷新中" : "刷新"}</button>
     </div>
     ${snapshot.error ? `<p class="row-error">${escapeHtml(snapshot.error)}</p>` : ""}
   </article>`;
@@ -68,7 +71,7 @@ function render() {
     </section>`).join("") : '<div class="empty">没有已启用的 Provider</div>';
 
   const healthy = snapshots.filter((item) => item.status === "ok").length;
-  const attention = snapshots.filter((item) => item.status === "error" || item.status === "stale" || item.recommendation === "recharge").length;
+  const attention = snapshots.filter((item) => ["error", "stale", "needs_login"].includes(item.status) || item.recommendation === "recharge").length;
   document.getElementById("provider-count").textContent = providers.length;
   document.getElementById("healthy-count").textContent = healthy;
   document.getElementById("attention-count").textContent = attention;
@@ -143,19 +146,65 @@ function reloadStatusIfVisible(force = false) {
     .finally(() => { statusReloadPromise = null; });
 }
 
-async function runOperation(message, operation) {
+async function runOperation(message, operation, successMessage = "操作完成") {
   if (activeOperation) return;
   activeOperation = true;
   setControlsDisabled(true);
   setMessage(message);
   try {
-    await operation();
+    const result = await operation();
     await loadStatus();
-    setMessage(`刷新完成 · ${new Date().toLocaleTimeString()}`);
+    const completedMessage = typeof successMessage === "function"
+      ? successMessage(result)
+      : successMessage;
+    setMessage(`${completedMessage} · ${new Date().toLocaleTimeString()}`);
   } catch (error) {
     setMessage(error.name === "AbortError" ? "请求超时" : error.message || "操作失败", true);
   } finally {
     activeOperation = false;
+    setControlsDisabled(false);
+  }
+}
+
+function providerRefreshResultMessage(provider, fallbackName) {
+  const name = provider?.name || fallbackName;
+  if (provider?.status === "ok") return { message: `${name} 刷新完成`, isError: false };
+  if (provider?.status === "needs_login") {
+    return { message: `${name} 需要登录：请先在 BrowserOS 登录对应站点`, isError: true };
+  }
+  if (provider?.status === "stale") {
+    return {
+      message: `${name} 刷新失败，正在显示旧数据：${provider.error || "采集失败"}`,
+      isError: true
+    };
+  }
+  return {
+    message: `${name} 刷新失败：${provider?.error || "未返回有效数据"}`,
+    isError: true
+  };
+}
+
+async function refreshProvider(provider) {
+  if (activeOperation) return;
+  activeOperation = true;
+  refreshingProviderId = provider.id;
+  render();
+  setMessage(`正在刷新 ${provider.name}...`);
+  try {
+    const data = await requestJson(
+      `/api/providers/${encodeURIComponent(provider.id)}/refresh`,
+      { method: "POST" }
+    );
+    refreshingProviderId = "";
+    await loadStatus();
+    const result = providerRefreshResultMessage(data.provider, provider.name);
+    setMessage(result.message, result.isError);
+  } catch (error) {
+    setMessage(error.name === "AbortError" ? "请求超时" : error.message || "刷新失败", true);
+  } finally {
+    refreshingProviderId = "";
+    activeOperation = false;
+    render();
     setControlsDisabled(false);
   }
 }
@@ -286,8 +335,33 @@ document.getElementById("refresh-all").addEventListener("click", refreshAll);
 document.getElementById("retry-failed").addEventListener("click", retryFailed);
 document.getElementById("cancel-refresh").addEventListener("click", cancelRefresh);
 document.getElementById("sync-auth").addEventListener("click", () => runOperation(
-  "正在同步 BrowserOS 登录态...",
-  () => requestJson("/api/sync-auth", { method: "POST", timeout: 120000 })
+  "正在检查 BrowserOS 实时登录态...",
+  () => requestJson("/api/sync-auth", { method: "POST", timeout: 120000 }),
+  (result) => {
+    const sessions = result?.authSessions;
+    if (Number(sessions?.synced || 0) > 0) {
+      const names = (sessions.providers || []).map((id) => (
+        providers.find((provider) => provider.id === id)?.name || id
+      ));
+      const suffix = names.length ? `：${names.join("、")}` : "";
+      return `已连接 ${sessions.synced} 个 Provider 实时登录会话${suffix}`;
+    }
+    if (sessions?.available === false && sessions?.error) {
+      return `无法连接 BrowserOS 实时会话：${sessions.error}`;
+    }
+    if (Array.isArray(sessions?.failures) && sessions.failures.length) {
+      const failure = sessions.failures[0];
+      const name = providers.find((provider) => provider.id === failure.id)?.name || failure.id;
+      return `${name} 登录会话无效：${failure.error || "请在 BrowserOS 重新登录"}`;
+    }
+    if (Number(sessions?.matched || 0) > 0) {
+      return "已找到 Provider 页面，但页面中没有可用登录凭据";
+    }
+    if (Number(sessions?.eligible || 0) > 0) {
+      return "BrowserOS 中没有打开已登录的 Provider 页面；刷新时会使用临时同源标签页";
+    }
+    return "当前没有需要 BrowserOS 实时会话的 Provider";
+  }
 ));
 document.getElementById("open-all").addEventListener("click", () => providers.forEach((provider) => {
   window.open(provider.target_url, "_blank", "noopener,noreferrer");
@@ -297,9 +371,7 @@ document.getElementById("provider-groups").addEventListener("click", (event) => 
   if (!button) return;
   const row = button.closest("[data-provider]");
   const provider = providers.find((item) => item.id === row.dataset.provider);
-  if (provider) runOperation(`正在刷新 ${provider.name}...`, () => requestJson(
-    `/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" }
-  ));
+  if (provider) refreshProvider(provider);
 });
 window.providerConfigEvents?.subscribe(() => reloadStatusIfVisible(true));
 window.addEventListener("focus", () => reloadStatusIfVisible());

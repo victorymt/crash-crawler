@@ -123,7 +123,7 @@ async function pushToLocalWeb() {
   });
   const authText = authResult.synced
     ? `，同步 ${authResult.synced} 个 Provider 登录会话`
-    : "，没有发现可同步的已打开登录页面";
+    : "，没有可同步的 Provider 登录会话";
   setMessage(`已推送到本地 Web：${syncSummary(applied.summary)}${authText}。`);
 }
 

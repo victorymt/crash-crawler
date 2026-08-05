@@ -278,6 +278,7 @@ main {
 
 .status.error,
 .status.stale,
+.status.needs_login,
 .status.unconfigured {
   border-color: color-mix(in srgb, var(--bad) 26%, var(--line));
   background: var(--bad-soft);

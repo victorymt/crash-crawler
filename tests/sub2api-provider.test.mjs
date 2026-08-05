@@ -28,8 +28,18 @@ function textResponse(url, text, status = 200) {
   };
 }
 
-function installSub2ApiChromeStub(token = "test-token") {
+function installSub2ApiChromeStub(sessionInput = "test-token") {
+  let session = typeof sessionInput === "string"
+    ? { authToken: sessionInput, refreshToken: "", expiresAt: "" }
+    : { authToken: "", refreshToken: "", expiresAt: "", ...sessionInput };
+  const store = {};
   globalThis.chrome = {
+    storage: {
+      session: {
+        async get(key) { return { [key]: store[key] }; },
+        async set(value) { Object.assign(store, value); }
+      }
+    },
     tabs: {
       async query() {
         return [{ id: 1, url: "https://aihub.example.test/dashboard", status: "complete" }];
@@ -48,10 +58,21 @@ function installSub2ApiChromeStub(token = "test-token") {
     },
     scripting: {
       async executeScript({ args }) {
-        if (args?.[0] === "auth_token") return [{ result: token }];
-        return [{ result: null }];
+        if (args?.[0] === "auth_token") return [{ result: session.authToken }];
+        if (args?.[0]?.authToken || args?.[0]?.refreshToken) {
+          session = { ...session, ...args[0] };
+          return [{ result: true }];
+        }
+        return [{ result: { ...session } }];
       }
     }
+  };
+  return {
+    get session() { return { ...session }; },
+    setSession(nextSession) {
+      session = { ...session, ...nextSession };
+    },
+    store
   };
 }
 
@@ -146,6 +167,231 @@ test("sub2api provider collects dashboard data with localStorage bearer token", 
     assert.equal(snapshot.channels[0].effectiveMultiplier, 0.06);
     assert.equal(snapshot.raw.channel_available_endpoint, "/api/v1/channels/available");
     assert.equal(snapshot.raw.channel_available_fallback, false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sub2api proactively rotates credentials close to expiry", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  const chromeState = installSub2ApiChromeStub({
+    authToken: "old-access",
+    refreshToken: "old-refresh",
+    expiresAt: String(Date.now() + 30_000)
+  });
+  const requestAuth = [];
+  let refreshCount = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/api/v1/auth/refresh") {
+      refreshCount += 1;
+      assert.equal(options.method, "POST");
+      assert.equal(options.headers.Authorization, "Bearer old-access");
+      assert.deepEqual(JSON.parse(options.body), { refresh_token: "old-refresh" });
+      return jsonResponse(url, {
+        code: 0,
+        data: {
+          access_token: "new-access",
+          refresh_token: "new-refresh",
+          expires_in: 3600
+        }
+      });
+    }
+    requestAuth.push(options.headers?.Authorization || "");
+    if (path === "/api/v1/auth/me") {
+      return jsonResponse(url, { data: { username: "rotated", balance: 4.2 } });
+    }
+    return jsonResponse(url, { message: "not found" }, 404);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?sub2api-proactive=${Date.now()}`);
+    const snapshot = await collectProvider({
+      id: "sub2api-proactive",
+      name: "Sub2API Proactive",
+      type: "sub2api",
+      targetUrl: "https://proactive.example.test/dashboard",
+      enabled: true,
+      secondaryUrls: []
+    });
+
+    assert.equal(refreshCount, 1);
+    assert.equal(requestAuth.every((header) => header === "Bearer new-access"), true);
+    assert.equal(chromeState.session.authToken, "new-access");
+    assert.equal(chromeState.session.refreshToken, "new-refresh");
+    assert.ok(Number(chromeState.session.expiresAt) > Date.now());
+    assert.equal(snapshot.status, "ok");
+    assert.equal(JSON.stringify(snapshot).includes("new-access"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sub2api refreshes credentials after 401 and retries once", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  installSub2ApiChromeStub({
+    authToken: "stale-access",
+    refreshToken: "valid-refresh",
+    expiresAt: String(Date.now() + 60 * 60 * 1000)
+  });
+  const authAttempts = [];
+  let refreshCount = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/api/v1/auth/refresh") {
+      refreshCount += 1;
+      return jsonResponse(url, {
+        code: "SUCCESS",
+        data: {
+          access_token: "recovered-access",
+          refresh_token: "recovered-refresh",
+          expires_in: 1800
+        }
+      });
+    }
+    if (path === "/api/v1/auth/me") {
+      authAttempts.push(options.headers?.Authorization || "");
+      if (authAttempts.length === 1) {
+        return jsonResponse(url, { message: "expired" }, 401);
+      }
+      return jsonResponse(url, { data: { username: "recovered", balance: 8.5 } });
+    }
+    return jsonResponse(url, { message: "not found" }, 404);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?sub2api-401=${Date.now()}`);
+    const snapshot = await collectProvider({
+      id: "sub2api-401",
+      name: "Sub2API 401",
+      type: "sub2api",
+      targetUrl: "https://recover.example.test/dashboard",
+      enabled: true,
+      secondaryUrls: []
+    });
+
+    assert.equal(refreshCount, 1);
+    assert.deepEqual(authAttempts, ["Bearer stale-access", "Bearer recovered-access"]);
+    assert.equal(snapshot.status, "ok");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sub2api resyncs a newer browser session when refresh after 401 fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  const chromeState = installSub2ApiChromeStub({
+    authToken: "stale-access",
+    refreshToken: "stale-refresh",
+    expiresAt: String(Date.now() + 60 * 60 * 1000)
+  });
+  const authAttempts = [];
+  let refreshCount = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/api/v1/auth/refresh") {
+      refreshCount += 1;
+      chromeState.setSession({
+        authToken: "browser-access",
+        refreshToken: "browser-refresh",
+        expiresAt: String(Date.now() + 60 * 60 * 1000)
+      });
+      return jsonResponse(url, {
+        success: false,
+        data: {
+          access_token: "rejected-access",
+          refresh_token: "rejected-refresh",
+          expires_in: 3600
+        }
+      });
+    }
+    if (path === "/api/v1/auth/me") {
+      const authorization = options.headers?.Authorization || "";
+      authAttempts.push(authorization);
+      if (authorization === "Bearer stale-access") {
+        return jsonResponse(url, { message: "expired" }, 401);
+      }
+      if (authorization === "Bearer browser-access") {
+        return jsonResponse(url, { data: { username: "browser", balance: 6.5 } });
+      }
+      return jsonResponse(url, { message: "unauthorized" }, 401);
+    }
+    return jsonResponse(url, { message: "not found" }, 404);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?sub2api-resync=${Date.now()}`);
+    const snapshot = await collectProvider({
+      id: "sub2api-resync",
+      name: "Sub2API Resync",
+      type: "sub2api",
+      targetUrl: "https://resync.example.test/dashboard",
+      enabled: true,
+      secondaryUrls: []
+    });
+
+    assert.equal(refreshCount, 1);
+    assert.deepEqual(authAttempts, ["Bearer stale-access", "Bearer browser-access"]);
+    assert.equal(snapshot.status, "ok");
+    assert.equal(chromeState.session.authToken, "browser-access");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sub2api serializes concurrent credential rotation per provider", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalFetch = globalThis.fetch;
+  installSub2ApiChromeStub({
+    authToken: "concurrent-old",
+    refreshToken: "concurrent-refresh",
+    expiresAt: String(Date.now() + 10_000)
+  });
+  let refreshCount = 0;
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/api/v1/auth/refresh") {
+      refreshCount += 1;
+      await Promise.resolve();
+      return jsonResponse(url, {
+        code: 0,
+        data: {
+          access_token: "concurrent-new",
+          refresh_token: "concurrent-refresh-new",
+          expires_in: 3600
+        }
+      });
+    }
+    if (path === "/api/v1/auth/me") {
+      return jsonResponse(url, { data: { username: "parallel", balance: 3 } });
+    }
+    return jsonResponse(url, { message: "not found" }, 404);
+  };
+
+  try {
+    const { collectProvider } = await import(`../extension/src/providers/index.js?sub2api-concurrent=${Date.now()}`);
+    const config = {
+      id: "sub2api-concurrent",
+      name: "Sub2API Concurrent",
+      type: "sub2api",
+      targetUrl: "https://concurrent.example.test/dashboard",
+      enabled: true,
+      secondaryUrls: []
+    };
+    const snapshots = await Promise.all([
+      collectProvider(config),
+      collectProvider(config)
+    ]);
+
+    assert.equal(refreshCount, 1);
+    assert.equal(snapshots.every((snapshot) => snapshot.status === "ok"), true);
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.fetch = originalFetch;

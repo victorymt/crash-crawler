@@ -22,16 +22,23 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from channels import available_channel_models, available_channel_providers, list_channels, summarize_channel_refresh
+from provider_definitions import (
+    PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH,
+    provider_definition_documents,
+    provider_supports_capability,
+)
 from providers import (
+    PROVIDER_SCHEMA_VERSION,
     ProviderError,
     ProviderManager,
     RefreshBusyError,
     delete_local_secret,
     links_for_config,
     load_local_secret,
+    provider_auth_session_lock,
     provider_auth_secret_name,
     set_local_secret,
-    sync_browseros_profile,
+    sync_browseros_auth_sessions,
 )
 from web_store import ConfigStore, providers_from_import_document
 
@@ -494,6 +501,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "settings": settings,
             })
             return
+        if path == "/api/health":
+            self.send_json({
+                "ok": True,
+                "service": "provider-usage-hub",
+                "schemaVersion": PROVIDER_SCHEMA_VERSION,
+                "pid": os.getpid(),
+            })
+            return
         if path == "/api/refresh":
             self.send_json({"refresh": self.refresh_jobs.current()})
             return
@@ -507,6 +522,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "settings": settings,
                 "revision": config_revision(configs),
                 "has_deepseek_key": bool(load_local_secret("deepseek_api_key")),
+                "providerDefinitions": provider_definition_documents(),
             })
             return
         if path == "/api/local-sync/token":
@@ -660,7 +676,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         raise ValueError("auth session must be an object")
                     provider_id = str(item.get("providerId") or "").strip()
                     config = configs_by_id.get(provider_id)
-                    if not config or config.type not in {"sub2api", "ezaiclub"}:
+                    if not config or not provider_supports_capability(
+                        config.type, PROVIDER_CAPABILITY_LOCAL_SYNC_AUTH
+                    ):
                         raise ValueError(f"unsupported auth session provider: {provider_id}")
                     expected = urlparse(config.target_url)
                     supplied = urlparse(str(item.get("origin") or ""))
@@ -678,14 +696,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         continue
                     if len(auth_token) > 8192 or len(refresh_token) > 8192 or len(expires_at) > 128:
                         raise ValueError(f"auth session is too large for Provider {provider_id}")
-                    set_local_secret(
-                        provider_auth_secret_name(provider_id),
-                        json.dumps({
-                            "authToken": auth_token,
-                            "refreshToken": refresh_token,
-                            "expiresAt": expires_at,
-                        }, ensure_ascii=False),
-                    )
+                    with provider_auth_session_lock(provider_id):
+                        set_local_secret(
+                            provider_auth_secret_name(provider_id),
+                            json.dumps({
+                                "authToken": auth_token,
+                                "refreshToken": refresh_token,
+                                "expiresAt": expires_at,
+                                "updatedAt": utc_now(),
+                            }, ensure_ascii=False),
+                        )
                     synced.append(provider_id)
                 self.send_json({"ok": True, "synced": len(synced), "providers": synced})
             except Exception as exc:
@@ -693,7 +713,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/sync-auth":
             try:
-                self.send_json(sync_browseros_profile())
+                configs, _ = self.store.snapshot()
+                result = {
+                    "ok": True,
+                    "mode": "live_browseros",
+                    "authSessions": sync_browseros_auth_sessions(configs),
+                }
+                self.send_json(result)
             except ProviderError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:

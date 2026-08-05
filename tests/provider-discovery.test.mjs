@@ -84,7 +84,11 @@ test("popup discovery adds a logged-in Sub2API site once and stores its first sn
     scripting: {
       async executeScript({ args }) {
         if (args?.[0] === "auth_token") return [{ result: "test-token" }];
-        return [{ result: null }];
+        return [{ result: {
+          authToken: "test-token",
+          refreshToken: "",
+          expiresAt: ""
+        } }];
       }
     }
   };

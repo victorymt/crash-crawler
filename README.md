@@ -25,7 +25,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv pip install -r requirements.txt
 uv run python server.py 19765
 ```
 
-也可以使用启动脚本。首次运行会自动创建 `.venv` 并安装依赖：
+也可以使用启动脚本。首次运行会自动创建 `.venv` 并安装 Python 依赖，同时检查 Chromium 可执行文件是否可用：
 
 ```bash
 ./launch.sh
@@ -45,6 +45,14 @@ uv run python -c 'import sys, playwright; print(sys.executable); print(playwrigh
 
 输出的解释器路径应位于项目的 `.venv/`。如果依赖已经安装但页面仍显示旧错误，请停止此前由 `python3 server.py 19765` 启动的进程，再使用上面的 `uv run python server.py 19765` 重新启动服务。Provider 的旧错误状态会在下一次刷新成功后被覆盖。
 
+启动脚本通过 `/api/health` 确认端口上的进程确实是当前本地 Web；如果端口被旧版本或其他服务占用，会明确报错，不会误报“已经运行”。
+
+普通页面 Provider 由 Playwright 控制独立的系统 Chromium。Sub2API Provider 例外：它通过 BrowserOS 的本机 CDP 连接复用实时浏览器上下文，以保持登录会话的网络指纹一致。脚本会依次查找 `chromium`、`chromium-browser` 和 `google-chrome`；也可以显式指定普通页面采集使用的浏览器：
+
+```bash
+PROVIDER_BROWSER_BIN=/path/to/chromium ./launch.sh
+```
+
 打开后可使用三个页面：
 
 ```text
@@ -55,8 +63,8 @@ http://127.0.0.1:19765/settings  Provider 与刷新设置
 
 Provider 看板包含：
 
-- “同步登录态”：把 BrowserOS 登录态同步到后端抓取 profile。
-- “刷新全部”：一次并行刷新（API 并行，同 profile 的浏览器抓取复用同一 BrowserOS 实例）。
+- “同步登录态”：检查 BrowserOS 中已打开的同源页面和实时登录态，不复制 profile 或导出 token。
+- “刷新全部”：一次并行刷新（API 并行，普通页面按 profile 复用独立 Chromium，Sub2API 复用实时 BrowserOS 会话）。
 - 刷新期间可取消；任务进度会写入本地 `.refresh-job.json`，服务重启后会将未完成任务标记为中断并保留结果。
 - 全量刷新出现失败 Provider 时，主页面可使用“重试失败”只重新采集失败项。
 - Provider 卡片上的“刷新”：只刷新当前 provider。
@@ -64,7 +72,7 @@ Provider 看板包含：
 - 按用户配置的分组和顺序展示余额、额度、订阅指标及错误状态。
 - 自动、全部、单 Provider 和渠道刷新共享同一个刷新协调器，不会同时争用浏览器会话或覆盖快照。
 
-渠道页汇总 Sub2API 类渠道监控数据，默认展示全部已采集渠道，并可按模型、状态、可用性、倍率识别情况和 Provider 筛选；已识别倍率的渠道按实际倍率从低到高排序。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率。
+渠道页汇总 Sub2API 类渠道监控数据，默认展示全部已采集渠道，并可按模型、状态、可用性、倍率识别情况和 Provider 筛选；已识别倍率的渠道按实际倍率从低到高排序。尚未刷新、需要登录、采集失败或正在使用旧数据的 Provider 也会显示在渠道页状态区和筛选列表中。实际倍率为 `渠道显示倍率 / 充值比例`；例如充值比例为 `1:10`，Provider 的 `recharge_ratio` 配置为 `10`。列表同时显示最近状态时间线、延迟和 7 天可用率。
 渠道刷新使用独立后台任务，支持进度、取消、失败项重试，并在服务重启后保留中断状态和已完成结果。
 
 设置页支持：
@@ -76,15 +84,19 @@ Provider 看板包含：
 - 在 DeepSeek Provider 编辑器内保存或清除本地 API Key。也可继续使用 `DEEPSEEK_API_KEY` 环境变量，环境变量优先。
 - 添加通用页面 Provider，以插件兼容的 `secondaryUrls` 和 `parserRules` JSON 配置多页面 CSS/正则解析。
 
-扩展设置页的“本地 Web 同步”支持从本地服务预览并拉取配置，或将扩展配置预览并推送到本地服务。推送配置时，扩展还会检查已打开的同域 Sub2API/EZAIClub 标签页；如果页面已经登录，会把该 Provider 的短期认证会话同步给本地 Web，供后续渠道刷新使用。配对令牌在 Web 设置页生成，可轮换；同步地址仅允许本机回环地址。应用同步时会校验配置 revision，预览后如果另一侧发生变化会拒绝覆盖。本地 Web 的所有写接口都要求当前配对令牌，内置页面会自动附加；自行调用 API 时需发送 `X-Provider-Sync-Token` 请求头。服务端同时拒绝非回环地址的 `Host` 请求。
+扩展设置页的“本地 Web 同步”支持从本地服务预览并拉取配置，或将扩展配置预览并推送到本地服务。推送配置时，扩展会优先读取已打开的同域 Sub2API/EZAIClub 标签页；没有可用标签页时，也可使用扩展短期缓存中的完整登录会话。配对令牌在 Web 设置页生成，可轮换；同步地址仅允许本机回环地址。应用同步时会校验配置 revision，预览后如果另一侧发生变化会拒绝覆盖。本地 Web 的所有写接口都要求当前配对令牌，内置页面会自动附加；自行调用 API 时需发送 `X-Provider-Sync-Token` 请求头。服务端同时拒绝非回环地址的 `Host` 请求。
 
-同步的认证会话只保存在本机 `.provider-secrets.json`，不会写入 Provider 配置、导出文件或刷新快照。会话过期或站点主动注销后，需要先在浏览器中重新登录，保持该 Provider 页面打开，再次点击“推送到 Web”。
+扩展主动推送到本地 Web 的认证会话只保存在 `.provider-secrets.json`，不会写入 Provider 配置、导出文件或刷新快照；注入和回写也只允许配置中的 Provider 源站。Web 端从 BrowserOS 刷新 Sub2API 时不会导出 token，而是在同源页面上下文中于到期前 2 分钟主动刷新，收到 401 后强制刷新并重试一次；轮换后的 access token、refresh token 和过期时间只写回该站点的 Local Storage。扩展端仍会把轮换结果写回页面并短期缓存到 `chrome.storage.session`。
 
 设置保存后，已经打开的 Provider 和渠道页面会自动重新读取配置；标签页重新获得焦点时也会检查最新分组和顺序。
 
 ## BrowserOS 登录态
 
-一般页面采集仍可使用 BrowserOS profile 副本。推荐先在 BrowserOS 里登录相关站点，然后在看板点击“同步登录态”，同步完成后再刷新 Provider。对于使用 Local Storage 令牌的 Sub2API/EZAIClub 渠道，应优先使用扩展设置页的“推送到 Web”同步认证会话；复制一个正在运行的 Chromium profile 不保证能取得最新 Local Storage 内容。
+一般页面采集仍可使用 BrowserOS profile 副本，但 Sub2API 不再使用副本。推荐先在 BrowserOS 登录相关站点；刷新时后端通过 `.browseros/config.json` 中的 CDP 端口查找同源标签页，并直接在该页面执行 refresh 和数据 API。如果没有同源标签页，刷新器会在 BrowserOS 中创建临时标签页。刷新成功或发生普通采集错误时自动关闭该临时页；检测到登录失效时则保留并置前，供用户重新登录。登录完成后再次刷新会复用这个同源标签页。刷新器不会导航或关闭用户原本已有的标签页。
+
+这套实时会话逻辑不绑定具体站点名称或域名，而是由 Provider 的 `type: "sub2api"` 和 `targetUrl` 动态确定 Origin。兼容相同 Sub2API 认证及数据接口的站点可直接复用；站点需要提供 `/api/v1/auth/refresh`、`/api/v1/auth/me` 等对应接口，并使用 `auth_token`、`refresh_token`、`token_expires_at` 这组 Local Storage 字段。
+
+看板的“同步登录态”只检查当前 BrowserOS 实时会话，不复制 profile，也不把 Local Storage token 写入本地 secret。此检查不是刷新前置条件；单 Provider、全量和渠道刷新都会自行连接 BrowserOS。
 
 手动同步 fallback：
 
@@ -116,6 +128,8 @@ cp providers.example.json providers.local.json
 本地 Web 支持官方 API、浏览器采集、Sub2API 类渠道和通用 `page` Provider。插件导出的通用页面 Provider 可以直接导入；当前网页自动识别、访问页面触发刷新、工具栏角标属于扩展运行时能力，不适用于本地服务。
 
 扩展和本地 Web 共用 [`schemas/provider-config-v4.schema.json`](schemas/provider-config-v4.schema.json) 定义的 portable v4 配置。两端运行时都会检查 v4 的字段形状，业务校验再额外检查 URL、正则和解析规则安全性；高于当前支持范围的 schema 版本会明确拒绝，避免按旧规则误读未来配置。导入接受单个 Provider、Provider 数组或 `{ "providers": [...] }`；导出统一使用 camelCase。`refreshOnVisit` 等扩展字段会由本地 Web 保留并重新导出，即使本地采集不使用该字段。空的可选选择器和暂未配置解析规则的通用页面允许导入，刷新时会在 Provider 状态中提示缺少可采集指标。
+
+Provider 的稳定注册信息与采集实现分开维护。Python 端由 `provider_definitions.py`、扩展端由 `extension/src/shared/provider_definitions.js` 统一声明类型、默认采集模式以及渠道、自动识别、本地认证同步等可选能力；具体 HTTP、页面解析和浏览器操作仍留在各自 Provider/Adapter 实现中。新增 Provider 时应先注册定义和能力，再接入采集实现，注册表一致性测试会拒绝只有定义或只有实现的未完成接入。
 
 “合并”会按 ID 更新已存在的 Provider 并追加新 Provider，其他配置保持不变；“替换”会删除导入文件中不存在的 Provider。扩展执行替换时仍会保留内置 Provider。
 
@@ -207,6 +221,7 @@ uv run python crawler.py --provider PROVIDER_ID --explore
 Popup 主页面仍以 Provider 为主；点击“渠道”会打开独立的渠道页。该页面提供：
 
 - 汇总所有支持渠道数据的已配置 Provider。
+- 在状态区显示尚未刷新、需要登录、采集失败和使用旧数据的 Provider，即使它还没有任何渠道行。
 - 默认展示所有已采集渠道，并按已识别实际倍率从低到高排序；未识别倍率的渠道排在末尾。
 - 可按模型、监控状态、当前可用性、倍率是否已识别和 Provider 过滤；选择“当前可用”即可得到原来的最低倍率可用渠道视图。
 - 展示当前状态、最近状态时间线、倍率来源和最近检查时间。

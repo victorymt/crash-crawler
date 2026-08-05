@@ -316,8 +316,10 @@ textarea {
 
 .status.ok,
 .channel-status.operational { color: var(--ok); }
+.status.refreshing { color: var(--accent); }
 .status.error,
 .status.stale,
+.status.needs_login,
 .channel-status.error { color: var(--bad); }
 .status.idle,
 .status.unconfigured,
@@ -373,6 +375,40 @@ textarea {
 .degraded-filter input,
 .provider-select input { width: 17px; height: 17px; margin: 0; accent-color: var(--accent); }
 .channel-meta { align-self: center; color: var(--muted); font-size: 12px; text-align: right; }
+.provider-health-band {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.provider-health-band[hidden] { display: none; }
+.provider-health-band > a,
+.provider-health-band > div {
+  display: grid;
+  min-width: min(100%, 260px);
+  grid-template-columns: minmax(80px, auto) auto;
+  gap: 2px 8px;
+  align-items: center;
+  color: var(--text);
+  text-decoration: none;
+}
+.provider-health-band small {
+  grid-column: 1 / -1;
+  max-width: 420px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.provider-health-band > a:hover strong { color: var(--accent); }
+.provider-health-status { font-size: 11px; white-space: nowrap; }
+.provider-health-status.ok { color: var(--ok); }
+.provider-health-status.warning { color: var(--warning); }
+.provider-health-status.error,
+.provider-health-status.needs-login { color: var(--bad); }
+.provider-health-status.idle { color: var(--muted); }
 .results { margin-top: 22px; }
 .results-head { margin-bottom: 11px; }
 .results-head h1 { font-size: 17px; }
