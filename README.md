@@ -25,7 +25,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv pip install -r requirements.txt
 uv run python server.py 19765
 ```
 
-也可以使用启动脚本。首次运行会自动创建 `.venv` 并安装 Python 依赖，同时检查 Chromium 可执行文件是否可用：
+也可以使用启动脚本。首次运行会自动创建 `.venv` 并安装 Python 依赖：
 
 ```bash
 ./launch.sh
@@ -47,11 +47,7 @@ uv run python -c 'import sys, playwright; print(sys.executable); print(playwrigh
 
 启动脚本通过 `/api/health` 确认端口上的进程确实是当前本地 Web；如果端口被旧版本或其他服务占用，会明确报错，不会误报“已经运行”。
 
-普通页面 Provider 由 Playwright 控制独立的系统 Chromium。Sub2API Provider 例外：它通过 BrowserOS 的本机 CDP 连接复用实时浏览器上下文，以保持登录会话的网络指纹一致。脚本会依次查找 `chromium`、`chromium-browser` 和 `google-chrome`；也可以显式指定普通页面采集使用的浏览器：
-
-```bash
-PROVIDER_BROWSER_BIN=/path/to/chromium ./launch.sh
-```
+所有需要浏览器的 Provider 都由 Playwright 通过本机 CDP 连接当前 BrowserOS。普通页面 Provider 使用由采集器创建的临时标签页，避免导航或关闭用户已有标签页；Sub2API 可以复用已有的同源标签页，以保持实时登录会话和网络指纹一致。纯 API Provider 不连接浏览器。BrowserOS 必须在刷新前启动，并提供 `.browseros/config.json` 中记录的 CDP 端口。
 
 打开后可使用三个页面：
 
@@ -63,8 +59,8 @@ http://127.0.0.1:19765/settings  Provider 与刷新设置
 
 Provider 看板包含：
 
-- “同步登录态”：检查 BrowserOS 中已打开的同源页面和实时登录态，不复制 profile 或导出 token。
-- “刷新全部”：一次并行刷新（API 并行，普通页面按 profile 复用独立 Chromium，Sub2API 复用实时 BrowserOS 会话）。
+- “同步登录态”：检查 BrowserOS 的实时登录态，必要时创建临时同源页面，不复制 profile 或导出 token。
+- “刷新全部”：一次并行刷新（API 并行，其余 Provider 复用同一个实时 BrowserOS 会话）。
 - 刷新期间可取消；任务进度会写入本地 `.refresh-job.json`，服务重启后会将未完成任务标记为中断并保留结果。
 - 全量刷新出现失败 Provider 时，主页面可使用“重试失败”只重新采集失败项。
 - Provider 卡片上的“刷新”：只刷新当前 provider。
@@ -92,20 +88,11 @@ Provider 看板包含：
 
 ## BrowserOS 登录态
 
-一般页面采集仍可使用 BrowserOS profile 副本，但 Sub2API 不再使用副本。推荐先在 BrowserOS 登录相关站点；刷新时后端通过 `.browseros/config.json` 中的 CDP 端口查找同源标签页，并直接在该页面执行 refresh 和数据 API。如果没有同源标签页，刷新器会在 BrowserOS 中创建临时标签页。刷新成功或发生普通采集错误时自动关闭该临时页；检测到登录失效时则保留并置前，供用户重新登录。登录完成后再次刷新会复用这个同源标签页。刷新器不会导航或关闭用户原本已有的标签页。
+本地 Web 不再启动独立 Chromium，也不再使用 BrowserOS profile 副本。推荐先在 BrowserOS 登录相关站点；刷新时后端通过 `.browseros/config.json` 中的 CDP 端口连接实时浏览器。普通页面采集始终创建专用临时标签页；刷新成功或发生普通采集错误时自动关闭，检测到登录失效时则保留并置前，供用户重新登录。Sub2API 会优先复用已有的同源标签页，并只在该页面执行 refresh 和数据 API，不导航或关闭用户原本已有的标签页。
 
-这套实时会话逻辑不绑定具体站点名称或域名，而是由 Provider 的 `type: "sub2api"` 和 `targetUrl` 动态确定 Origin。兼容相同 Sub2API 认证及数据接口的站点可直接复用；站点需要提供 `/api/v1/auth/refresh`、`/api/v1/auth/me` 等对应接口，并使用 `auth_token`、`refresh_token`、`token_expires_at` 这组 Local Storage 字段。
+Sub2API 的同源页面复用逻辑不绑定具体站点名称或域名，而是由 Provider 的 `type: "sub2api"` 和 `targetUrl` 动态确定 Origin。兼容相同 Sub2API 认证及数据接口的站点可直接复用；站点需要提供 `/api/v1/auth/refresh`、`/api/v1/auth/me` 等对应接口，并使用 `auth_token`、`refresh_token`、`token_expires_at` 这组 Local Storage 字段。
 
-看板的“同步登录态”只检查当前 BrowserOS 实时会话，不复制 profile，也不把 Local Storage token 写入本地 secret。此检查不是刷新前置条件；单 Provider、全量和渠道刷新都会自行连接 BrowserOS。
-
-手动同步 fallback：
-
-```bash
-cp -r /home/cv/.config/browser-os /home/cv/.browseros-crawler-profile
-rm -f /home/cv/.browseros-crawler-profile/Singleton*
-```
-
-BrowserOS 关闭时同步 profile 最干净。“打开主页”按钮不依赖这个副本，会直接使用你当前浏览器自己的登录态。
+看板的“同步登录态”只使用当前 BrowserOS 实时会话，不复制 profile，也不把 Local Storage token 写入本地 secret。此检查不是刷新前置条件；单 Provider、全量和渠道刷新都会自行连接 BrowserOS。BrowserOS 未运行或 CDP 不可用时，需要浏览器的 Provider 会明确报告浏览器不可用。
 
 ## 登录态契约与手工验收
 

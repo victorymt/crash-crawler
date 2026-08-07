@@ -4,10 +4,11 @@ import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from providers import (
     BrowserOSSession,
+    clear_provider_auth_session,
     DeepSeekProvider,
     EZAICLUBProvider,
     GenericPageProvider,
@@ -33,11 +34,8 @@ from providers import (
     parse_percent,
     parse_siliconflow_balance_tokens,
     parse_siliconflow_metric_tokens,
-    profile_fingerprint,
-    resolve_browser_executable,
     refresh_sub2api_auth_session,
     sync_browseros_auth_sessions,
-    sync_browseros_profile,
     verify_provider_auth_session,
     wait_for_page_ready,
     is_transient_frame_error,
@@ -46,19 +44,6 @@ from provider_auth import ProviderAuthSessionError
 
 
 class ProviderParserTests(unittest.TestCase):
-    def test_browser_executable_prefers_config_then_system_chromium(self):
-        with patch.dict("providers.os.environ", {"PROVIDER_BROWSER_BIN": "/custom/chromium"}, clear=True):
-            self.assertEqual(resolve_browser_executable(), "/custom/chromium")
-
-        with (
-            patch.dict("providers.os.environ", {}, clear=True),
-            patch("providers.shutil.which", side_effect=lambda name: "/usr/bin/chromium" if name == "chromium" else None),
-        ):
-            self.assertEqual(resolve_browser_executable(), "/usr/bin/chromium")
-
-        with patch.dict("providers.os.environ", {"BROWSEROS_BIN": "/legacy/browser"}, clear=True):
-            self.assertEqual(resolve_browser_executable(), "/legacy/browser")
-
     def test_provider_cache_save_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_file = Path(tmp) / "cache.json"
@@ -365,10 +350,6 @@ class ProviderParserTests(unittest.TestCase):
             },
         ]
 
-        class FakeBrowser:
-            def page(self):
-                return object()
-
         provider.goto_with_json = lambda *_args, **_kwargs: (
             config.target_url,
             [],
@@ -379,7 +360,10 @@ class ProviderParserTests(unittest.TestCase):
             raise AssertionError("captured authenticated response should avoid a direct API request")
 
         provider.page_api_json = fail_direct_request
-        snapshot = provider.fetch(browser=FakeBrowser())
+        with patch.object(
+            provider, "browser_page", return_value=nullcontext(object())
+        ):
+            snapshot = provider.fetch()
 
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["balances"][0]["value"], "5.00")
@@ -446,6 +430,18 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(config.recharge_ratio, 2)
         self.assertEqual(config.secondary_urls[0]["label"], "监控")
 
+    def test_provider_config_ignores_legacy_profile_dir(self):
+        config = ProviderConfig.from_dict({
+            "id": "legacy-page",
+            "name": "Legacy Page",
+            "type": "page",
+            "targetUrl": "https://example.test/dashboard",
+            "profile_dir": "/tmp/legacy-browser-profile",
+        })
+
+        self.assertFalse(hasattr(config, "profile_dir"))
+        self.assertNotIn("profile_dir", config.to_dict())
+
     def test_generic_page_rules_parse_tokens_and_selectors(self):
         token_result = parse_generic_page_tokens([
             "$74.84",
@@ -489,76 +485,6 @@ class ProviderParserTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             manager.get_provider("unknown")
-
-    def test_sync_browseros_profile_copies_files_and_removes_singletons(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            target = root / "target"
-            source.mkdir()
-            (source / "Cookies").write_text("cookie-db", encoding="utf-8")
-            (source / "SingletonLock").write_text("source-lock", encoding="utf-8")
-            (source / "Cache" / "data").parent.mkdir()
-            (source / "Cache" / "data").write_text("heavy", encoding="utf-8")
-            target.mkdir()
-            (target / "SingletonSocket").write_text("target-lock", encoding="utf-8")
-
-            result = sync_browseros_profile(source, target)
-
-            self.assertTrue(result["ok"])
-            self.assertFalse(result.get("skipped"))
-            self.assertEqual((target / "Cookies").read_text(encoding="utf-8"), "cookie-db")
-            self.assertFalse((target / "SingletonLock").exists())
-            self.assertFalse((target / "SingletonSocket").exists())
-            self.assertFalse((target / "Cache").exists())
-
-    def test_sync_browseros_profile_skips_unchanged_source(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            target = root / "target"
-            source.mkdir()
-            (source / "Cookies").write_text("cookie-db", encoding="utf-8")
-
-            first = sync_browseros_profile(source, target)
-            second = sync_browseros_profile(source, target)
-
-            self.assertTrue(first["ok"])
-            self.assertFalse(first.get("skipped"))
-            self.assertTrue(second["ok"])
-            self.assertTrue(second.get("skipped"))
-            self.assertEqual(profile_fingerprint(source)["source"], str(source.resolve()))
-
-    def test_sync_browseros_profile_detects_and_copies_local_storage_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            target = root / "target"
-            storage = source / "Default" / "Local Storage" / "leveldb"
-            storage.mkdir(parents=True)
-            token_log = storage / "000003.log"
-            token_log.write_text("before-login", encoding="utf-8")
-
-            first = sync_browseros_profile(source, target)
-            second = sync_browseros_profile(source, target)
-            token_log.write_text("after-login-with-new-token", encoding="utf-8")
-            third = sync_browseros_profile(source, target)
-
-            self.assertFalse(first.get("skipped"))
-            self.assertTrue(second.get("skipped"))
-            self.assertFalse(third.get("skipped"))
-            self.assertEqual(
-                (target / "Default" / "Local Storage" / "leveldb" / "000003.log").read_text(
-                    encoding="utf-8"
-                ),
-                "after-login-with-new-token",
-            )
-
-    def test_sync_browseros_profile_rejects_missing_source(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with self.assertRaises(Exception):
-                sync_browseros_profile(root / "missing", root / "target")
 
     def test_sync_browseros_auth_sessions_reads_only_matching_open_pages(self):
         fluxion = ProviderConfig(
@@ -1086,52 +1012,7 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         refresh.assert_called_once_with(page, config, force=True)
 
-    def test_sub2api_fetch_recovers_navigation_and_checks_expiry(self):
-        config = ProviderConfig(
-            id="sub2api-navigation-retry",
-            name="Sub2API Navigation Retry",
-            type="sub2api",
-            target_url="https://relay.example/dashboard",
-        )
-        provider = Sub2APIProvider(config)
-        page = object()
-        auth_payload = {"data": {"username": "alice", "balance": 3.5}}
-        with (
-            patch.object(provider, "browser_page", return_value=nullcontext(page)),
-            patch.object(
-                provider,
-                "goto_with_json",
-                side_effect=[
-                    NotLoggedInError("expired"),
-                    (config.target_url, [], []),
-                ],
-            ) as navigate,
-            patch.object(
-                provider,
-                "page_api_json",
-                side_effect=[auth_payload, {"data": {"today_requests": 2}}],
-            ),
-            patch.object(
-                provider,
-                "fetch_channel_payloads",
-                return_value=(None, None, None, "not collected"),
-            ),
-            patch(
-                "providers.refresh_sub2api_auth_session",
-                side_effect=[True, False],
-            ) as refresh,
-        ):
-            snapshot = provider.fetch()
-
-        self.assertEqual(navigate.call_count, 2)
-        self.assertEqual(snapshot["status"], "ok")
-        self.assertEqual(
-            [call.kwargs for call in refresh.call_args_list],
-            [{"force": True}, {}],
-        )
-        self.assertTrue(all(call.args == (page, config) for call in refresh.call_args_list))
-
-    def test_sub2api_live_browseros_fetch_does_not_navigate_or_export_tokens(self):
+    def test_sub2api_implicit_browseros_fetch_does_not_navigate_or_export_tokens(self):
         config = ProviderConfig(
             id="fluxion",
             name="FluxionAI",
@@ -1140,7 +1021,6 @@ class ProviderParserTests(unittest.TestCase):
         )
         provider = Sub2APIProvider(config)
         page = type("Page", (), {"url": "https://fluxionai.space/console/keys"})()
-        browser = type("Browser", (), {"is_live_browseros": True})()
         auth_payload = {"data": {"username": "alice", "balance": 3.5}}
         with (
             patch.object(provider, "browser_page", return_value=nullcontext(page)),
@@ -1158,11 +1038,15 @@ class ProviderParserTests(unittest.TestCase):
             patch(
                 "providers.refresh_sub2api_auth_session", return_value=False
             ) as refresh,
+            patch(
+                "providers.verify_provider_auth_session", return_value={}
+            ) as verify,
         ):
-            snapshot = provider.fetch(browser=browser)
+            snapshot = provider.fetch()
 
         navigate.assert_not_called()
         refresh.assert_called_once_with(page, config, persist=False)
+        self.assertFalse(verify.call_args.kwargs["persist"])
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["url"], page.url)
 
@@ -1213,40 +1097,185 @@ class ProviderParserTests(unittest.TestCase):
             provider_auth_session_lock("provider-b"),
         )
 
-    def test_provider_auth_session_is_cleared_after_login_failure(self):
+    def test_non_sub2api_provider_uses_dedicated_browseros_page(self):
         config = ProviderConfig(
-            id="fluxion",
-            name="FluxionAI",
-            type="sub2api",
-            target_url="https://fluxionai.space/dashboard",
+            id="generic",
+            name="Generic",
+            type="page",
+            target_url="https://example.test/dashboard",
         )
-        provider = Sub2APIProvider(config)
+        provider = GenericPageProvider(config)
+        page = object()
 
-        class FakePage:
-            def add_init_script(self, _script):
-                return None
+        class FakeBrowserOSSession:
+            def __init__(self):
+                self.released = []
+                self.reused = []
 
-            def close(self):
-                return None
-
-        class FakeContext:
             def new_page(self):
-                return FakePage()
+                return page
 
-        class FakeBrowser:
-            context = FakeContext()
+            def page_for_url(self, url):
+                self.reused.append(url)
+                return object(), False
+
+            def release_page(self, selected):
+                self.released.append(selected)
+
+            def keep_page_open(self, _selected):
+                return None
+
+            def discard_page(self, _selected):
+                return None
+
+        browser = FakeBrowserOSSession()
+        with provider.browser_page(browser) as selected:
+            self.assertIs(selected, page)
+
+        self.assertEqual(browser.reused, [])
+        self.assertEqual(browser.released, [page])
+
+    def test_ezaiclub_browseros_page_uses_synced_auth_session(self):
+        config = ProviderConfig(
+            id="ezaiclub",
+            name="EZAICLUB",
+            type="ezaiclub",
+            target_url="https://www.ezaiclub.com/dashboard",
+        )
+        provider = EZAICLUBProvider(config)
+        page = object()
+        stored = {
+            "authToken": "synced-access",
+            "refreshToken": "synced-refresh",
+        }
+
+        class FakeBrowserOSSession:
+            def new_page(self):
+                return page
+
+            def release_page(self, _selected):
+                return None
+
+            def keep_page_open(self, _selected):
+                return None
+
+            def discard_page(self, _selected):
+                return None
 
         with (
-            patch("providers.load_provider_auth_session", return_value={
-                "authToken": "expired-access",
-                "refreshToken": "expired-refresh",
-            }),
+            patch("providers.load_provider_auth_session", return_value=stored),
+            patch("providers.install_provider_auth_session") as install,
+            patch("providers.persist_provider_auth_session") as persist,
+        ):
+            with provider.browser_page(FakeBrowserOSSession()) as selected:
+                self.assertIs(selected, page)
+
+        install.assert_called_once_with(page, config, stored)
+        persist.assert_called_once_with(page, config, stored)
+
+    def test_clear_provider_auth_session_is_limited_to_provider_origin(self):
+        config = ProviderConfig(
+            id="ezaiclub",
+            name="EZAICLUB",
+            type="ezaiclub",
+            target_url="https://www.ezaiclub.com/dashboard",
+        )
+
+        class FakePage:
+            def __init__(self):
+                self.script = ""
+                self.argument = None
+
+            def evaluate(self, script, argument):
+                self.script = script
+                self.argument = argument
+                return True
+
+        page = FakePage()
+        self.assertTrue(clear_provider_auth_session(page, config))
+        self.assertEqual(page.argument, "https://www.ezaiclub.com")
+        self.assertIn("location?.origin !== expectedOrigin", page.script)
+        for key in (
+            "auth_token",
+            "refresh_token",
+            "token_expires_at",
+            "auth_user",
+        ):
+            self.assertIn(key, page.script)
+
+    def test_ezaiclub_rejected_synced_session_opens_clean_login_page(self):
+        config = ProviderConfig(
+            id="ezaiclub",
+            name="EZAICLUB",
+            type="ezaiclub",
+            target_url="https://www.ezaiclub.com/dashboard",
+        )
+        provider = EZAICLUBProvider(config)
+        stale_page = object()
+        clean_page = object()
+
+        class FakeBrowserOSSession:
+            def __init__(self):
+                self.pages = iter((stale_page, clean_page))
+                self.discarded = []
+                self.kept = []
+                self.released = []
+
+            def new_page(self):
+                return next(self.pages)
+
+            def release_page(self, selected):
+                self.released.append(selected)
+
+            def keep_page_open(self, selected):
+                self.kept.append(selected)
+
+            def discard_page(self, selected):
+                self.discarded.append(selected)
+
+        browser = FakeBrowserOSSession()
+        stored = {"authToken": "rejected-access"}
+        with (
+            patch("providers.load_provider_auth_session", return_value=stored),
+            patch("providers.install_provider_auth_session", return_value=True),
+            patch(
+                "providers.clear_provider_auth_session", return_value=True
+            ) as clear_auth,
             patch("providers.delete_local_secret") as delete_secret,
+            patch("providers.goto_with_frame_retry") as navigate,
         ):
             with self.assertRaises(NotLoggedInError):
-                with provider.browser_page(FakeBrowser()):
+                with provider.browser_page(browser):
                     raise NotLoggedInError("login required")
-        delete_secret.assert_called_once_with("provider_auth_session:fluxion")
+
+        self.assertEqual(browser.discarded, [stale_page])
+        self.assertEqual(browser.kept, [clean_page])
+        self.assertEqual(browser.released, [])
+        self.assertEqual(
+            clear_auth.call_args_list,
+            [
+                call(stale_page, config),
+                call(clean_page, config),
+            ],
+        )
+        self.assertEqual(
+            navigate.call_args_list,
+            [
+                call(
+                    clean_page,
+                    config.target_url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                ),
+                call(
+                    clean_page,
+                    config.target_url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                ),
+            ],
+        )
+        delete_secret.assert_called_once()
 
     def test_provider_manager_classifies_login_failure(self):
         config = ProviderConfig(
@@ -1270,12 +1299,12 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "needs_login")
         self.assertEqual(snapshot["channels"], [])
 
-    def test_provider_manager_routes_sub2api_refresh_to_live_browseros(self):
+    def test_provider_manager_routes_browser_refresh_to_live_browseros(self):
         config = ProviderConfig(
-            id="fluxion",
-            name="FluxionAI",
-            type="sub2api",
-            target_url="https://fluxionai.space/dashboard",
+            id="ezaiclub",
+            name="EZAICLUB",
+            type="ezaiclub",
+            target_url="https://www.ezaiclub.com/dashboard",
         )
         with tempfile.TemporaryDirectory() as tmp:
             manager = ProviderManager(
@@ -1304,7 +1333,7 @@ class ProviderParserTests(unittest.TestCase):
         self.assertEqual(result, expected)
         refresh.assert_called_once_with(config, browser=live_session)
 
-    def test_refresh_all_routes_sub2api_away_from_headless_session(self):
+    def test_refresh_all_routes_sub2api_to_live_browseros(self):
         config = ProviderConfig(
             id="fluxion",
             name="FluxionAI",
@@ -1333,15 +1362,11 @@ class ProviderParserTests(unittest.TestCase):
                 return {"id": current.id, "status": "ok"}
 
             manager._refresh_config = fake_refresh  # type: ignore[method-assign]
-            with (
-                patch("providers.BrowserOSSession", return_value=live_session),
-                patch("providers.BrowserSession") as headless_session,
-            ):
+            with patch("providers.BrowserOSSession", return_value=live_session):
                 result = manager.refresh_all()
 
         self.assertEqual(result, [{"id": "fluxion", "status": "ok"}])
         self.assertEqual(seen, [("fluxion", live_session)])
-        headless_session.assert_not_called()
 
     def test_refresh_all_reuses_browser_session_and_runs_api(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1360,7 +1385,6 @@ class ProviderParserTests(unittest.TestCase):
                     type="ezaiclub",
                     target_url="https://www.ezaiclub.com/dashboard",
                     mode="browser",
-                    profile_dir=str(Path(tmp) / "profile"),
                 ),
                 ProviderConfig(
                     id="siliconflow",
@@ -1368,7 +1392,6 @@ class ProviderParserTests(unittest.TestCase):
                     type="siliconflow",
                     target_url="https://cloud.siliconflow.cn/me/expensebill?tab=coupon",
                     mode="browser",
-                    profile_dir=str(Path(tmp) / "profile"),
                 ),
             ]
             manager = ProviderManager(configs=configs, cache_file=cache_file)
@@ -1395,8 +1418,7 @@ class ProviderParserTests(unittest.TestCase):
             sessions = []
 
             class FakeSession:
-                def __init__(self, profile_dir):
-                    self.profile_dir = profile_dir
+                def __init__(self):
                     sessions.append(self)
 
                 def __enter__(self):
@@ -1405,19 +1427,13 @@ class ProviderParserTests(unittest.TestCase):
                 def __exit__(self, *_args):
                     return None
 
-            import providers as providers_mod
-
-            original = providers_mod.BrowserSession
-            providers_mod.BrowserSession = FakeSession
             progress_events = []
-            try:
+            with patch("providers.BrowserOSSession", FakeSession):
                 results = manager.refresh_all(
                     progress=lambda event, config, snapshot: progress_events.append(
                         (event, config.id, snapshot and snapshot.get("status"))
                     )
                 )
-            finally:
-                providers_mod.BrowserSession = original
 
             self.assertEqual([item["id"] for item in results], ["deepseek", "ezaiclub", "siliconflow"])
             self.assertEqual(len(sessions), 1)
@@ -1465,27 +1481,21 @@ class ProviderParserTests(unittest.TestCase):
                 return {"id": current.id, "status": "ok", "error": None}
 
             manager._refresh_config = fake_refresh  # type: ignore[method-assign]
-            import providers as providers_mod
-
-            original = providers_mod.BrowserSession
-            providers_mod.BrowserSession = type(
+            fake_session = type(
                 "FakeSession",
                 (),
                 {
-                    "__init__": lambda self, profile_dir: None,
                     "__enter__": lambda self: self,
                     "__exit__": lambda self, *_args: None,
                 },
             )
-            try:
+            with patch("providers.BrowserOSSession", fake_session):
                 results = manager.refresh_all(
                     progress=lambda event, config, snapshot: events.append(
                         (event, config.id, snapshot and snapshot.get("status"))
                     ),
                     cancel_event=cancel_event,
                 )
-            finally:
-                providers_mod.BrowserSession = original
             self.assertEqual([item["status"] for item in results], ["ok", "cancelled"])
             self.assertIn(("completed", "second", "cancelled"), events)
 
